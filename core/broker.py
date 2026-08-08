@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from datetime import date, datetime, time, timedelta
 from typing import Optional
 
@@ -189,9 +190,385 @@ class OpenAlgoBroker(BrokerInterface):
             raise RuntimeError(f"No history data for {symbol}")
         return df
 
+    def discover_index_profile(self, script: str) -> dict[str, object]:
+        """Discover instrument metadata for index option trading from OpenAlgo.
+
+        Returns keys used by StrategyConfig:
+        - spot_symbol
+        - option_index_symbol
+        - exchange_spot
+        - exchange_options
+        - strike_step
+        - option_lot_size
+        - weekly_expiry_weekday
+        """
+        canonical = self._normalize_script_name(script)
+        default_exchanges = {
+            "NIFTY": ("NSE_INDEX", "NFO"),
+            "BANKNIFTY": ("NSE_INDEX", "NFO"),
+            "SENSEX": ("BSE_INDEX", "BFO"),
+        }
+        fallback_metadata = {
+            "NIFTY": {"strike_step": 50, "option_lot_size": 65, "weekly_expiry_weekday": 1},
+            "BANKNIFTY": {"strike_step": 100, "option_lot_size": 30, "weekly_expiry_weekday": 1},
+            "SENSEX": {"strike_step": 100, "option_lot_size": 20, "weekly_expiry_weekday": 3},
+        }
+        spot_exch, opt_exch = default_exchanges.get(canonical, ("NSE_INDEX", self.exchange_options))
+
+        payload, discovery_error = self._discover_payload(canonical, spot_exch, opt_exch)
+        if payload is None:
+            raise RuntimeError(
+                f"Could not discover instrument metadata for '{script}' from OpenAlgo"
+                + (f": {discovery_error}" if discovery_error else "")
+            )
+
+        numeric = self._extract_numeric_fields(payload)
+        strike_step = self._extract_strike_step(payload)
+        lot_size = numeric.get("lot_size")
+        if lot_size is None:
+            lot_size = numeric.get("market_lot")
+        if strike_step is None or lot_size is None:
+            fallback = fallback_metadata.get(canonical)
+            if fallback is not None:
+                if strike_step is None:
+                    strike_step = int(fallback["strike_step"])
+                if lot_size is None:
+                    lot_size = int(fallback["option_lot_size"])
+                logger.warning(
+                    "OpenAlgo discovery missing strike/lot metadata for %s; using fallback strike_step=%s lot_size=%s",
+                    canonical,
+                    strike_step,
+                    lot_size,
+                )
+            else:
+                if strike_step is None:
+                    raise RuntimeError(
+                        f"OpenAlgo discovery for '{script}' did not return strike-step metadata"
+                    )
+                if lot_size is None:
+                    raise RuntimeError(
+                        f"OpenAlgo discovery for '{script}' did not return lot-size metadata"
+                    )
+
+        symbol_guess = self._extract_symbol(payload) or canonical
+        option_root = self._extract_option_root(payload) or symbol_guess or canonical
+        weekly_expiry_weekday = self._extract_weekly_expiry_weekday(payload)
+
+        return {
+            "spot_symbol": canonical,
+            "option_index_symbol": option_root,
+            "exchange_spot": spot_exch,
+            "exchange_options": opt_exch,
+            "strike_step": int(strike_step),
+            "option_lot_size": int(lot_size),
+            "weekly_expiry_weekday": int(weekly_expiry_weekday),
+        }
+
+    def _discover_payload(
+        self,
+        canonical: str,
+        spot_exchange: str,
+        options_exchange: str,
+    ) -> tuple[object | None, str | None]:
+        aliases = self._symbol_aliases(canonical)
+        last_error: Optional[str] = None
+        first_usable_payload = None
+        method_candidates: list[tuple[str, list[dict[str, object]]]] = []
+        for alias in aliases:
+            method_candidates.extend(
+                [
+                    (
+                        "optionchain",
+                        [
+                            {"underlying": alias, "exchange": options_exchange},
+                            {"underlying": alias, "exchange": spot_exchange},
+                        ],
+                    ),
+                    (
+                        "search",
+                        [
+                            {"exchange": options_exchange, "query": alias},
+                            {"exchange": spot_exchange, "query": alias},
+                        ],
+                    ),
+                    (
+                        "symbol",
+                        [
+                            {"exchange": spot_exchange, "symbol": alias},
+                            {"exchange": options_exchange, "symbol": alias},
+                        ],
+                    ),
+                    (
+                        "instruments",
+                        [
+                            {"exchange": options_exchange},
+                            {"exchange": spot_exchange},
+                        ],
+                    ),
+                    (
+                        "expiry",
+                        [
+                            {"exchange": options_exchange, "symbol": alias, "instrumenttype": "OPTIDX"},
+                        ],
+                    ),
+                ]
+            )
+
+        for method_name, kwargs_list in method_candidates:
+            method = getattr(self.client, method_name, None)
+            if method is None:
+                continue
+            for kwargs in kwargs_list:
+                try:
+                    resp = method(**kwargs)
+                except Exception:
+                    continue
+                if isinstance(resp, dict) and resp.get("status") == "error":
+                    msg = resp.get("message")
+                    if isinstance(msg, str) and msg.strip():
+                        last_error = msg.strip()
+                if self._is_usable_payload(resp):
+                    if first_usable_payload is None:
+                        first_usable_payload = resp
+                    has_step = self._extract_strike_step(resp) is not None
+                    numeric = self._extract_numeric_fields(resp)
+                    has_lot = (
+                        numeric.get("lot_size") is not None
+                        or numeric.get("market_lot") is not None
+                    )
+                    if has_step and has_lot:
+                        return resp, None
+        if first_usable_payload is not None:
+            return first_usable_payload, None
+        return None, last_error
+
+    @staticmethod
+    def _normalize_script_name(script: str) -> str:
+        key = re.sub(r"[^A-Za-z0-9]", "", script or "").upper()
+        alias_map = {
+            "NIFTY": "NIFTY",
+            "NIFTY50": "NIFTY",
+            "BANKNIFTY": "BANKNIFTY",
+            "NIFTYBANK": "BANKNIFTY",
+            "SENSEX": "SENSEX",
+            "BSESENSEX": "SENSEX",
+        }
+        return alias_map.get(key, key)
+
+    @staticmethod
+    def _symbol_aliases(canonical: str) -> list[str]:
+        aliases = {
+            "NIFTY": ["NIFTY", "NIFTY 50"],
+            "BANKNIFTY": ["BANKNIFTY", "NIFTY BANK"],
+            "SENSEX": ["SENSEX", "BSE SENSEX"],
+        }
+        return aliases.get(canonical, [canonical])
+
+    @staticmethod
+    def _is_usable_payload(payload) -> bool:
+        if payload is None:
+            return False
+        if isinstance(payload, dict) and payload.get("status") == "error":
+            return False
+        return True
+
+    @staticmethod
+    def _walk_objects(payload):
+        stack = [payload]
+        while stack:
+            cur = stack.pop()
+            yield cur
+            if isinstance(cur, dict):
+                for v in cur.values():
+                    if isinstance(v, (dict, list, tuple)):
+                        stack.append(v)
+            elif isinstance(cur, (list, tuple)):
+                for v in cur:
+                    if isinstance(v, (dict, list, tuple)):
+                        stack.append(v)
+
+    @staticmethod
+    def _coerce_number(value: object) -> Optional[float]:
+        if isinstance(value, (int, float)):
+            return float(value)
+        if isinstance(value, str):
+            text = value.strip().replace(",", "")
+            try:
+                return float(text)
+            except ValueError:
+                return None
+        return None
+
+    @classmethod
+    def _extract_numeric_fields(cls, payload) -> dict[str, int]:
+        out: dict[str, int] = {}
+        key_map = {
+            "lot_size": "lot_size",
+            "lotsize": "lot_size",
+            "market_lot": "market_lot",
+            "marketlot": "market_lot",
+        }
+        for item in cls._walk_objects(payload):
+            if not isinstance(item, dict):
+                continue
+            for raw_key, target in key_map.items():
+                if raw_key not in item:
+                    continue
+                val = cls._coerce_number(item.get(raw_key))
+                if val is None:
+                    continue
+                if val > 0:
+                    out[target] = int(round(val))
+        return out
+
+    @classmethod
+    def _extract_strike_step(cls, payload) -> Optional[int]:
+        direct_keys = ("strike_step", "strikestep", "strike_interval", "strikeinterval")
+        for item in cls._walk_objects(payload):
+            if not isinstance(item, dict):
+                continue
+            for key in direct_keys:
+                if key not in item:
+                    continue
+                val = cls._coerce_number(item.get(key))
+                if val and val > 0:
+                    return int(round(val))
+
+        strikes: list[float] = []
+        for item in cls._walk_objects(payload):
+            if isinstance(item, dict):
+                for key in ("strike", "strike_price", "strikeprice"):
+                    if key in item:
+                        val = cls._coerce_number(item.get(key))
+                        if val is not None:
+                            strikes.append(val)
+            elif isinstance(item, (list, tuple)):
+                for v in item:
+                    val = cls._coerce_number(v)
+                    if val is not None:
+                        strikes.append(val)
+
+        unique = sorted({int(round(s)) for s in strikes if s > 0})
+        if len(unique) < 2:
+            return None
+        diffs = [b - a for a, b in zip(unique, unique[1:]) if (b - a) > 0]
+        return min(diffs)
+
+    @classmethod
+    def _extract_symbol(cls, payload) -> Optional[str]:
+        keys = ("brsymbol", "name", "symbol", "tradingsymbol", "index")
+        for item in cls._walk_objects(payload):
+            if not isinstance(item, dict):
+                continue
+            for key in keys:
+                value = item.get(key)
+                if isinstance(value, str) and value.strip():
+                    root = cls._infer_index_root(value)
+                    if root is not None:
+                        return root
+        return None
+
+    @classmethod
+    def _extract_option_root(cls, payload) -> Optional[str]:
+        keys = (
+            "underlying",
+            "underlying_symbol",
+            "index_symbol",
+            "option_root",
+            "brsymbol",
+            "name",
+            "symbol",
+        )
+        for item in cls._walk_objects(payload):
+            if not isinstance(item, dict):
+                continue
+            for key in keys:
+                value = item.get(key)
+                if isinstance(value, str) and value.strip():
+                    root = cls._infer_index_root(value)
+                    if root is not None:
+                        return root
+        return None
+
+    @staticmethod
+    def _infer_index_root(value: str) -> Optional[str]:
+        text = value.strip().upper().replace(" ", "")
+        if not text:
+            return None
+        if "BANKNIFTY" in text or "NIFTYBANK" in text:
+            return "BANKNIFTY"
+        if "SENSEX" in text:
+            return "SENSEX"
+        if "NIFTY" in text:
+            return "NIFTY"
+        return None
+
+    @classmethod
+    def _extract_weekly_expiry_weekday(cls, payload) -> int:
+        # Default to Tuesday for backward compatibility with existing config.
+        default_weekday = 1
+        for item in cls._walk_objects(payload):
+            if not isinstance(item, dict):
+                continue
+            for key in ("weekly_expiry_weekday", "expiry_weekday"):
+                if key in item:
+                    val = cls._coerce_number(item.get(key))
+                    if val is not None and 0 <= int(val) <= 6:
+                        return int(val)
+
+        dates: list[date] = []
+        for item in cls._walk_objects(payload):
+            if isinstance(item, dict):
+                for key in ("expiry", "expiry_date", "expdate", "exp"):
+                    if key not in item:
+                        continue
+                    parsed = cls._parse_date(item.get(key))
+                    if parsed is not None:
+                        dates.append(parsed)
+            elif isinstance(item, (list, tuple)):
+                for value in item:
+                    parsed = cls._parse_date(value)
+                    if parsed is not None:
+                        dates.append(parsed)
+
+        if not dates:
+            return default_weekday
+        # Weekly expiries tend to dominate chain payloads; pick most frequent weekday.
+        counts: dict[int, int] = {}
+        for d in dates:
+            wd = d.weekday()
+            counts[wd] = counts.get(wd, 0) + 1
+        return max(counts.items(), key=lambda kv: kv[1])[0]
+
+    @staticmethod
+    def _parse_date(value: object) -> Optional[date]:
+        if not isinstance(value, str):
+            return None
+        text = value.strip()
+        if not text:
+            return None
+        for fmt in (
+            "%Y-%m-%d",
+            "%d-%m-%Y",
+            "%d/%m/%Y",
+            "%d-%b-%y",
+            "%d-%b-%Y",
+            "%d%b%y",
+            "%d%b%Y",
+            "%d %b %Y",
+        ):
+            try:
+                return datetime.strptime(text, fmt).date()
+            except ValueError:
+                continue
+        return None
+
     def _infer_exchange(self, symbol: str) -> str:
         if symbol.endswith("CE") or symbol.endswith("PE"):
             return self.exchange_options
+        upper = symbol.upper()
+        if "SENSEX" in upper:
+            return "BSE_INDEX"
         return "NSE_INDEX"
 
     @staticmethod

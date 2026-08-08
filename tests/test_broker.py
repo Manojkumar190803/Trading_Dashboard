@@ -30,6 +30,18 @@ class _StubClient:
             }
         )
         self.last_placeorder_kwargs = None
+        self.optionchain_response = {
+            "status": "success",
+            "data": {
+                "underlying": "NIFTY",
+                "lot_size": 75,
+                "records": [
+                    {"expiry": "2026-08-11", "strike": 24600},
+                    {"expiry": "2026-08-11", "strike": 24650},
+                    {"expiry": "2026-08-11", "strike": 24700},
+                ],
+            },
+        }
 
     def quotes(self, symbol: str, exchange: str):
         return self.quotes_response
@@ -40,6 +52,9 @@ class _StubClient:
 
     def history(self, **kwargs):
         return self.history_response
+
+    def optionchain(self, **kwargs):
+        return self.optionchain_response
 
 
 @pytest.fixture
@@ -169,6 +184,192 @@ def test_openalgo_exchange_inference(fake_openalgo):
     assert broker._infer_exchange("ANYCE") == "OPTX"
     assert broker._infer_exchange("ANYPE") == "OPTX"
     assert broker._infer_exchange("NIFTY") == "NSE_INDEX"
+    assert broker._infer_exchange("SENSEX") == "BSE_INDEX"
+
+
+def test_discover_index_profile_from_optionchain(fake_openalgo):
+    broker = OpenAlgoBroker(api_key="k", host="h", dry_run=True)
+    client = fake_openalgo["client"]
+    client.optionchain_response = {
+        "status": "success",
+        "data": {
+            "underlying": "NIFTY",
+            "lot_size": 65,
+            "records": [
+                {"expiry": "2026-08-11", "strike": 25000},
+                {"expiry": "2026-08-11", "strike": 25050},
+                {"expiry": "2026-08-11", "strike": 25100},
+            ],
+        },
+    }
+
+    profile = broker.discover_index_profile("Nifty")
+    assert profile["spot_symbol"] == "NIFTY"
+    assert profile["option_index_symbol"] == "NIFTY"
+    assert profile["exchange_spot"] == "NSE_INDEX"
+    assert profile["exchange_options"] == "NFO"
+    assert profile["strike_step"] == 50
+    assert profile["option_lot_size"] == 65
+    assert profile["weekly_expiry_weekday"] == 1
+
+
+def test_discover_index_profile_alias_banknifty(fake_openalgo):
+    broker = OpenAlgoBroker(api_key="k", host="h", dry_run=True)
+    client = fake_openalgo["client"]
+    client.optionchain_response = {
+        "status": "success",
+        "data": {
+            "underlying": "BANKNIFTY",
+            "market_lot": 30,
+            "records": [
+                {"expiry": "2026-08-13", "strike": 56000},
+                {"expiry": "2026-08-13", "strike": 56100},
+            ],
+        },
+    }
+
+    profile = broker.discover_index_profile("NIFTY BANK")
+    assert profile["spot_symbol"] == "BANKNIFTY"
+    assert profile["option_index_symbol"] == "BANKNIFTY"
+    assert profile["exchange_spot"] == "NSE_INDEX"
+    assert profile["exchange_options"] == "NFO"
+    assert profile["strike_step"] == 100
+    assert profile["option_lot_size"] == 30
+    assert profile["weekly_expiry_weekday"] == 3
+
+
+def test_discover_index_profile_fails_when_payload_not_found(fake_openalgo):
+    broker = OpenAlgoBroker(api_key="k", host="h", dry_run=True)
+    client = fake_openalgo["client"]
+    client.optionchain_response = {"status": "error", "message": "missing"}
+
+    with pytest.raises(RuntimeError, match="Could not discover instrument metadata"):
+        broker.discover_index_profile("NIFTY")
+
+
+def test_discover_index_profile_falls_back_when_strike_missing_for_known_script(fake_openalgo):
+    broker = OpenAlgoBroker(api_key="k", host="h", dry_run=True)
+    client = fake_openalgo["client"]
+    client.optionchain_response = {
+        "status": "success",
+        "data": {"underlying": "NIFTY", "lot_size": 65, "records": [{"expiry": "2026-08-11"}]},
+    }
+
+    profile = broker.discover_index_profile("NIFTY")
+    assert profile["strike_step"] == 50
+    assert profile["option_lot_size"] == 65
+
+
+def test_discover_index_profile_falls_back_when_lot_missing_for_known_script(fake_openalgo):
+    broker = OpenAlgoBroker(api_key="k", host="h", dry_run=True)
+    client = fake_openalgo["client"]
+    client.optionchain_response = {
+        "status": "success",
+        "data": {
+            "underlying": "NIFTY",
+            "records": [{"expiry": "2026-08-11", "strike": 25000}, {"expiry": "2026-08-11", "strike": 25050}],
+        },
+    }
+
+    profile = broker.discover_index_profile("NIFTY")
+    assert profile["strike_step"] == 50
+    assert profile["option_lot_size"] == 65
+
+
+def test_discover_index_profile_requires_strike_step_for_unknown_script(fake_openalgo):
+    broker = OpenAlgoBroker(api_key="k", host="h", dry_run=True)
+    client = fake_openalgo["client"]
+    client.optionchain_response = {
+        "status": "success",
+        "data": {"underlying": "MIDCAP", "lot_size": 10, "records": [{"expiry": "2026-08-11"}]},
+    }
+
+    with pytest.raises(RuntimeError, match="strike-step"):
+        broker.discover_index_profile("MIDCAP")
+
+
+def test_discover_index_profile_requires_lot_size_for_unknown_script(fake_openalgo):
+    broker = OpenAlgoBroker(api_key="k", host="h", dry_run=True)
+    client = fake_openalgo["client"]
+    client.optionchain_response = {
+        "status": "success",
+        "data": {
+            "underlying": "MIDCAP",
+            "records": [{"expiry": "2026-08-11", "strike": 25000}, {"expiry": "2026-08-11", "strike": 25050}],
+        },
+    }
+
+    with pytest.raises(RuntimeError, match="lot-size"):
+        broker.discover_index_profile("MIDCAP")
+
+
+def test_discover_payload_handles_method_errors_and_later_success(fake_openalgo):
+    broker = OpenAlgoBroker(api_key="k", host="h", dry_run=True)
+
+    class _Client:
+        def optionchain(self, **kwargs):
+            raise RuntimeError("boom")
+
+        def searchscrip(self, **kwargs):
+            return {"status": "error"}
+
+        def search(self, **kwargs):
+            return None
+
+        def instruments(self, **kwargs):
+            return {"status": "success", "data": {"lot_size": 10, "strike_step": 100}}
+
+    broker.client = _Client()
+    payload, err = broker._discover_payload("NIFTY", "NSE_INDEX", "NFO")
+    assert err is None
+    assert isinstance(payload, dict)
+    assert payload["status"] == "success"
+
+
+def test_discovery_helper_parsers_cover_edge_cases(fake_openalgo):
+    broker = OpenAlgoBroker(api_key="k", host="h", dry_run=True)
+
+    assert broker._normalize_script_name("nifty 50") == "NIFTY"
+    assert broker._normalize_script_name("Nifty-Bank") == "BANKNIFTY"
+    assert broker._symbol_aliases("UNKNOWN") == ["UNKNOWN"]
+
+    assert broker._is_usable_payload(None) is False
+    assert broker._is_usable_payload({"status": "error"}) is False
+    assert broker._is_usable_payload({"status": "success"}) is True
+
+    assert broker._coerce_number("1,234.5") == 1234.5
+    assert broker._coerce_number("abc") is None
+    assert broker._coerce_number(object()) is None
+
+    numeric = broker._extract_numeric_fields({"data": [{"lotsize": "65"}, {"marketlot": 30}, {"lot_size": "x"}]})
+    assert numeric["lot_size"] == 65
+    assert numeric["market_lot"] == 30
+
+    assert broker._extract_strike_step({"strike_interval": "50"}) == 50
+    assert broker._extract_strike_step({"data": [{"strike": 25000}, {"strike": 25100}]}) == 100
+    assert broker._extract_strike_step({"data": [[25000, 25050, 25100]]}) == 50
+    assert broker._extract_strike_step({"data": [{"strike": 25000}]}) is None
+
+    assert broker._extract_symbol({"data": [{"name": "NIFTY 50"}]}) == "NIFTY"
+    assert broker._extract_symbol({"data": [{"name": "OTHER"}]}) is None
+
+    assert broker._extract_option_root({"data": [{"underlying_symbol": "Nifty"}]}) == "NIFTY"
+    assert broker._extract_option_root(["noop", 1]) is None
+    assert broker._infer_index_root("NIFTY11AUG2625100CE") == "NIFTY"
+    assert broker._infer_index_root("Nifty Bank") == "BANKNIFTY"
+    assert broker._infer_index_root("SENSEX10SEP2682700PE") == "SENSEX"
+    assert broker._infer_index_root("   ") is None
+    assert broker._infer_index_root("random") is None
+
+    assert broker._extract_weekly_expiry_weekday({"data": [{"expiry_weekday": 4}]}) == 4
+    assert broker._extract_weekly_expiry_weekday({"data": [{"exp": ""}]}) == 1
+    assert broker._extract_weekly_expiry_weekday(["11-08-2026", "18-08-2026"]) == 1
+
+    assert broker._parse_date("11-08-2026") is not None
+    assert broker._parse_date("11Aug26") is not None
+    assert broker._parse_date(123) is None
+    assert broker._parse_date("") is None
+    assert broker._parse_date("invalid") is None
 
 
 def test_historical_replay_broker_paths():

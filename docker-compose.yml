@@ -1,13 +1,52 @@
+x-live-defaults: &live-defaults
+  build: .
+  restart: always
+  env_file: .env
+  environment:
+    TZ: Asia/Kolkata
+    STRATEGY: hd,cd
+    MODE: live
+    OPENALGO_HOST: http://host.docker.internal:5001
+    OPENALGO_WS_URL: ws://host.docker.internal:8765
+    WEBSOCKET_HOST: host.docker.internal
+    WEBSOCKET_PORT: "8765"
+
 services:
-  app:
-    build: .
-    container_name: openalgo_buying_setups
-    restart: always
-    env_file: .env
+  live_nifty:
+    <<: *live-defaults
+    container_name: openalgo_live_nifty
     environment:
-      - TZ=Asia/Kolkata
-      - STRATEGY=${STRATEGY:-hd,cd}
-      - MODE=${MODE:-live}
-      - OPENALGO_HOST=http://host.docker.internal:5001
-      - WEBSOCKET_HOST=host.docker.internal
-      - WEBSOCKET_PORT=8765
+      TZ: Asia/Kolkata
+      STRATEGY: hd,cd
+      MODE: live
+      SCRIPT: NIFTY
+      OPENALGO_HOST: http://host.docker.internal:5001
+      OPENALGO_WS_URL: ws://host.docker.internal:8765
+      WEBSOCKET_HOST: host.docker.internal
+      WEBSOCKET_PORT: "8765"
+
+  live_banknifty:
+    <<: *live-defaults
+    container_name: openalgo_live_banknifty
+    environment:
+      TZ: Asia/Kolkata
+      STRATEGY: hd,cd
+      MODE: live
+      SCRIPT: BANKNIFTY
+      OPENALGO_HOST: http://host.docker.internal:5001
+      OPENALGO_WS_URL: ws://host.docker.internal:8765
+      WEBSOCKET_HOST: host.docker.internal
+      WEBSOCKET_PORT: "8765"
+
+  live_sensex:
+    <<: *live-defaults
+    container_name: openalgo_live_sensex
+    environment:
+      TZ: Asia/Kolkata
+      STRATEGY: hd,cd
+      MODE: live
+      SCRIPT: SENSEX
+      OPENALGO_HOST: http://host.docker.internal:5001
+      OPENALGO_WS_URL: ws://host.docker.internal:8765
+      WEBSOCKET_HOST: host.docker.internal
+      WEBSOCKET_PORT: "8765"

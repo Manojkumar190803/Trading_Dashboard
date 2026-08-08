@@ -12,5 +12,6 @@ COPY . .
 
 ENV STRATEGY=hd,cd
 ENV MODE=live
+ENV SCRIPT=NIFTY
 
-CMD ["sh", "-c", "exec python3 run_strategy.py --strategy $STRATEGY --mode $MODE"]
+CMD ["sh", "-c", "exec python3 run_strategy.py --script $SCRIPT --strategy $STRATEGY --mode $MODE"]

@@ -33,16 +33,16 @@ cp .env.example .env  # Add your OpenAlgo credentials
 
 ```bash
 # Backtest
-python3 run_strategy.py --strategy hd --mode backtest --start 2026-08-01 --end 2026-08-07
+python3 run_strategy.py --script NIFTY --strategy hd --mode backtest --start 2026-08-01 --end 2026-08-07
 
 # Paper trading (dry run, real data)
-python3 run_strategy.py --strategy cd --mode paper
+python3 run_strategy.py --script BANKNIFTY --strategy cd --mode paper
 
 # Live trading
-python3 run_strategy.py --strategy hd --mode live
+python3 run_strategy.py --script SENSEX --strategy hd --mode live
 
 # Smoke test (fetch data, print indicators)
-python3 run_strategy.py --strategy hd --mode smoke
+python3 run_strategy.py --script NIFTY --strategy hd --mode smoke
 ```
 
 ### Multi-Strategy (Independent Execution)
@@ -64,11 +64,12 @@ python3 run_strategy.py --strategy hd,cd --mode live
 
 | Argument | Description | Default |
 |----------|-------------|---------|
+| `--script` | Underlying script: `NIFTY`, `BANKNIFTY`, `SENSEX` (strike step, lot size, option root, exchanges, weekly expiry are discovered from OpenAlgo) | `NIFTY` |
 | `--strategy` | Strategy name(s), comma-separated: `hd`, `cd`, `hd,cd` | `hd` |
 | `--mode` | `backtest`, `smoke`, `paper`, `live` | `smoke` |
 | `--start` | Backtest start date (YYYY-MM-DD) | — |
 | `--end` | Backtest end date (YYYY-MM-DD) | today |
-| `--symbol` | Override spot symbol | `NIFTY` |
+| `--symbol` | Manual override for spot/option root symbol after discovery | discovered from `--script` |
 | `--exchange` | Override spot exchange | `NSE_INDEX` |
 | `--timeframe` | Override candle interval (minutes) | `3` |
 | `--max-risk` | Override max option risk points | `20` |
@@ -129,20 +130,31 @@ python3 -m pytest tests/ -v
 ## Docker
 
 ```bash
-# Run both strategies live (uses .env for credentials)
+# Run intraday live for all scripts in parallel:
+# - NIFTY (HD+CD)
+# - BANKNIFTY (HD+CD)
+# - SENSEX (HD+CD)
 docker compose up -d
 
-# Override strategy or mode
-STRATEGY=hd MODE=paper docker compose up -d
-
-# View logs
+# Follow logs for all live services
 docker compose logs -f
+
+# Follow logs for one script
+docker compose logs -f live_nifty
+docker compose logs -f live_banknifty
+docker compose logs -f live_sensex
+
+# Restart only one script service
+docker compose restart live_nifty
+
+# Run a single script service (if needed)
+docker compose up -d live_nifty
 
 # Stop
 docker compose down
 ```
 
-The container runs in IST timezone, auto-restarts on crash, and uses `network_mode: host` to reach local OpenAlgo instances.
+Each service runs in IST timezone, auto-restarts on crash, and injects script-specific `SCRIPT` value into `run_strategy.py --mode live --strategy hd,cd`.
 
 ---
 

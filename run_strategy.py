@@ -18,6 +18,8 @@ from strategies.base import SignalProvider
 
 logger = logging.getLogger("run_strategy")
 
+SCRIPT_CHOICES = ("NIFTY", "BANKNIFTY", "SENSEX")
+
 # ── Strategy registry ────────────────────────────────────────────────────────
 # Add new strategies here: key = CLI name, value = factory function.
 
@@ -66,6 +68,10 @@ def get_signal_provider(name: str, args: argparse.Namespace) -> SignalProvider:
 
 def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Unified strategy runner")
+    parser.add_argument(
+        "--script", type=str, default="NIFTY",
+        help="Underlying script: NIFTY | BANKNIFTY | SENSEX (auto-discovers lot/strike/expiry from OpenAlgo)",
+    )
     parser.add_argument(
         "--strategy", type=str, default="hd",
         help=f"Strategy to run (available: {', '.join(sorted(STRATEGY_REGISTRY.keys()))})",
@@ -141,6 +147,31 @@ def _build_broker(cfg: StrategyConfig, dry_run: bool) -> OpenAlgoBroker:
     )
 
 
+def _apply_discovered_script_profile(cfg: StrategyConfig, script: str) -> None:
+    """Discover and apply script-specific instrument metadata via OpenAlgo."""
+    probe_broker = _build_broker(cfg, dry_run=True)
+    profile = probe_broker.discover_index_profile(script)
+    cfg.spot_symbol = str(profile["spot_symbol"])
+    cfg.option_index_symbol = str(profile["option_index_symbol"])
+    cfg.exchange_spot = str(profile["exchange_spot"])
+    cfg.exchange_options = str(profile["exchange_options"])
+    cfg.strike_step = int(profile["strike_step"])
+    cfg.option_lot_size = int(profile["option_lot_size"])
+    cfg.weekly_expiry_weekday = int(profile["weekly_expiry_weekday"])
+
+    logger.info(
+        "script profile discovered: script=%s spot=%s opt_root=%s exch=%s/%s strike_step=%s lot_size=%s expiry_weekday=%s",
+        script,
+        cfg.spot_symbol,
+        cfg.option_index_symbol,
+        cfg.exchange_spot,
+        cfg.exchange_options,
+        cfg.strike_step,
+        cfg.option_lot_size,
+        cfg.weekly_expiry_weekday,
+    )
+
+
 def _run_smoke(cfg: StrategyConfig) -> None:
     broker = _build_broker(cfg, dry_run=True)
     today = datetime.now().date()
@@ -199,6 +230,13 @@ def main(argv: Optional[list[str]] = None) -> None:
     _load_dotenv_if_present()
 
     cfg = StrategyConfig()
+    script = (args.script or "").upper().replace(" ", "")
+    if script not in SCRIPT_CHOICES:
+        allowed = ", ".join(SCRIPT_CHOICES)
+        raise SystemExit(f"Invalid --script '{args.script}'. Allowed: {allowed}")
+    _apply_discovered_script_profile(cfg, script)
+
+    # Manual overrides still win over discovered defaults.
     if args.symbol:
         cfg.spot_symbol = args.symbol
         cfg.option_index_symbol = args.symbol
