@@ -36,8 +36,14 @@ def _register_cd() -> SignalProvider:
     return CDSignalProvider(CDConfig())
 
 
+def _register_tc() -> SignalProvider:
+    from strategies.tc import TCConfig, TCSignalProvider
+    return TCSignalProvider(TCConfig())
+
+
 STRATEGY_REGISTRY["hd"] = _register_hd
 STRATEGY_REGISTRY["cd"] = _register_cd
+STRATEGY_REGISTRY["tc"] = _register_tc
 
 
 def get_signal_provider(name: str, args: argparse.Namespace) -> SignalProvider:
@@ -55,6 +61,13 @@ def get_signal_provider(name: str, args: argparse.Namespace) -> SignalProvider:
         if args.body_threshold is not None:
             cd_cfg.strong_body_threshold = args.body_threshold
         return CDSignalProvider(cd_cfg)
+
+    if name == "tc":
+        from strategies.tc import TCConfig, TCSignalProvider
+        tc_cfg = TCConfig()
+        if args.body_threshold is not None:
+            tc_cfg.strong_body_threshold = args.body_threshold
+        return TCSignalProvider(tc_cfg)
 
     factory = STRATEGY_REGISTRY.get(name)
     if factory is None:

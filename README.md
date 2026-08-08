@@ -12,6 +12,7 @@ Automated trading system for **Nifty weekly options** using RSI divergence strat
 |----------|-------------|------------|
 | **HD** (Hidden Divergence) | Price HL + RSI LL (trend continuation) | EMA trend filter + 1 trigger candle |
 | **CD** (Classic Divergence) | Price LL + RSI HL (reversal) | No trend filter + 2 consecutive confirmation candles |
+| **TC** (Trend Continuation) | 2 bullish momentum candles + high-volume red pullback | EMA alignment + red candle structure/volume rules |
 
 Both strategies share the same engine infrastructure: ATM strike locking, VWAP position sizing, risk caps, and step-trailing SL.
 
@@ -38,6 +39,9 @@ python3 run_strategy.py --script NIFTY --strategy hd --mode backtest --start 202
 # Paper trading (dry run, real data)
 python3 run_strategy.py --script BANKNIFTY --strategy cd --mode paper
 
+# TC strategy
+python3 run_strategy.py --script NIFTY --strategy tc --mode paper
+
 # Live trading
 python3 run_strategy.py --script SENSEX --strategy hd --mode live
 
@@ -50,14 +54,14 @@ python3 run_strategy.py --script NIFTY --strategy hd --mode smoke
 Both strategies run independently — each has its own positions, SL cap, and PnL.
 
 ```bash
-# Backtest both (single data fetch, combined summary)
-python3 run_strategy.py --strategy hd,cd --mode backtest --start 2026-08-01 --end 2026-08-07
+# Backtest all (single data fetch, combined summary)
+python3 run_strategy.py --strategy hd,cd,tc --mode backtest --start 2026-08-01 --end 2026-08-07
 
-# Paper trade both simultaneously
-python3 run_strategy.py --strategy hd,cd --mode paper
+# Paper trade all simultaneously
+python3 run_strategy.py --strategy hd,cd,tc --mode paper
 
-# Live trade both simultaneously
-python3 run_strategy.py --strategy hd,cd --mode live
+# Live trade all simultaneously
+python3 run_strategy.py --strategy hd,cd,tc --mode live
 ```
 
 ### CLI Options
@@ -65,7 +69,7 @@ python3 run_strategy.py --strategy hd,cd --mode live
 | Argument | Description | Default |
 |----------|-------------|---------|
 | `--script` | Underlying script: `NIFTY`, `BANKNIFTY`, `SENSEX` (strike step, lot size, option root, exchanges, weekly expiry are discovered from OpenAlgo) | `NIFTY` |
-| `--strategy` | Strategy name(s), comma-separated: `hd`, `cd`, `hd,cd` | `hd` |
+| `--strategy` | Strategy name(s), comma-separated: `hd`, `cd`, `tc`, `hd,cd,tc` | `hd` |
 | `--mode` | `backtest`, `smoke`, `paper`, `live` | `smoke` |
 | `--start` | Backtest start date (YYYY-MM-DD) | — |
 | `--end` | Backtest end date (YYYY-MM-DD) | today |
@@ -95,10 +99,12 @@ openalgo_buying_setups/
 ├── strategies/
 │   ├── base.py             # SignalProvider ABC
 │   ├── hd.py              # Hidden Divergence signal logic
-│   └── cd.py              # Classic Divergence signal logic
+│   ├── cd.py              # Classic Divergence signal logic
+│   └── tc.py              # Trend Continuation signal logic
 ├── docs/
 │   ├── hd.md              # HD strategy FRD (V3.0)
-│   └── cd.md              # CD strategy FRD (V1.2)
+│   ├── cd.md              # CD strategy FRD (V1.2)
+│   └── tc.md              # TC strategy FRD (V1.1)
 ├── tests/
 │   ├── test_cd_strategy.py
 │   └── test_vwap_room_and_tsl.py
@@ -154,7 +160,7 @@ docker compose up -d live_nifty
 docker compose down
 ```
 
-Each service runs in IST timezone, auto-restarts on crash, and injects script-specific `SCRIPT` value into `run_strategy.py --mode live --strategy hd,cd`.
+Each service runs in IST timezone, auto-restarts on crash, and injects script-specific `SCRIPT` value into `run_strategy.py --mode live --strategy hd,cd,tc`.
 
 ---
 

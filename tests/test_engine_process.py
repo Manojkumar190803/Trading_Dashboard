@@ -1,10 +1,12 @@
 """Focused tests for BaseStrategyEngine tick and square-off behavior."""
 
-from datetime import datetime
+from datetime import date, datetime
+
+import pandas as pd
 
 from core.broker import ConsoleBroker
 from core.engine import BaseStrategyEngine
-from core.models import BaseSideState, Position, RiskConfig, Signal, StrategyConfig
+from core.models import BaseSideState, PendingEntry, Position, RiskConfig, Signal, StrategyConfig
 from strategies.base import SignalProvider
 
 
@@ -33,10 +35,28 @@ class StubSignalProvider(SignalProvider):
 
 def _make_engine() -> BaseStrategyEngine:
     return BaseStrategyEngine(
-        cfg=StrategyConfig(option_lot_size=65),
+        cfg=StrategyConfig(option_lot_size=65, pending_entry_expiry_candles=3),
         risk=RiskConfig(max_sl_per_day=3),
         broker=ConsoleBroker(ltp_fallback=100.0),
         signal_provider=StubSignalProvider(),
+    )
+
+
+def _row(ts: datetime, high: float = 100.0, low: float = 95.0) -> pd.Series:
+    return pd.Series(
+        {
+            "datetime": ts,
+            "open": 97.0,
+            "high": high,
+            "low": low,
+            "close": 98.0,
+            "rsi3": 40.0,
+            "ema13": 98.0,
+            "ema20": 97.0,
+            "ema50": 96.0,
+            "vwap": 97.5,
+            "volume": 1000.0,
+        }
     )
 
 
@@ -92,3 +112,63 @@ def test_force_square_off_side_clears_pending_and_position():
     engine.force_square_off_side(ss, datetime(2026, 8, 8, 15, 16))
     assert ss.pending_entry is None
     assert ss.position is None
+
+
+def test_pending_entry_expires_after_3_candles():
+    engine = _make_engine()
+    engine.state.trading_day = datetime(2026, 8, 8).date()
+    ss = engine.state.ce
+    ss.option_symbol = "NIFTY08AUG2625000CE"
+    ss.pending_entry = PendingEntry(
+        signal=Signal.BUY_CE,
+        created_at=datetime(2026, 8, 8, 10, 0),
+        option_symbol=ss.option_symbol,
+        quantity=65,
+        option_trigger_level=120.0,
+        option_stop_level=90.0,
+        trigger_candle_high=119.0,
+        trigger_candle_low=95.0,
+    )
+
+    # 4 candles elapsed (12 minutes on 3m TF) -> should expire.
+    row = _row(datetime(2026, 8, 8, 10, 12), high=110.0, low=95.0)
+    engine.process_option_candle("CE", row, None)
+
+    assert ss.pending_entry is None
+    assert any("expired after" in a.message for a in engine.alerts)
+
+
+def test_pending_entry_still_valid_at_3rd_candle():
+    engine = _make_engine()
+    engine.state.trading_day = datetime(2026, 8, 8).date()
+    ss = engine.state.ce
+    ss.option_symbol = "NIFTY08AUG2625000CE"
+    ss.pending_entry = PendingEntry(
+        signal=Signal.BUY_CE,
+        created_at=datetime(2026, 8, 8, 10, 0),
+        option_symbol=ss.option_symbol,
+        quantity=65,
+        option_trigger_level=120.0,
+        option_stop_level=90.0,
+        trigger_candle_high=119.0,
+        trigger_candle_low=95.0,
+    )
+
+    # Exactly 3 candles elapsed (9 minutes) -> still allowed.
+    row = _row(datetime(2026, 8, 8, 10, 9), high=110.0, low=95.0)
+    engine.process_option_candle("CE", row, None)
+
+    assert ss.pending_entry is not None
+
+
+def test_lock_atm_uses_expiry_override_date():
+    engine = _make_engine()
+    lock_ts = datetime(2026, 8, 8, 9, 20)
+    # Override to a known monthly code date.
+    engine.lock_atm_for_day(lock_ts, spot_price=57746.45, expiry_day_override=date(2026, 8, 25))
+
+    assert engine.state.atm_locked is True
+    assert engine.state.ce_symbol is not None
+    assert engine.state.pe_symbol is not None
+    assert "25AUG26" in engine.state.ce_symbol
+    assert "25AUG26" in engine.state.pe_symbol

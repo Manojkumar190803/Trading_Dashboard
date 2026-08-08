@@ -4,7 +4,7 @@ x-live-defaults: &live-defaults
   env_file: .env
   environment:
     TZ: Asia/Kolkata
-    STRATEGY: hd,cd
+    STRATEGY: hd,cd,tc
     MODE: live
     OPENALGO_HOST: http://host.docker.internal:5001
     OPENALGO_WS_URL: ws://host.docker.internal:8765
@@ -17,7 +17,7 @@ services:
     container_name: openalgo_live_nifty
     environment:
       TZ: Asia/Kolkata
-      STRATEGY: hd,cd
+      STRATEGY: hd,cd,tc
       MODE: live
       SCRIPT: NIFTY
       OPENALGO_HOST: http://host.docker.internal:5001
@@ -30,7 +30,7 @@ services:
     container_name: openalgo_live_banknifty
     environment:
       TZ: Asia/Kolkata
-      STRATEGY: hd,cd
+      STRATEGY: hd,cd,tc
       MODE: live
       SCRIPT: BANKNIFTY
       OPENALGO_HOST: http://host.docker.internal:5001
@@ -43,7 +43,7 @@ services:
     container_name: openalgo_live_sensex
     environment:
       TZ: Asia/Kolkata
-      STRATEGY: hd,cd
+      STRATEGY: hd,cd,tc
       MODE: live
       SCRIPT: SENSEX
       OPENALGO_HOST: http://host.docker.internal:5001

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import re
+import time as time_module
 from datetime import date, datetime, time, timedelta
 from typing import Optional
 
@@ -30,6 +31,17 @@ class BrokerInterface:
 
     def place_market_order(self, symbol: str, side: OrderSide, quantity: int) -> str:
         raise NotImplementedError
+
+    def resolve_nearest_expiry(
+        self,
+        index_symbol: str,
+        trade_day: date,
+        atm_strike: int,
+        strike_step: int,
+        preferred_weekday: Optional[int] = None,
+    ) -> Optional[date]:
+        """Return nearest tradable expiry date for an option root, if available."""
+        return None
 
 
 class ConsoleBroker(BrokerInterface):
@@ -91,10 +103,110 @@ class OpenAlgoBroker(BrokerInterface):
         self.product = product
         self.exchange_options = exchange_options
         self.dry_run = dry_run
+        self._nearest_expiry_cache: dict[tuple[str, str, int, int, str], Optional[date]] = {}
         logger.info(
             "OpenAlgoBroker initialized host=%s ws_url=%s product=%s dry_run=%s",
             host, ws_url, product, dry_run,
         )
+
+    def resolve_nearest_expiry(
+        self,
+        index_symbol: str,
+        trade_day: date,
+        atm_strike: int,
+        strike_step: int,
+        preferred_weekday: Optional[int] = None,
+    ) -> Optional[date]:
+        """Probe option symbols to find the nearest tradable expiry.
+
+        This handles broker feeds that don't expose explicit weekly/monthly expiry metadata.
+        """
+        root = (index_symbol or "").upper().strip()
+        key = (
+            root,
+            trade_day.isoformat(),
+            int(atm_strike),
+            int(strike_step),
+            self.exchange_options,
+            int(preferred_weekday) if preferred_weekday is not None else -1,
+        )
+        if key in self._nearest_expiry_cache:
+            return self._nearest_expiry_cache[key]
+
+        strikes = [atm_strike - strike_step, atm_strike, atm_strike + strike_step]
+        strikes = sorted({s for s in strikes if s > 0})
+
+        candidate_days: list[date] = []
+
+        # Prioritize the configured/script-specific expiry weekday first.
+        if preferred_weekday is not None and 0 <= preferred_weekday <= 6:
+            for day_offset in range(0, 70):
+                d = trade_day + timedelta(days=day_offset)
+                if d.weekday() == preferred_weekday:
+                    candidate_days.append(d)
+                if len(candidate_days) >= 10:
+                    break
+
+        # Add the remaining weekdays as backups with short horizon.
+        for wd in range(0, 5):
+            if preferred_weekday is not None and wd == preferred_weekday:
+                continue
+            count = 0
+            for day_offset in range(0, 35):
+                d = trade_day + timedelta(days=day_offset)
+                if d.weekday() == wd:
+                    if d not in candidate_days:
+                        candidate_days.append(d)
+                    count += 1
+                if count >= 2:
+                    break
+
+        candidate_days.sort()
+        for candidate_day in candidate_days:
+            expiry_code = candidate_day.strftime("%d%b%y").upper()
+            for strike in strikes:
+                for option_type in ("CE", "PE"):
+                    symbol = f"{root}{expiry_code}{strike}{option_type}"
+                    if self._quote_symbol_exists(symbol):
+                        self._nearest_expiry_cache[key] = candidate_day
+                        logger.info(
+                            "nearest expiry resolved for %s: %s (symbol=%s)",
+                            root,
+                            candidate_day,
+                            symbol,
+                        )
+                        return candidate_day
+
+        logger.warning(
+            "Could not resolve nearest expiry for %s around strike=%s; using fallback expiry logic",
+            root,
+            atm_strike,
+        )
+        self._nearest_expiry_cache[key] = None
+        return None
+
+    def _quote_symbol_exists(self, symbol: str) -> bool:
+        """Check symbol existence via quotes with gentle throttling and 429 retry."""
+        max_attempts = 3
+        for attempt in range(max_attempts):
+            try:
+                resp = self.client.quotes(symbol=symbol, exchange=self.exchange_options)
+            except Exception:
+                resp = None
+
+            if isinstance(resp, dict):
+                if resp.get("status") == "success":
+                    time_module.sleep(0.03)
+                    return True
+                message = str(resp.get("message") or "")
+                if "429" in message and attempt < max_attempts - 1:
+                    # Back off slightly when OpenAlgo rate-limits requests.
+                    time_module.sleep(0.25 * (attempt + 1))
+                    continue
+            break
+
+        time_module.sleep(0.03)
+        return False
 
     def get_ltp(self, symbol: str) -> float:
         exchange = self._infer_exchange(symbol)

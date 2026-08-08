@@ -233,12 +233,29 @@ class BaseStrategyEngine:
     def must_force_square_off(self, ts: datetime) -> bool:
         return ts.time() >= self.cfg.force_square_off
 
-    def lock_atm_for_day(self, ts: datetime, spot_price: float) -> None:
+    def lock_atm_for_day(
+        self,
+        ts: datetime,
+        spot_price: float,
+        expiry_day_override: Optional[date] = None,
+    ) -> None:
         if self.state.atm_locked:
             return
-        expiry_day = choose_weekly_expiry_for_entry(ts.date(), self.cfg.weekly_expiry_weekday)
-        expiry_code = format_expiry_code(expiry_day)
         strike = get_atm_strike(spot_price, self.cfg.strike_step)
+
+        expiry_day: Optional[date] = expiry_day_override
+        if expiry_day is None:
+            expiry_day = self.broker.resolve_nearest_expiry(
+                self.cfg.option_index_symbol,
+                ts.date(),
+                strike,
+                self.cfg.strike_step,
+                preferred_weekday=self.cfg.weekly_expiry_weekday,
+            )
+        if expiry_day is None:
+            expiry_day = choose_weekly_expiry_for_entry(ts.date(), self.cfg.weekly_expiry_weekday)
+        expiry_code = format_expiry_code(expiry_day)
+
         ce_symbol = build_option_symbol(self.cfg.option_index_symbol, expiry_code, strike, "CE")
         pe_symbol = build_option_symbol(self.cfg.option_index_symbol, expiry_code, strike, "PE")
         self.state.ce_symbol = ce_symbol
@@ -346,6 +363,20 @@ class BaseStrategyEngine:
     ) -> None:
         pending = side_state.pending_entry
         if pending is None:
+            return
+
+        # Cancel pending after configured number of candles from setup bar.
+        candle_seconds = max(1, self.cfg.timeframe_minutes * 60)
+        elapsed_seconds = max(0.0, (ts - pending.created_at).total_seconds())
+        candles_elapsed = int(elapsed_seconds // candle_seconds)
+        if candles_elapsed > self.cfg.pending_entry_expiry_candles:
+            self._record_alert(
+                ts,
+                "CANCEL",
+                f"{side} pending cancelled: expired after {candles_elapsed} candles "
+                f"(limit={self.cfg.pending_entry_expiry_candles})",
+            )
+            side_state.pending_entry = None
             return
 
         # Cancel pending if SL level is breached before entry triggers.

@@ -10,7 +10,7 @@ from typing import Optional
 import pandas as pd
 
 from core.broker import HistoricalReplayBroker, OpenAlgoBroker
-from core.engine import BaseStrategyEngine
+from core.engine import BaseStrategyEngine, get_atm_strike
 from core.indicators import add_indicators
 from core.models import RiskConfig, StrategyConfig
 from strategies.base import SignalProvider
@@ -47,6 +47,69 @@ def _normalize_history_df(df: pd.DataFrame) -> pd.DataFrame:
         ["open", "high", "low", "close", "volume"]
     ].apply(pd.to_numeric, errors="coerce")
     return out.sort_values("datetime").reset_index(drop=True)
+
+
+def _parse_option_symbol(symbol: str) -> tuple[str, str, int, str]:
+    """Parse <ROOT><DDMMMYY><STRIKE><CE|PE> option symbols."""
+    m = re.match(r"^(.*?)(\d{2}[A-Z]{3}\d{2})(\d+)(CE|PE)$", symbol)
+    if not m:
+        raise ValueError(f"Unrecognized option symbol format: {symbol}")
+    root, expiry_code, strike_str, option_type = m.groups()
+    return root, expiry_code, int(strike_str), option_type
+
+
+def _build_option_symbol(root: str, expiry_code: str, strike: int, option_type: str) -> str:
+    return f"{root}{expiry_code}{strike}{option_type}"
+
+
+def _strike_offsets(max_steps: int = 8) -> list[int]:
+    """Return 0, +1, -1, +2, -2, ... for nearby strike probing."""
+    out = [0]
+    for step in range(1, max_steps + 1):
+        out.extend([step, -step])
+    return out
+
+
+def _resolve_option_pair_history(
+    broker: OpenAlgoBroker,
+    ce_symbol: str,
+    pe_symbol: str,
+    exchange: str,
+    interval: str,
+    start_date: str,
+    end_date: str,
+    strike_step: int,
+    max_steps: int = 8,
+) -> tuple[pd.DataFrame, pd.DataFrame, str, str, int]:
+    """Try ATM and nearby strikes; return first CE/PE pair that has history."""
+    ce_root, ce_exp, ce_strike, ce_type = _parse_option_symbol(ce_symbol)
+    pe_root, pe_exp, pe_strike, pe_type = _parse_option_symbol(pe_symbol)
+    if ce_root != pe_root or ce_exp != pe_exp or ce_type != "CE" or pe_type != "PE":
+        raise RuntimeError(
+            f"Cannot resolve pair for symbols CE={ce_symbol} PE={pe_symbol}"
+        )
+    base_strike = ce_strike
+    if pe_strike != base_strike:
+        base_strike = int(round((ce_strike + pe_strike) / 2))
+
+    last_exc: Optional[Exception] = None
+    for off in _strike_offsets(max_steps=max_steps):
+        strike = base_strike + off * strike_step
+        ce_try = _build_option_symbol(ce_root, ce_exp, strike, "CE")
+        pe_try = _build_option_symbol(pe_root, pe_exp, strike, "PE")
+        try:
+            ce_df = _fetch_history_df(broker, ce_try, exchange, interval, start_date, end_date)
+            pe_df = _fetch_history_df(broker, pe_try, exchange, interval, start_date, end_date)
+            if ce_df.empty or pe_df.empty:
+                continue
+            return ce_df, pe_df, ce_try, pe_try, off
+        except Exception as exc:
+            last_exc = exc
+            continue
+
+    if last_exc is not None:
+        raise RuntimeError(str(last_exc))
+    raise RuntimeError(f"No option history available for {ce_symbol}/{pe_symbol}")
 
 
 # ===============================================================
@@ -659,7 +722,15 @@ def run_historical_replay(
 
         engine.reset_for_new_day(day)
         lock_ts = datetime.combine(day, cfg.atm_lock_time)
-        engine.lock_atm_for_day(lock_ts, atm_price)
+        atm_strike = get_atm_strike(atm_price, cfg.strike_step)
+        expiry_day = history_broker.resolve_nearest_expiry(
+            cfg.option_index_symbol,
+            day,
+            atm_strike,
+            cfg.strike_step,
+            preferred_weekday=cfg.weekly_expiry_weekday,
+        )
+        engine.lock_atm_for_day(lock_ts, atm_price, expiry_day_override=expiry_day)
         ce_sym = engine.state.ce_symbol
         pe_sym = engine.state.pe_symbol
         assert ce_sym and pe_sym
@@ -667,12 +738,30 @@ def run_historical_replay(
         warmup_start = (day - timedelta(days=5)).strftime("%Y-%m-%d")
         day_str = day.strftime("%Y-%m-%d")
         try:
-            ce_raw = _fetch_history_df(
-                history_broker, ce_sym, cfg.exchange_options, interval, warmup_start, day_str,
+            ce_raw, pe_raw, resolved_ce, resolved_pe, off = _resolve_option_pair_history(
+                history_broker,
+                ce_sym,
+                pe_sym,
+                cfg.exchange_options,
+                interval,
+                warmup_start,
+                day_str,
+                cfg.strike_step,
             )
-            pe_raw = _fetch_history_df(
-                history_broker, pe_sym, cfg.exchange_options, interval, warmup_start, day_str,
-            )
+            if off != 0:
+                logger.warning(
+                    "replay %s: ATM strike history missing; fallback offset=%+d used (CE=%s PE=%s)",
+                    day,
+                    off,
+                    resolved_ce,
+                    resolved_pe,
+                )
+            ce_sym = resolved_ce
+            pe_sym = resolved_pe
+            engine.state.ce_symbol = resolved_ce
+            engine.state.pe_symbol = resolved_pe
+            engine.state.ce.option_symbol = resolved_ce
+            engine.state.pe.option_symbol = resolved_pe
         except Exception as exc:
             logger.warning("replay %s: option history fetch failed (%s) — skipping day", day, exc)
             skipped_days += 1
@@ -798,9 +887,17 @@ def run_multi_historical_replay(
             continue
 
         lock_ts = datetime.combine(day, cfg.atm_lock_time)
+        atm_strike = get_atm_strike(atm_price, cfg.strike_step)
+        expiry_day = history_broker.resolve_nearest_expiry(
+            cfg.option_index_symbol,
+            day,
+            atm_strike,
+            cfg.strike_step,
+            preferred_weekday=cfg.weekly_expiry_weekday,
+        )
         for _, engine, _ in engines:
             engine.reset_for_new_day(day)
-            engine.lock_atm_for_day(lock_ts, atm_price)
+            engine.lock_atm_for_day(lock_ts, atm_price, expiry_day_override=expiry_day)
 
         # All engines share the same ATM symbols
         ce_sym = engines[0][1].state.ce_symbol
@@ -810,12 +907,31 @@ def run_multi_historical_replay(
         warmup_start = (day - timedelta(days=5)).strftime("%Y-%m-%d")
         day_str = day.strftime("%Y-%m-%d")
         try:
-            ce_raw = _fetch_history_df(
-                history_broker, ce_sym, cfg.exchange_options, interval, warmup_start, day_str,
+            ce_raw, pe_raw, resolved_ce, resolved_pe, off = _resolve_option_pair_history(
+                history_broker,
+                ce_sym,
+                pe_sym,
+                cfg.exchange_options,
+                interval,
+                warmup_start,
+                day_str,
+                cfg.strike_step,
             )
-            pe_raw = _fetch_history_df(
-                history_broker, pe_sym, cfg.exchange_options, interval, warmup_start, day_str,
-            )
+            if off != 0:
+                logger.warning(
+                    "replay %s: ATM strike history missing; fallback offset=%+d used (CE=%s PE=%s)",
+                    day,
+                    off,
+                    resolved_ce,
+                    resolved_pe,
+                )
+            ce_sym = resolved_ce
+            pe_sym = resolved_pe
+            for _, engine, _ in engines:
+                engine.state.ce_symbol = resolved_ce
+                engine.state.pe_symbol = resolved_pe
+                engine.state.ce.option_symbol = resolved_ce
+                engine.state.pe.option_symbol = resolved_pe
         except Exception as exc:
             logger.warning("replay %s: option history fetch failed (%s) — skipping", day, exc)
             skipped_days += 1
