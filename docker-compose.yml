@@ -1,0 +1,13 @@
+services:
+  app:
+    build: .
+    container_name: openalgo_buying_setups
+    restart: always
+    env_file: .env
+    environment:
+      - TZ=Asia/Kolkata
+      - STRATEGY=${STRATEGY:-hd,cd}
+      - MODE=${MODE:-live}
+      - OPENALGO_HOST=http://host.docker.internal:5001
+      - WEBSOCKET_HOST=host.docker.internal
+      - WEBSOCKET_PORT=8765

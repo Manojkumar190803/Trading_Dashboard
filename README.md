@@ -126,6 +126,26 @@ python3 -m pytest tests/ -v
 
 ---
 
+## Docker
+
+```bash
+# Run both strategies live (uses .env for credentials)
+docker compose up -d
+
+# Override strategy or mode
+STRATEGY=hd MODE=paper docker compose up -d
+
+# View logs
+docker compose logs -f
+
+# Stop
+docker compose down
+```
+
+The container runs in IST timezone, auto-restarts on crash, and uses `network_mode: host` to reach local OpenAlgo instances.
+
+---
+
 ## License
 
 MIT

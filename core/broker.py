@@ -84,9 +84,8 @@ class OpenAlgoBroker(BrokerInterface):
             ) from exc
 
         kwargs = {"api_key": api_key, "host": host}
-        if ws_url:
-            kwargs["ws_url"] = ws_url
         self.client = api(**kwargs)
+        self.ws_url = ws_url
         self.strategy_tag = strategy_tag
         self.product = product
         self.exchange_options = exchange_options
