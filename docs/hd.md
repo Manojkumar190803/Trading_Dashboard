@@ -25,7 +25,7 @@ placed or executed to manage a dynamic Trailing Stop Loss (TSL).
 2.  RSI (3 period): Applied to Close price.
 3.  VWAP: Daily reset.
 
-4. Signal Generation Logic (The "Four-Gate" Entry)
+4. Signal Generation Logic (The "Five-Gate" Entry)
 
   - Gate 1 (Divergence): Fractal Lows P1 and P2.
       - Low_{P2} > Low_{P1} AND RSI_{P2} < RSI_{P1}.
@@ -38,6 +38,9 @@ placed or executed to manage a dynamic Trailing Stop Loss (TSL).
       - \text{Initial SL} = \text{Lowest Low of (P1, P2, and Trigger)} - 1.0.
       - \text{Entry Price} = \text{Trigger Candle High} + 1.0.
       - Discard if (\text{Entry} - \text{SL}) > 20 \text{ points}.
+  - Gate 5 (VWAP Room): Only when Entry < VWAP.
+      - Discard if (\text{VWAP} - \text{Entry}) < 1.5 \times IR.
+      - Ensures sufficient upside room before hitting VWAP resistance.
 
 5. Execution & WebSocket Integration
 

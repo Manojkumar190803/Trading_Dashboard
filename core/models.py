@@ -48,6 +48,7 @@ class StrategyConfig:
 
     # ── Risk (all on option premium points) ──────────────────────────
     max_option_risk_points: float = 20.0
+    min_vwap_room_rr: float = 1.5
 
     # ── Targets (RR multiples) ───────────────────────────────────────
     t1_rr: float = 1.5

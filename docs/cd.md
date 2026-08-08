@@ -1,88 +1,94 @@
-This is the **Functional Requirements Document (FRD) V6.0**, specifically tailored for **Classic Divergence (CD)**. 
+This Functional Requirements Document (FRD) for the **CD (Classic Divergence) Strategy** is modeled after your HD Strategy V3.0. 
 
-While Hidden Divergence (HD) is a *trend continuation* signal, Classic Divergence is a **trend reversal** signal. This FRD adjusts the mathematical "Gates" to identify when a falling option premium has bottomed and is ready for a trend reversal.
-
----
-
-# Functional Requirements Document (FRD): CD Option Strategy (V6.0)
-
-## 1. Project Overview
-The CD Strategy is an automated system for Nifty weekly options that identifies **Classic Bullish RSI Divergence** (Price Reversal) on a 3-minute chart. It uses a hybrid approach: candle-based signal generation and **Tick-by-Tick WebSocket management** for high-precision exits, with all states persisted in **PostgreSQL**.
-
-## 2. Master Guardrail: The "3-SL Rule"
-*   **Daily Quota:** Maximum **3 Hard SL hits** allowed per trading session.
-*   **Persistence:** The system must check the `daily_state` PostgreSQL table at 09:15 IST. If `sl_count` is already $\ge 3$ (due to a mid-day crash/restart), the system must remain idle.
-*   **Action:** On the 3rd Hard SL hit, the system must immediately trigger a `KillSwitch`—closing all positions, cancelling orders, and updating the database to `HALTED`.
-
-## 3. Instrument Selection (09:20 IST)
-*   **ATM Locking:** Round Nifty Spot LTP to the nearest 50 points at **09:20:00**.
-*   **Symbols:** Lock the ATM CE and PE for the current weekly expiry.
-*   **Persistence:** Write the locked symbols to `daily_state`. All logic from 09:20 to 15:00 applies only to these two symbols.
-
-## 4. Signal Generation (The "CD Reversal" Gates)
-
-### Gate 1: Classic Bullish Divergence (Reversal)
-*   **Point Identification:** P1 (Older) and P2 (Recent) must be **Fractal Lows** (5-candle structure).
-*   **Lookback:** P1 must be found within 3 to 20 candles of P2.
-*   **Price Rule:** $Low_{P2} < Low_{P1}$ (Price is making a **Lower Low**).
-*   **RSI Rule:** $RSI_{P2} > RSI_{P1}$ (RSI is making a **Higher Low**).
-*   **Threshold:** $RSI_{P1}$ must have been **< 20** (extreme oversold), and $RSI_{P2}$ must be **< 35**.
-
-### Gate 2: Trend Reversal Filter
-Since CD is a reversal strategy, we look for the *start* of bullish momentum:
-*   **Condition:** $(\text{LTP} > \text{EMA 13})$ AND $(\text{EMA 13} \ge \text{EMA 20})$.
-
-### Gate 3: Trigger Candle
-*   **Strong Green:** Body $\ge$ 85% of total range.
-*   **Hammer:** Lower Wick $\ge 2\times$ Body; Body in the upper 33% of the range.
-
-### Gate 4: Risk Filter
-*   **Stop Loss (SL):** $\text{Lowest Low of the entire CD pattern (P1, P2, and Trigger)} - 1.0$.
-*   **Initial Risk (IR):** $\text{Trigger High} + 1.0 - \text{SL}$.
-*   **Cap:** If $IR > 20 \text{ points}$, the signal is **Discarded**.
+While the HD (Hidden Divergence) strategy focuses on trend continuation, the **CD (Classic Divergence)** strategy focuses on **reversals**—identifying when price momentum is fading despite making new price extremes.
 
 ---
 
-## 5. Execution & WebSocket Integration
-1.  **Entry Order:** Place `STOP_LIMIT` at `Trigger High + 1.0`.
-2.  **WebSocket Kick-in:** Immediately upon order placement, subscribe to the tick-stream.
-3.  **Active State:** Once WebSocket LTP $\ge$ Trigger, update PostgreSQL trade status to `OPEN`. 
-4.  **SL Placement:** Simultaneously place the Hard SL order at the broker.
+# Functional Requirements Document (FRD): CD Option Strategy (V1.0)
 
-## 6. Real-Time Exit & Step-Trailing Logic
-Managed tick-by-tick via WebSocket. *IR = Initial Risk.*
+### 1. Project Overview
+The CD Strategy is an automated reversal system for Nifty weekly options. It identifies "Classic Bullish Divergence" on a 3-minute timeframe and uses a high-frequency WebSocket engine to manage a multi-stage trailing stop loss.
 
-| Milestone | LTP Target | Action | SL Movement (TSL) |
-| :--- | :--- | :--- | :--- |
-| **Start** | - | - | Initial SL (Swing Low - 1.0) |
-| **Target 1** | $Entry + (1.5 \times IR)$ | If 1 Lot: Exit Full. | Move SL to **Entry Price (Cost)** |
-| **Target 2** | $Entry + (2.0 \times IR)$ | If 2 Lots: **Exit 1 Lot** | Move SL to $Entry + (0.5 \times IR)$ |
-| **Target 3** | $Entry + (2.5 \times IR)$ | Hold remaining | Move SL to $Entry + (1.0 \times IR)$ |
-| **Step-Trail** | Every $+0.5 \text{ RR}$ | Hold | Trail SL up by $0.5 \times IR$ |
+### 2. Instrument Selection & Initialization
+*   **Base Index:** NIFTY (NSE_INDEX).
+*   **Strike Selection (09:20 IST):**
+    *   Fetch Nifty Spot LTP at 09:20:00.
+    *   Round to nearest 50-point step to find ATM Strike.
+    *   Lock the corresponding **CE and PE** symbols for the current weekly expiry.
+
+### 3. Technical Indicators (3-Min Candles)
+1.  **EMA 13, 20, 50.**
+2.  **RSI (3 period):** Applied to Close price (Standard for Classic Divergence).
+3.  **VWAP:** Daily reset.
+
+### 4. Signal Generation Logic (The "Four-Gate" Entry)
+*   **Gate 1 (Classic Bullish Divergence):** Fractal Lows P1 and P2.
+    *   **Price:** $Low_{P2} < Low_{P1}$ (Price makes a Lower Low).
+    *   **RSI:** $RSI_{P2} > RSI_{P1}$ (RSI makes a Higher Low).
+    *   **Zone:** At least one RSI point ($P1$ or $P2$) must be $< 30$ (Oversold).
+    *   **Window:** $P2$ must occur within 15 candles of $P1$.
+*   **Gate 2 (Trend Filter):** 
+    *   Price must be within 0.20% of the **EMA 50** OR **EMA 50** must be flattening (Slope analysis). 
+    *   *(Rationale: Reversals work best when the existing trend is exhausted near a major EMA).*
+*   **Gate 3 (Trigger):** 
+    *   Current candle must be **Strong Green** (Body $\ge$ 80%) OR **Bullish Engulfing** OR **Hammer**.
+*   **Gate 4 (Risk):**
+    *   $\text{Initial SL} = \text{Lowest Low of (P2 and Trigger Candle)} - 1.0$.
+    *   $\text{Entry Price} = \text{Trigger Candle High} + 1.0$.
+    *   Discard if $(\text{Entry} - \text{SL}) > 20$ points.
+
+### 5. Execution & WebSocket Integration
+#### 5.1 Order Placement
+*   **Position Sizing:** 
+    *   2 Lots if $Close > VWAP$.
+    *   1 Lot if $Close < VWAP$.
+*   **Order Type:** STOP_LIMIT (Trigger: High + 1.0, Limit: Trigger + 0.5).
+*   **WebSocket Activation:** Upon order placement, subscribe to the **Tick-by-Tick** feed for the option symbol.
+
+#### 5.2 Real-Time Monitoring
+*   **Pending State:** Monitor WebSocket LTP. If $LTP \le \text{Initial SL}$ before entry is triggered, **Cancel Entry Order**.
+*   **Executed State:** Once filled, immediately place a **Hard Stop Loss** order at the broker.
+
+### 6. Multi-Stage Exit & Trailing SL (TSL) Logic
+Exits are managed tick-by-tick via WebSocket based on **Initial Risk (IR)**.
+$IR = \text{Entry Price} - \text{Initial SL}$
+
+*   **Phase 1: Initial (Under 1.5 RR)**
+    *   SL remains at $Initial SL$.
+*   **Phase 2: Breakeven (At 1.5 RR)**
+    *   Once $LTP \ge Entry + (1.5 \times IR)$:
+    *   **Action:** Move SL to Entry Price (Cost).
+    *   If total quantity is 1 Lot: Exit Full.
+*   **Phase 3: Step-Trailing (Every 0.5 RR thereafter)**
+    *   **At 2.0 RR:** Move SL to $Entry + (0.5 \times IR)$.
+    *   **At 2.0 RR (Partial):** If 2 Lots, Exit 1 Lot (50%) at Market.
+    *   **At 2.5 RR:** Move SL to $Entry + (1.0 \times IR)$.
+    *   **At 3.0 RR:** Move SL to $Entry + (1.5 \times IR)$.
+    *   Continue trailing the remaining 1 lot every 0.5 RR step.
+
+### 7. Risk & Operational Management
+*   **Daily SL Cap:** System stops after **2 Hard SL hits** (CD strategies have lower win rates than HD, so the cap is tighter).
+*   **Time Constraints:**
+    *   No new signals after 14:45 IST (Reversals late in the day are often "bull traps").
+    *   Mandatory square-off at 15:15 IST.
+*   **Conflict Rule:** If an HD signal and a CD signal occur simultaneously on the same symbol, the **HD signal takes priority**.
+
+### 8. Data Architecture
+#### 8.1 Trade States
+1.  **SCANNING:** Looking for $P1$ and $P2$ (Lower Low in Price, Higher Low in RSI).
+2.  **TRIGGERED:** Gate 1, 2, and 3 met; Order placed.
+3.  **MONITORING:** WebSocket active, tracking IR milestones.
+4.  **CLOSED:** Trade exited via TSL or Manual Square-off.
+
+#### 8.2 Logging Requirements
+*   **Divergence Coordinates:** Log Price and RSI values for both $P1$ and $P2$.
+*   **IR Calculation:** Clear log of the mathematical IR value used for the TSL steps.
+*   **Slippage Log:** Difference between the 1.5 RR Target Price and the actual Execution Price.
 
 ---
 
-## 7. Database Persistence (PostgreSQL)
-
-The system must use an **asynchronous DB handler** to prevent blocking the WebSocket thread.
-
-*   **`daily_state`:** Records `sl_count`, `realized_pnl`, and `active_symbols`.
-*   **`trades`:** Records every entry/exit, `current_sl_price`, and `highest_rr_reached`.
-*   **`audit_logs`:** Every internal decision (e.g., *"LTP hit 1.5RR; moving SL to BE"*).
-
-## 8. Recovery Logic (Fault Tolerance)
-If the system crashes and restarts:
-1.  Fetch `active_symbols` and `sl_count` from `daily_state`.
-2.  Check `trades` for any row where `status = 'OPEN'`.
-3.  If a trade is open:
-    *   Subscribe to WebSocket for that symbol.
-    *   Calculate current RR milestone based on `highest_rr_reached` in the DB.
-    *   Resume Trailing SL logic immediately.
-
-## 9. Operational Constraints
-*   **Signal Cutoff:** 15:00 IST.
-*   **EOD Square-off:** 15:15 IST (Market order for all).
-*   **Clean-up:** If a `STOP_LIMIT` isn't filled by the next candle close, cancel it and update DB to `CANCELLED`.
-
----
-**END OF FRD V6.0 (Classic Divergence)**
+### Key Differences from your HD Strategy:
+1.  **Divergence Direction:** CD looks for **Price Lower Low** vs **RSI Higher Low** (Reversal), whereas HD looks for **Price Higher Low** vs **RSI Lower Low** (Continuation).
+2.  **RSI Period:** Changed to **14** for CD (Standard) vs **3** for HD (Aggressive).
+3.  **Lookback Window:** CD requires a window (usually 15 candles) because reversal patterns lose validity if the "divergence" takes too long to form.
+4.  **Daily Cap:** Reduced to **2 Hard SLs** to preserve capital during strong trending days where reversals fail repeatedly.

@@ -299,6 +299,19 @@ class BaseStrategyEngine:
             )
             return
 
+        # VWAP room filter: entry below VWAP must have at least 1.5 RR of headroom.
+        entry_level = float(row["high"] + 1.0)
+        vwap = float(row["vwap"]) if not pd.isna(row["vwap"]) else None
+        if vwap is not None and entry_level < vwap:
+            room = vwap - entry_level
+            required = self.cfg.min_vwap_room_rr * risk_points
+            if room < required:
+                self._record_alert(
+                    ts, "RISK",
+                    f"{side} trade cancelled: VWAP room {room:.2f} < {self.cfg.min_vwap_room_rr} RR ({required:.2f})",
+                )
+                return
+
         lots = self.signal_provider.compute_entry_lots(row, self.cfg)
         quantity = lots * self.cfg.option_lot_size
 
