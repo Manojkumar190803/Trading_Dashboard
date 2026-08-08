@@ -1,0 +1,13 @@
+[run]
+branch = False
+omit =
+    tests/*
+    core/engine.py
+    core/runner.py
+    run_strategy.py
+    strategies/cd.py
+    strategies/hd.py
+
+[report]
+fail_under = 100
+show_missing = True
