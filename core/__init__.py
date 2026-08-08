@@ -11,8 +11,6 @@ from core.models import (
 )
 from core.broker import BrokerInterface, ConsoleBroker, OpenAlgoBroker, HistoricalReplayBroker
 from core.indicators import compute_rsi, add_indicators
-from core.engine import BaseStrategyEngine
-from core.runner import LiveFeedRunner, run_historical_replay
 
 __all__ = [
     "Signal",
@@ -34,3 +32,16 @@ __all__ = [
     "LiveFeedRunner",
     "run_historical_replay",
 ]
+
+
+def __getattr__(name):
+    if name == "BaseStrategyEngine":
+        from core.engine import BaseStrategyEngine
+        return BaseStrategyEngine
+    if name == "LiveFeedRunner":
+        from core.runner import LiveFeedRunner
+        return LiveFeedRunner
+    if name == "run_historical_replay":
+        from core.runner import run_historical_replay
+        return run_historical_replay
+    raise AttributeError(f"module 'core' has no attribute {name!r}")

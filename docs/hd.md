@@ -27,9 +27,10 @@ placed or executed to manage a dynamic Trailing Stop Loss (TSL).
 
 4. Signal Generation Logic (The "Four-Gate" Entry)
 
-  - Gate 1 (Divergence): Fractal Lows P1 and P2 (3–20 candles apart).
+  - Gate 1 (Divergence): Fractal Lows P1 and P2.
       - Low_{P2} > Low_{P1} AND RSI_{P2} < RSI_{P1}.
       - Both RSI points must be < 20.
+      - No minimum or maximum candle-distance constraint between P1 and P2.
   - Gate 2 (Trend): (EMA13 > EMA20) OR (EMA20 > EMA50).
   - Gate 3 (Trigger): Current candle must be Strong Green (Body \ge 85%) OR
     Hammer (Lower wick \ge 2\times Body).
@@ -86,8 +87,9 @@ Formula: IR = \text{Entry Price} - \text{Initial SL}
   - Time Constraints:
       - No new signals/orders after 15:00 IST.
       - Mandatory square-off of all positions at 15:15 IST.
-  - Order Cleanup: If an entry STOP_LIMIT is not filled by the time the
-    next 3-minute candle closes, the order must be Cancelled via API.
+  - Order Cleanup: A pending STOP_LIMIT entry order is cancelled only if
+    the option's stop-loss level is breached (candle low ≤ option SL)
+    before the order triggers.
 
 8. Data Architecture
 

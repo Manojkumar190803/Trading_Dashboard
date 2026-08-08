@@ -250,5 +250,6 @@ class HDSignalProvider(SignalProvider):
                         ss.p2_price > ss.p1_price and ss.p2_rsi < ss.p1_rsi
                     )
             ss.pullback_active = False
+            ss.pullback_active = False
             ss.pullback_low_price = None
             ss.pullback_low_rsi = None

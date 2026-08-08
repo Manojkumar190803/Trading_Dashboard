@@ -52,7 +52,6 @@ class StrategyConfig:
     # ── Targets (RR multiples) ───────────────────────────────────────
     t1_rr: float = 1.5
     t2_rr: float = 2.0
-    t3_rr: float = 2.5
 
 
 @dataclass
@@ -73,8 +72,10 @@ class Position:
     option_risk_points: float
     t1_done: bool = False
     t2_done: bool = False
-    t3_done: bool = False
     breakeven_armed: bool = False
+    # Step-trailing: highest RR milestone reached (in 0.5 steps).
+    highest_rr_step: float = 0.0
+    trailing_sl_level: Optional[float] = None
 
 
 @dataclass
