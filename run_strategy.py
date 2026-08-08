@@ -13,7 +13,7 @@ from core.broker import OpenAlgoBroker
 from core.engine import BaseStrategyEngine
 from core.indicators import add_indicators
 from core.models import RiskConfig, StrategyConfig
-from core.runner import LiveFeedRunner, _normalize_history_df, run_historical_replay
+from core.runner import LiveFeedRunner, MultiEngineLiveFeedRunner, _normalize_history_df, run_historical_replay, run_multi_historical_replay
 from strategies.base import SignalProvider
 
 logger = logging.getLogger("run_strategy")
@@ -29,7 +29,13 @@ def _register_hd() -> SignalProvider:
     return HDSignalProvider(HDConfig())
 
 
+def _register_cd() -> SignalProvider:
+    from strategies.cd import CDConfig, CDSignalProvider
+    return CDSignalProvider(CDConfig())
+
+
 STRATEGY_REGISTRY["hd"] = _register_hd
+STRATEGY_REGISTRY["cd"] = _register_cd
 
 
 def get_signal_provider(name: str, args: argparse.Namespace) -> SignalProvider:
@@ -40,6 +46,13 @@ def get_signal_provider(name: str, args: argparse.Namespace) -> SignalProvider:
         if args.body_threshold is not None:
             hd_cfg.strong_body_threshold = args.body_threshold
         return HDSignalProvider(hd_cfg)
+
+    if name == "cd":
+        from strategies.cd import CDConfig, CDSignalProvider
+        cd_cfg = CDConfig()
+        if args.body_threshold is not None:
+            cd_cfg.strong_body_threshold = args.body_threshold
+        return CDSignalProvider(cd_cfg)
 
     factory = STRATEGY_REGISTRY.get(name)
     if factory is None:
@@ -155,6 +168,31 @@ def _run_live(cfg: StrategyConfig, risk: RiskConfig, signal_provider: SignalProv
         runner.stop()
 
 
+def _run_multi_live(
+    cfg: StrategyConfig,
+    risk: RiskConfig,
+    strategy_names: list[str],
+    args: argparse.Namespace,
+    dry_run: bool,
+    diagnose: bool,
+    verbose: bool,
+) -> None:
+    broker = _build_broker(cfg, dry_run=dry_run)
+    engines: list[tuple[str, BaseStrategyEngine]] = []
+    for name in strategy_names:
+        provider = get_signal_provider(name, args)
+        engine = BaseStrategyEngine(cfg, risk, broker, provider)
+        engine.diagnose = diagnose
+        engine.verbose = verbose
+        engines.append((name, engine))
+    runner = MultiEngineLiveFeedRunner(engines, broker, cfg)
+    try:
+        runner.run_forever()
+    except KeyboardInterrupt:
+        logger.info("interrupted; stopping runner")
+        runner.stop()
+
+
 def main(argv: Optional[list[str]] = None) -> None:
     args = _parse_args(argv)
     _setup_logging(args.log_level)
@@ -175,13 +213,19 @@ def main(argv: Optional[list[str]] = None) -> None:
     if args.max_sl is not None:
         risk.max_sl_per_day = args.max_sl
 
-    signal_provider = get_signal_provider(args.strategy, args)
+    # Support comma-separated strategies: --strategy hd,cd
+    strategy_names = [s.strip() for s in args.strategy.split(",")]
 
     if args.mode == "backtest":
         if not args.start:
             raise SystemExit("backtest mode requires --start YYYY-MM-DD")
         end_date = args.end or datetime.now().date().strftime("%Y-%m-%d")
-        run_historical_replay(cfg, risk, signal_provider, args.start, end_date, diagnose=args.diagnose)
+        if len(strategy_names) > 1:
+            providers = [(name, get_signal_provider(name, args)) for name in strategy_names]
+            run_multi_historical_replay(cfg, risk, providers, args.start, end_date, diagnose=args.diagnose)
+        else:
+            provider = get_signal_provider(strategy_names[0], args)
+            run_historical_replay(cfg, risk, provider, args.start, end_date, diagnose=args.diagnose)
         return
 
     if args.mode == "smoke":
@@ -189,7 +233,11 @@ def main(argv: Optional[list[str]] = None) -> None:
         return
 
     dry_run = args.mode == "paper"
-    _run_live(cfg, risk, signal_provider, dry_run=dry_run, diagnose=args.diagnose, verbose=args.verbose)
+    if len(strategy_names) > 1:
+        _run_multi_live(cfg, risk, strategy_names, args, dry_run=dry_run, diagnose=args.diagnose, verbose=args.verbose)
+    else:
+        signal_provider = get_signal_provider(strategy_names[0], args)
+        _run_live(cfg, risk, signal_provider, dry_run=dry_run, diagnose=args.diagnose, verbose=args.verbose)
 
 
 if __name__ == "__main__":

@@ -294,6 +294,213 @@ class LiveFeedRunner:
 
 
 # ===============================================================
+#  Multi-engine live feed runner
+# ===============================================================
+
+
+class MultiEngineLiveFeedRunner:
+    """Feeds same candle data to multiple independent engines."""
+
+    def __init__(
+        self,
+        engines: list[tuple[str, BaseStrategyEngine]],
+        broker: OpenAlgoBroker,
+        cfg: StrategyConfig,
+        lookback_days: int = 5,
+        poll_slack_seconds: int = 5,
+    ) -> None:
+        self.engines = engines  # [(name, engine), ...]
+        self.broker = broker
+        self.cfg = cfg
+        self.lookback_days = lookback_days
+        self.poll_slack_seconds = poll_slack_seconds
+        self._stop = threading.Event()
+        self._last_bar_time: dict[str, Optional[datetime]] = {"CE": None, "PE": None}
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def _try_lock_atm(self, now: datetime) -> None:
+        first_engine = self.engines[0][1]
+        if first_engine.state.atm_locked:
+            return
+        if now.time() < self.cfg.atm_lock_time:
+            return
+        try:
+            spot_ltp = self.broker.get_ltp(self.cfg.spot_symbol)
+        except Exception as exc:
+            logger.warning("spot LTP fetch failed while locking ATM: %s", exc)
+            return
+        if not spot_ltp:
+            logger.warning("spot LTP came back 0/None — will retry next poll")
+            return
+        lock_ts = datetime.combine(now.date(), self.cfg.atm_lock_time)
+        for _, engine in self.engines:
+            engine.on_day_transition_if_needed(lock_ts)
+            engine.lock_atm_for_day(lock_ts, float(spot_ltp))
+
+    def _fetch_option_history(self, option_symbol: str) -> pd.DataFrame:
+        today = datetime.now().date()
+        start = (today - timedelta(days=self.lookback_days)).strftime("%Y-%m-%d")
+        end = today.strftime("%Y-%m-%d")
+        interval = f"{self.cfg.timeframe_minutes}m"
+        raw = self.broker.fetch_history(
+            symbol=option_symbol,
+            exchange=self.cfg.exchange_options,
+            interval=interval,
+            start_date=start,
+            end_date=end,
+        )
+        base = _normalize_history_df(raw)
+        if base.empty:
+            return base
+        base = add_indicators(base.reset_index(drop=True), self.cfg)
+        session_start = datetime.combine(today, self.cfg.market_open)
+        session_end = datetime.combine(today, self.cfg.market_close)
+        base = base[(base["datetime"] >= session_start) & (base["datetime"] < session_end)]
+        return base.reset_index(drop=True)
+
+    def _seconds_until_next_boundary(self) -> float:
+        now = datetime.now()
+        tf = self.cfg.timeframe_minutes
+        boundary_min = ((now.minute // tf) + 1) * tf
+        next_ts = now.replace(second=0, microsecond=0)
+        if boundary_min >= 60:
+            next_ts = next_ts.replace(minute=0) + timedelta(hours=1)
+        else:
+            next_ts = next_ts.replace(minute=boundary_min)
+        return max(1.0, (next_ts - now).total_seconds() + self.poll_slack_seconds)
+
+    def _process_new_bars_for_side(self, side: str, data: pd.DataFrame) -> None:
+        if data.empty:
+            return
+        now = datetime.now()
+        tf_delta = timedelta(minutes=self.cfg.timeframe_minutes)
+        closed = data[data["datetime"] + tf_delta <= now]
+        if closed.empty:
+            return
+
+        last_ts = self._last_bar_time.get(side)
+        if last_ts is not None:
+            closed = closed[closed["datetime"] > last_ts]
+            if closed.empty:
+                return
+
+        for i, (_, row) in enumerate(closed.iterrows()):
+            row_idx = row.name if hasattr(row, "name") else None
+            prev_row: Optional[pd.Series] = None
+            if row_idx is None:
+                first_idx = closed.index[0]
+                pos_in_full = data.index.get_loc(first_idx) + i
+            else:
+                pos_in_full = data.index.get_loc(row_idx)
+            if pos_in_full > 0:
+                prev_row = data.iloc[pos_in_full - 1]
+            for _, engine in self.engines:
+                engine.process_option_candle(side, row, prev_row)
+            ts = row["datetime"]
+            self._last_bar_time[side] = (
+                ts.to_pydatetime() if hasattr(ts, "to_pydatetime") else ts
+            )
+
+    def _poll_once(self) -> None:
+        now = datetime.now()
+        self._try_lock_atm(now)
+        first_engine = self.engines[0][1]
+        if not first_engine.state.atm_locked:
+            return
+
+        for side, symbol in (
+            ("CE", first_engine.state.ce_symbol),
+            ("PE", first_engine.state.pe_symbol),
+        ):
+            if not symbol:
+                continue
+            try:
+                data = self._fetch_option_history(symbol)
+            except Exception as exc:
+                logger.warning("history fetch failed for %s %s: %s", side, symbol, exc)
+                continue
+            self._process_new_bars_for_side(side, data)
+
+    def _wait_with_countdown(self, seconds: float) -> bool:
+        import sys
+        deadline = datetime.now() + timedelta(seconds=seconds)
+        while not self._stop.is_set():
+            remaining = (deadline - datetime.now()).total_seconds()
+            if remaining <= 0:
+                break
+            mins, secs = divmod(int(remaining), 60)
+            sys.stdout.write(f"\r⏳ Next candle in {mins:02d}:{secs:02d} ")
+            sys.stdout.flush()
+            if self._stop.wait(min(1.0, remaining)):
+                sys.stdout.write("\r" + " " * 30 + "\r")
+                sys.stdout.flush()
+                return True
+        sys.stdout.write("\r" + " " * 30 + "\r")
+        sys.stdout.flush()
+        return False
+
+    def run_forever(self) -> None:
+        names = ", ".join(n for n, _ in self.engines)
+        logger.info(
+            "MultiEngineLiveFeedRunner starting [%s] (spot=%s tf=%sm)",
+            names, self.cfg.spot_symbol, self.cfg.timeframe_minutes,
+        )
+        try:
+            self._poll_once()
+            self._print_cycle_summary()
+        except Exception as exc:
+            logger.warning("initial poll failed: %s", exc)
+
+        while not self._stop.is_set():
+            sleep_for = self._seconds_until_next_boundary()
+            if self._wait_with_countdown(sleep_for):
+                break
+            try:
+                self._poll_once()
+                self._print_cycle_summary()
+            except KeyboardInterrupt:
+                break
+            except Exception as exc:
+                logger.exception("live loop iteration error: %s", exc)
+
+    def _print_cycle_summary(self) -> None:
+        now = datetime.now()
+        first_engine = self.engines[0][1]
+        state = first_engine.state
+        if not state.atm_locked:
+            print(f"\n[{now.strftime('%H:%M:%S')}] Waiting for ATM lock...")
+            return
+
+        print(f"\n┌─── {now.strftime('%H:%M:%S')} ─── Multi-Strategy Status {'─' * 24}┐")
+        print(f"│ Strikes: {state.ce_symbol} / {state.pe_symbol}")
+        for name, engine in self.engines:
+            pnl = engine.realized_pnl
+            entries = engine.total_entries
+            sl = engine.state.sl_hits_today
+            print(
+                f"│ [{name.upper()}] Entries={entries}  SL_hits={sl}/{engine.risk.max_sl_per_day}"
+                f"  PnL={pnl:+.1f}"
+            )
+            for side in ("CE", "PE"):
+                ss = engine._side_state(side)
+                setup = engine.signal_provider.format_setup_status(ss)
+                if ss.position:
+                    pos = ss.position
+                    trade = (
+                        f"LONG entry={pos.entry_price:.1f} SL={pos.option_stop_level:.1f} "
+                        f"qty={pos.quantity}/{pos.initial_quantity}"
+                    )
+                elif ss.pending_entry:
+                    trade = f"PENDING trigger={ss.pending_entry.option_trigger_level:.1f}"
+                else:
+                    trade = "FLAT"
+                print(f"│   {side}: {trade}  | {setup}")
+        print(f"└{'─' * 62}┘")
+
+
+# ===============================================================
 #  Historical replay
 # ===============================================================
 
@@ -486,4 +693,140 @@ def run_historical_replay(
     print("\n─── Summary ───────────────────────────────────────────────")
     print(f"Total entries     : {len(entries)}")
     print(f"Total exits       : {len(exits)}")
+    print("=" * 72)
+
+
+def run_multi_historical_replay(
+    cfg: StrategyConfig,
+    risk: RiskConfig,
+    providers: list[tuple[str, SignalProvider]],
+    start_date: str,
+    end_date: str,
+    diagnose: bool = False,
+) -> None:
+    """Run multiple independent engines over the same historical data (single fetch)."""
+    api_key = os.getenv("OPENALGO_API_KEY")
+    if not api_key:
+        raise SystemExit("OPENALGO_API_KEY not set (check .env)")
+    host = (
+        os.getenv("OPENALGO_HOST")
+        or os.getenv("OPENALGO_URL")
+        or "http://127.0.0.1:5002"
+    )
+    history_broker = OpenAlgoBroker(api_key=api_key, host=host, dry_run=True)
+
+    interval = f"{cfg.timeframe_minutes}m"
+    spot_df = _fetch_history_df(
+        history_broker, cfg.spot_symbol, cfg.exchange_spot, interval, start_date, end_date,
+    )
+    if spot_df.empty:
+        raise SystemExit("replay: no spot bars returned")
+
+    engines: list[tuple[str, BaseStrategyEngine, HistoricalReplayBroker]] = []
+    for name, provider in providers:
+        broker = HistoricalReplayBroker()
+        engine = BaseStrategyEngine(cfg, risk, broker, provider)
+        engine.diagnose = diagnose
+        engines.append((name, engine, broker))
+
+    skipped_days = 0
+    total_bars = 0
+    for day in _iter_trading_days(spot_df):
+        spot_day = _slice_session(spot_df, day, cfg)
+        if spot_day.empty:
+            continue
+
+        atm_price = _find_atm_lock_price(spot_day, cfg)
+        if atm_price is None:
+            skipped_days += 1
+            continue
+
+        lock_ts = datetime.combine(day, cfg.atm_lock_time)
+        for _, engine, _ in engines:
+            engine.reset_for_new_day(day)
+            engine.lock_atm_for_day(lock_ts, atm_price)
+
+        # All engines share the same ATM symbols
+        ce_sym = engines[0][1].state.ce_symbol
+        pe_sym = engines[0][1].state.pe_symbol
+        assert ce_sym and pe_sym
+
+        warmup_start = (day - timedelta(days=5)).strftime("%Y-%m-%d")
+        day_str = day.strftime("%Y-%m-%d")
+        try:
+            ce_raw = _fetch_history_df(
+                history_broker, ce_sym, cfg.exchange_options, interval, warmup_start, day_str,
+            )
+            pe_raw = _fetch_history_df(
+                history_broker, pe_sym, cfg.exchange_options, interval, warmup_start, day_str,
+            )
+        except Exception as exc:
+            logger.warning("replay %s: option history fetch failed (%s) — skipping", day, exc)
+            skipped_days += 1
+            continue
+
+        if ce_raw.empty or pe_raw.empty:
+            skipped_days += 1
+            continue
+
+        ce_day = _warmup_and_slice(ce_raw, day, cfg)
+        pe_day = _warmup_and_slice(pe_raw, day, cfg)
+
+        ce_events = [("CE", row) for _, row in ce_day.iterrows()]
+        pe_events = [("PE", row) for _, row in pe_day.iterrows()]
+        spot_events = [("SPOT", row) for _, row in spot_day.iterrows()]
+        events = ce_events + pe_events + spot_events
+        events.sort(key=lambda ev: ev[1]["datetime"])
+
+        prev_by_side: dict[str, Optional[pd.Series]] = {"CE": None, "PE": None}
+        for side, row in events:
+            if side == "SPOT":
+                for _, _, broker in engines:
+                    broker.set_current_bar(cfg.spot_symbol, row)
+                continue
+            symbol = ce_sym if side == "CE" else pe_sym
+            for _, engine, broker in engines:
+                broker.set_current_bar(symbol, row)
+                engine.process_option_candle(side, row, prev_by_side[side])
+            prev_by_side[side] = row
+            total_bars += 1
+
+        eod_ts = datetime.combine(day, cfg.force_square_off)
+        for _, engine, _ in engines:
+            engine.force_square_off_side(engine.state.ce, eod_ts)
+            engine.force_square_off_side(engine.state.pe, eod_ts)
+
+    # Print combined summary
+    days_replayed = len(_iter_trading_days(spot_df)) - skipped_days
+    print("\n" + "=" * 72)
+    print("MULTI-STRATEGY REPLAY SUMMARY")
+    print("=" * 72)
+    print(f"Spot symbol       : {cfg.spot_symbol} / {cfg.exchange_spot}")
+    print(f"Timeframe         : {cfg.timeframe_minutes}m")
+    print(f"Window            : {start_date} -> {end_date}")
+    print(f"Days replayed     : {days_replayed}")
+    print(f"Days skipped      : {skipped_days}")
+    print(f"Option bars fed   : {total_bars}")
+    print("-" * 72)
+
+    combined_pnl = 0.0
+    for name, engine, _ in engines:
+        snap = engine.get_status_snapshot()
+        combined_pnl += snap["realized_pnl"]
+        print(f"\n  [{name.upper()}]")
+        print(f"    Entries       : {snap['total_entries']}")
+        print(f"    Hard SL hits  : {snap['total_hard_sl_hits']}")
+        print(f"    Realized PnL  : {snap['realized_pnl']:.2f}")
+
+        entry_alerts = [a for a in engine.alerts if a.category == "ENTRY"]
+        exit_alerts = [a for a in engine.alerts if a.category == "EXIT"]
+        for evt in entry_alerts:
+            ts = evt.timestamp.strftime("%H:%M:%S")
+            print(f"      [{ts}] ENTRY  {evt.message}")
+        for evt in exit_alerts:
+            ts = evt.timestamp.strftime("%H:%M:%S")
+            print(f"      [{ts}] EXIT   {evt.message}")
+
+    print(f"\n{'─' * 72}")
+    print(f"  COMBINED PnL    : {combined_pnl:.2f}")
     print("=" * 72)
