@@ -463,8 +463,8 @@ class BaseStrategyEngine:
         if pos.breakeven_armed and ir > 0:
             current_step = int(rr / 0.5) * 0.5  # floor to nearest 0.5
             if current_step > pos.highest_rr_step:
-                # SL trails 1.0 RR behind the current step.
-                new_sl = pos.entry_price + (current_step - 1.0) * ir
+                # SL trails 1.5 RR behind the current step.
+                new_sl = pos.entry_price + (current_step - 1.5) * ir
                 if pos.trailing_sl_level is None or new_sl > pos.trailing_sl_level:
                     pos.trailing_sl_level = new_sl
                     pos.highest_rr_step = current_step
@@ -589,7 +589,7 @@ class BaseStrategyEngine:
         if pos.breakeven_armed and ir > 0:
             current_step = int(rr / 0.5) * 0.5
             if current_step > pos.highest_rr_step:
-                new_sl = pos.entry_price + (current_step - 1.0) * ir
+                new_sl = pos.entry_price + (current_step - 1.5) * ir
                 if pos.trailing_sl_level is None or new_sl > pos.trailing_sl_level:
                     pos.trailing_sl_level = new_sl
                     pos.highest_rr_step = current_step
