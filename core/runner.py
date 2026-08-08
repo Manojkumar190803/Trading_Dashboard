@@ -204,6 +204,17 @@ class LiveFeedRunner:
             "LiveFeedRunner starting (spot=%s exchange=%s tf=%sm)",
             self.cfg.spot_symbol, self.cfg.exchange_spot, self.cfg.timeframe_minutes,
         )
+
+        # ── Market-hours awareness ───────────────────────────────────────
+        if not self._is_market_open():
+            logger.info(
+                "Market is closed — will sleep and resume at next session open."
+            )
+            while not self._is_market_open() and not self._stop.is_set():
+                wait = 3600.0  # 1 hour
+                if self._wait_with_countdown(wait):
+                    break
+
         try:
             self._poll_once()
             self._print_cycle_summary()
@@ -211,6 +222,14 @@ class LiveFeedRunner:
             logger.warning("initial poll failed: %s", exc)
 
         while not self._stop.is_set():
+            # ── Skip poll if market is closed ────────────────────────────
+            if not self._is_market_open():
+                sleep_for = self._seconds_until_next_boundary() + 60.0
+                logger.debug("market closed — sleeping %.1fs", sleep_for)
+                if self._wait_with_countdown(sleep_for):
+                    break
+                continue
+
             sleep_for = self._seconds_until_next_boundary()
             logger.debug("sleeping %.1fs until next boundary", sleep_for)
             if self._wait_with_countdown(sleep_for):
@@ -222,6 +241,15 @@ class LiveFeedRunner:
                 break
             except Exception as exc:
                 logger.exception("live loop iteration error: %s", exc)
+
+    def _is_market_open(self) -> bool:
+        """Return True if today is a weekday and current time falls within trading hours."""
+        now = datetime.now()
+        if now.weekday() >= 5:
+            return False
+        open_t = self.cfg.market_open.replace(year=now.year, month=now.month, day=now.day)
+        close_t = self.cfg.market_close.replace(year=now.year, month=now.month, day=now.day)
+        return open_t <= now < close_t
 
     def _format_side_status(self, side: str) -> str:
         side_state = self.engine._side_state(side)
@@ -447,6 +475,17 @@ class MultiEngineLiveFeedRunner:
             "MultiEngineLiveFeedRunner starting [%s] (spot=%s tf=%sm)",
             names, self.cfg.spot_symbol, self.cfg.timeframe_minutes,
         )
+
+        # ── Market-hours awareness ───────────────────────────────────────
+        if not self._is_market_open():
+            logger.info(
+                "Market is closed — will sleep and resume at next session open."
+            )
+            while not self._is_market_open() and not self._stop.is_set():
+                wait = 3600.0  # 1 hour
+                if self._wait_with_countdown(wait):
+                    break
+
         try:
             self._poll_once()
             self._print_cycle_summary()
@@ -454,6 +493,14 @@ class MultiEngineLiveFeedRunner:
             logger.warning("initial poll failed: %s", exc)
 
         while not self._stop.is_set():
+            # ── Skip poll if market is closed ────────────────────────────
+            if not self._is_market_open():
+                sleep_for = self._seconds_until_next_boundary() + 60.0
+                logger.debug("market closed — sleeping %.1fs", sleep_for)
+                if self._wait_with_countdown(sleep_for):
+                    break
+                continue
+
             sleep_for = self._seconds_until_next_boundary()
             if self._wait_with_countdown(sleep_for):
                 break
@@ -464,6 +511,15 @@ class MultiEngineLiveFeedRunner:
                 break
             except Exception as exc:
                 logger.exception("live loop iteration error: %s", exc)
+
+    def _is_market_open(self) -> bool:
+        """Return True if today is a weekday and current time falls within trading hours."""
+        now = datetime.now()
+        if now.weekday() >= 5:
+            return False
+        open_t = self.cfg.market_open.replace(year=now.year, month=now.month, day=now.day)
+        close_t = self.cfg.market_close.replace(year=now.year, month=now.month, day=now.day)
+        return open_t <= now < close_t
 
     def _print_cycle_summary(self) -> None:
         now = datetime.now()
