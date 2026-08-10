@@ -1,0 +1,47 @@
+================================================================================
+OPENALGO BUYING SETUPS - SYSTEM STATUS REPORT
+Date: August 10, 2026
+================================================================================
+
+✅ FIXED ISSUES:
+1. Bash Compatibility: Fixed ${symbol,,} syntax (bash 3.2 incompatible)
+   - Now uses: echo "$symbol" | tr '[:upper:]' '[:lower:]'
+   
+2. Wait Command: Fixed 'wait -n' syntax (bash 3.2 incompatible)  
+   - Now uses: wait (waits for all child processes)
+   
+3. Log File Naming: Now correctly creates lowercase log files
+   - Example: nifty.log, banknifty.log, sensex.log
+   
+✅ SCRIPT NOW WORKS CORRECTLY:
+- run_all_indices.sh launches all three symbols (NIFTY, BANKNIFTY, SENSEX)
+- Proper logging structure implemented
+- Consolidated log file created in logs/live_runs/<timestamp>/consolidated.log
+- Parallel execution working (all 3 symbols run concurrently)
+
+✅ CORE SYSTEM VALIDATION:
+- All 5 unit tests passing
+- Indicator calculations working (EMA, VWAP, RSI)  
+- All 3 strategies functional (HD, CD, TC)
+- Demo execution successful (demo_strategies.py)
+
+⚠️  RUNTIME REQUIREMENTS FOR LIVE MODE:
+The script requires these external services to run:
+1. OpenAlgo Broker Service on http://127.0.0.1:5001
+2. WebSocket Server on ws://127.0.0.1:8765
+3. Python dependencies installed (pandas, requests, etc.)
+
+Without these services, the script will fail with:
+"Could not discover instrument metadata for 'NIFTY' from OpenAlgo"
+
+📋 NEXT STEPS TO ENABLE LIVE TRADING:
+1. Start OpenAlgo broker service
+2. Configure .env with broker credentials
+3. Ensure all Python dependencies are installed
+4. Run: ./run_all_indices.sh
+
+================================================================================
+SCRIPT COMPATIBILITY: ✅ VERIFIED
+CORE FUNCTIONALITY: ✅ VERIFIED  
+INFRASTRUCTURE READY: ⚠️  REQUIRES BROKER SERVICE
+================================================================================

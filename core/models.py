@@ -111,6 +111,7 @@ class BaseSideState:
     last_ema13: Optional[float] = None
     last_ema20: Optional[float] = None
     last_ema50: Optional[float] = None
+    last_vwap: Optional[float] = None
 
 
 @dataclass

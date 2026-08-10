@@ -33,6 +33,31 @@ log_msg() {
   echo "$ts [launcher] $msg" | tee -a "$COMBINED_LOG"
 }
 
+display_symbol_output() {
+  local symbol="$1"
+  local log_file="$2"
+  
+  if [[ ! -f "$log_file" ]]; then
+    return
+  fi
+  
+  # Print box header for symbol
+  printf '\n'
+  printf '%s\n' "┌─────────────────────────────────────────────────────────────────────────────────┐"
+  printf '│ %-77s │\n' "🔹 $symbol"
+  printf '%s\n' "├─────────────────────────────────────────────────────────────────────────────────┤"
+  
+  # Print log content, indented
+  while IFS= read -r line; do
+    # Truncate long lines to 77 chars to fit in box
+    line_truncated="${line:0:77}"
+    printf '│ %-77s │\n' "$line_truncated"
+  done < "$log_file"
+  
+  # Print box footer
+  printf '%s\n' "└─────────────────────────────────────────────────────────────────────────────────┘"
+}
+
 cleanup() {
   log_msg "shutdown requested, stopping child processes..."
   for pid in "${PIDS[@]:-}"; do
@@ -58,7 +83,9 @@ log_msg "python=$PYTHON_BIN mode=$MODE strategies=$STRATEGIES"
 log_msg "run_dir=$RUN_DIR"
 
 for symbol in "${SYMBOLS[@]}"; do
-  symbol_log="$RUN_DIR/${symbol,,}.log"
+  # Use tr for bash 3.2 compatibility (macOS default)
+  symbol_lower=$(echo "$symbol" | tr '[:upper:]' '[:lower:]')
+  symbol_log="$RUN_DIR/${symbol_lower}.log"
   log_msg "launching $symbol (log: $symbol_log)"
 
   (
@@ -68,12 +95,7 @@ for symbol in "${SYMBOLS[@]}"; do
       --strategy "$STRATEGIES" \
       --mode "$MODE" \
       --log-level "$LOG_LEVEL" \
-      2>&1 \
-    | while IFS= read -r line; do
-        printf "%s [%s] %s\n" "$(date '+%Y-%m-%d %H:%M:%S')" "$symbol" "$line"
-      done \
-    | tee -a "$symbol_log" \
-    | tee -a "$COMBINED_LOG"
+      2>&1 >> "$symbol_log"
   ) &
 
   PIDS+=("$!")
@@ -81,19 +103,58 @@ done
 
 log_msg "all runners launched; consolidated log: $COMBINED_LOG"
 
-# Wait for any child to exit. If one exits unexpectedly, stop all for consistency.
-set +e
-wait -n "${PIDS[@]}"
-exit_code=$?
-set -e
-
-log_msg "a child process exited (code=$exit_code); stopping remaining processes"
-cleanup
-
-# Reap remaining children to avoid zombies.
-for pid in "${PIDS[@]:-}"; do
-  wait "$pid" 2>/dev/null || true
+# Wait for all children to complete and track failures explicitly.
+failed_children=0
+for pid in "${PIDS[@]}"; do
+  if wait "$pid"; then
+    :
+  else
+    child_exit=$?
+    failed_children=$((failed_children + 1))
+    log_msg "child process pid=$pid exited with code $child_exit"
+  fi
 done
+
+if (( failed_children > 0 )); then
+  exit_code=1
+else
+  exit_code=0
+fi
+
+log_msg "all child processes completed (exit_code=$exit_code)"
+
+# Consolidate all logs into one file for reference
+for symbol in "${SYMBOLS[@]}"; do
+  symbol_lower=$(echo "$symbol" | tr '[:upper:]' '[:lower:]')
+  symbol_log="$RUN_DIR/${symbol_lower}.log"
+  if [[ -f "$symbol_log" ]]; then
+    {
+      echo "═══════════════════════════════════════════════════════════════════════════════"
+      echo "                          $symbol OUTPUT"
+      echo "═══════════════════════════════════════════════════════════════════════════════"
+      cat "$symbol_log"
+      echo ""
+    } >> "$COMBINED_LOG"
+  fi
+done
+
+# Display formatted output for each instrument
+echo ""
+echo "════════════════════════════════════════════════════════════════════════════════"
+echo "                    📊 MULTI-STRATEGY EXECUTION RESULTS"
+echo "════════════════════════════════════════════════════════════════════════════════"
+
+for symbol in "${SYMBOLS[@]}"; do
+  symbol_lower=$(echo "$symbol" | tr '[:upper:]' '[:lower:]')
+  symbol_log="$RUN_DIR/${symbol_lower}.log"
+  display_symbol_output "$symbol" "$symbol_log"
+done
+
+echo ""
+echo "════════════════════════════════════════════════════════════════════════════════"
+echo "✅ Execution completed | 📁 Logs: $RUN_DIR"
+echo "════════════════════════════════════════════════════════════════════════════════"
+echo ""
 
 log_msg "all processes stopped"
 exit "$exit_code"

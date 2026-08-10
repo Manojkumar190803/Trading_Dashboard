@@ -277,6 +277,12 @@ class BaseStrategyEngine:
                     "option_trigger_level": pending.option_trigger_level,
                     "option_stop_level": pending.option_stop_level,
                 },
+                # Add technical indicators for display
+                "rsi": side_state.last_rsi if hasattr(side_state, 'last_rsi') else None,
+                "ema13": side_state.last_ema13 if hasattr(side_state, 'last_ema13') else None,
+                "ema20": side_state.last_ema20 if hasattr(side_state, 'last_ema20') else None,
+                "ema50": side_state.last_ema50 if hasattr(side_state, 'last_ema50') else None,
+                "vwap": side_state.last_vwap if hasattr(side_state, 'last_vwap') else None,
             }
 
         return {
@@ -765,6 +771,8 @@ class BaseStrategyEngine:
         for attr, col in (("last_ema13", "ema13"), ("last_ema20", "ema20"), ("last_ema50", "ema50")):
             v = row.get(col)
             setattr(side_state, attr, None if (v is None or pd.isna(v)) else float(v))
+        vwap_val = row.get("vwap")
+        side_state.last_vwap = None if (vwap_val is None or pd.isna(vwap_val)) else float(vwap_val)
 
         if self.must_force_square_off(ts):
             self.force_square_off_side(side_state, ts)

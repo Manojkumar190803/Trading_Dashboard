@@ -11,6 +11,7 @@ from typing import Optional
 import pandas as pd
 
 from core.broker import HistoricalReplayBroker, OpenAlgoBroker
+from core.display import format_status_table, format_candle_table, format_candle_header, format_candle_footer, format_candle_data_with_status, save_candle_data, export_all_candles_to_csv, export_all_candles_to_single_csv
 from core.engine import BaseStrategyEngine, get_atm_strike
 from core.indicators import add_indicators
 from core.models import RiskConfig, StrategyConfig
@@ -126,19 +127,51 @@ class LiveFeedRunner:
         engine: BaseStrategyEngine,
         broker: OpenAlgoBroker,
         cfg: StrategyConfig,
+        strategy_name: str = "UNKNOWN",
         lookback_days: int = 5,
         poll_slack_seconds: int = 5,
     ) -> None:
         self.engine = engine
         self.broker = broker
         self.cfg = cfg
+        self.strategy_name = strategy_name
         self.lookback_days = lookback_days
         self.poll_slack_seconds = poll_slack_seconds
         self._stop = threading.Event()
         self._last_bar_time: dict[str, Optional[datetime]] = {"CE": None, "PE": None}
+        self._candle_buffer: dict[str, list[dict]] = {"CE": [], "PE": []}
+        self._header_printed: dict[str, bool] = {"CE": False, "PE": False}
 
     def stop(self) -> None:
         self._stop.set()
+        self.export_candle_data()
+
+    def export_candle_data(self, output_dir: str = "logs") -> None:
+        """Export all buffered candle data to a SINGLE consolidated CSV file in logs/ directory.
+        
+        Format: trading_log_YYYYMMDD.csv
+        Contains ALL candles from the entire trading session.
+        
+        Args:
+            output_dir: Directory to save the CSV file (defaults to "logs")
+        """
+        # Prepare data structure for export: {symbol: {side: [candles]}}
+        all_candles = {
+            self.cfg.spot_symbol: {
+                "CE": self._candle_buffer.get("CE", []),
+                "PE": self._candle_buffer.get("PE", []),
+            }
+        }
+        
+        # Export to SINGLE consolidated CSV file
+        filepath = export_all_candles_to_single_csv(all_candles, output_dir, "trading_log")
+        
+        if filepath:
+            total = len(self._candle_buffer.get("CE", [])) + len(self._candle_buffer.get("PE", []))
+            logger.info(
+                "[EXPORT] Consolidated %d candles to %s",
+                total, filepath
+            )
 
     def _try_lock_atm(self, now: datetime) -> None:
         if self.engine.state.atm_locked:
@@ -191,19 +224,23 @@ class LiveFeedRunner:
 
     def _process_new_bars_for_side(self, side: str, data: pd.DataFrame) -> None:
         if data.empty:
+            logger.debug("[%s] no data received", side)
             return
         now = datetime.now()
         tf_delta = timedelta(minutes=self.cfg.timeframe_minutes)
         closed = data[data["datetime"] + tf_delta <= now]
         if closed.empty:
+            logger.debug("[%s] no closed bars yet (data has %d rows, checking closed bars)", side, len(data))
             return
 
         last_ts = self._last_bar_time.get(side)
         if last_ts is not None:
             closed = closed[closed["datetime"] > last_ts]
             if closed.empty:
+                logger.debug("[%s] no new bars since %s", side, last_ts)
                 return
 
+        logger.info("[%s] processing %d new closed bar(s)", side, len(closed))
         for i, (_, row) in enumerate(closed.iterrows()):
             row_idx = row.name if hasattr(row, "name") else None
             prev_row: Optional[pd.Series] = None
@@ -219,19 +256,49 @@ class LiveFeedRunner:
             self._last_bar_time[side] = (
                 ts.to_pydatetime() if hasattr(ts, "to_pydatetime") else ts
             )
-            if not self.engine.verbose:
-                logger.info(
-                    "processed %s bar %s O=%.2f H=%.2f L=%.2f C=%.2f",
-                    side, self._last_bar_time[side],
-                    row["open"], row["high"], row["low"], row["close"],
-                )
+            
+            # Print table header on first candle for this side
+            if not self._header_printed[side]:
+                logger.info("[%s] ╔════════════════════════════════════════════════════════════════════╗", side)
+                logger.info("[%s] ║                    CANDLESTICK DATA - %s                          ║", side, side)
+                logger.info("[%s] ╚════════════════════════════════════════════════════════════════════╝", side)
+                header_lines = format_candle_header().split('\n')
+                for line in header_lines:
+                    logger.info("[%s] %s", side, line)
+                self._header_printed[side] = True
+            
+            # Format candle row with status
+            side_state = self.engine.state.ce if side == "CE" else self.engine.state.pe
+            candle_row, rsi_val, status = format_candle_data_with_status(
+                self.strategy_name, self.cfg.spot_symbol, side, row, side_state
+            )
+            logger.info("[%s] %s", side, candle_row)
+            
+            # Buffer candle data for file export
+            self._candle_buffer[side].append({
+                "datetime": self._last_bar_time[side],
+                "strategy": self.strategy_name,
+                "open": float(row["open"]),
+                "high": float(row["high"]),
+                "low": float(row["low"]),
+                "close": float(row["close"]),
+                "volume": int(row["volume"]) if "volume" in row else 0,
+                "rsi": rsi_val,
+                "ema13": float(row.get("ema13", 0)) if row.get("ema13") else None,
+                "ema20": float(row.get("ema20", 0)) if row.get("ema20") else None,
+                "ema50": float(row.get("ema50", 0)) if row.get("ema50") else None,
+                "vwap": float(row.get("vwap", 0)) if row.get("vwap") else None,
+                "status": status,
+            })
 
     def _poll_once(self) -> None:
         now = datetime.now()
         self._try_lock_atm(now)
         if not self.engine.state.atm_locked:
+            logger.debug("Poll: ATM not yet locked")
             return
 
+        logger.debug("[POLL] fetching data for CE/PE symbols")
         for side, symbol in (
             ("CE", self.engine.state.ce_symbol),
             ("PE", self.engine.state.pe_symbol),
@@ -239,28 +306,23 @@ class LiveFeedRunner:
             if not symbol:
                 continue
             try:
+                logger.debug("[POLL] fetching history for %s (%s)", symbol, side)
                 data = self._fetch_option_history(symbol)
+                logger.debug("[POLL] received %d rows for %s (%s)", len(data), symbol, side)
             except Exception as exc:
                 logger.warning("history fetch failed for %s %s: %s", side, symbol, exc)
                 continue
             self._process_new_bars_for_side(side, data)
 
     def _wait_with_countdown(self, seconds: float) -> bool:
-        import sys
+        """Wait for specified seconds, checking for stop signal."""
         deadline = datetime.now() + timedelta(seconds=seconds)
         while not self._stop.is_set():
             remaining = (deadline - datetime.now()).total_seconds()
             if remaining <= 0:
                 break
-            mins, secs = divmod(int(remaining), 60)
-            sys.stdout.write(f"\r⏳ Next candle in {mins:02d}:{secs:02d} ")
-            sys.stdout.flush()
             if self._stop.wait(min(1.0, remaining)):
-                sys.stdout.write("\r" + " " * 30 + "\r")
-                sys.stdout.flush()
                 return True
-        sys.stdout.write("\r" + " " * 30 + "\r")
-        sys.stdout.flush()
         return False
 
     def run_forever(self) -> None:
@@ -408,9 +470,39 @@ class MultiEngineLiveFeedRunner:
         self.poll_slack_seconds = poll_slack_seconds
         self._stop = threading.Event()
         self._last_bar_time: dict[str, Optional[datetime]] = {"CE": None, "PE": None}
+        self._candle_buffer: dict[str, list[dict]] = {"CE": [], "PE": []}
+        self._header_printed: dict[str, bool] = {"CE": False, "PE": False}
 
     def stop(self) -> None:
         self._stop.set()
+        self.export_candle_data()
+
+    def export_candle_data(self, output_dir: str = "logs") -> None:
+        """Export all buffered candle data to a SINGLE consolidated CSV file in logs/ directory.
+        
+        Format: trading_log_YYYYMMDD.csv
+        Contains ALL symbols and sides from the entire trading session.
+        
+        Args:
+            output_dir: Directory to save the CSV file (defaults to "logs")
+        """
+        # Prepare data structure for export: {symbol: {side: [candles]}}
+        all_candles = {
+            self.cfg.spot_symbol: {
+                "CE": self._candle_buffer.get("CE", []),
+                "PE": self._candle_buffer.get("PE", []),
+            }
+        }
+        
+        # Export to SINGLE consolidated CSV file
+        filepath = export_all_candles_to_single_csv(all_candles, output_dir, "trading_log")
+        
+        if filepath:
+            total = len(self._candle_buffer.get("CE", [])) + len(self._candle_buffer.get("PE", []))
+            logger.info(
+                "[EXPORT] Consolidated %d candles to %s",
+                total, filepath
+            )
 
     def _try_lock_atm(self, now: datetime) -> None:
         first_engine = self.engines[0][1]
@@ -465,19 +557,23 @@ class MultiEngineLiveFeedRunner:
 
     def _process_new_bars_for_side(self, side: str, data: pd.DataFrame) -> None:
         if data.empty:
+            logger.debug("[%s] no data received", side)
             return
         now = datetime.now()
         tf_delta = timedelta(minutes=self.cfg.timeframe_minutes)
         closed = data[data["datetime"] + tf_delta <= now]
         if closed.empty:
+            logger.debug("[%s] no closed bars yet (data has %d rows)", side, len(data))
             return
 
         last_ts = self._last_bar_time.get(side)
         if last_ts is not None:
             closed = closed[closed["datetime"] > last_ts]
             if closed.empty:
+                logger.debug("[%s] no new bars since %s", side, last_ts)
                 return
 
+        logger.info("[%s] processing %d new closed bar(s) across %d engines", side, len(closed), len(self.engines))
         for i, (_, row) in enumerate(closed.iterrows()):
             row_idx = row.name if hasattr(row, "name") else None
             prev_row: Optional[pd.Series] = None
@@ -488,20 +584,61 @@ class MultiEngineLiveFeedRunner:
                 pos_in_full = data.index.get_loc(row_idx)
             if pos_in_full > 0:
                 prev_row = data.iloc[pos_in_full - 1]
+            
+            # Process candle for all engines
             for _, engine in self.engines:
                 engine.process_option_candle(side, row, prev_row)
+            
             ts = row["datetime"]
             self._last_bar_time[side] = (
                 ts.to_pydatetime() if hasattr(ts, "to_pydatetime") else ts
             )
+            
+            # Print table header on first candle for this side
+            if not self._header_printed[side]:
+                logger.info("[%s] ╔════════════════════════════════════════════════════════════════════╗", side)
+                logger.info("[%s] ║                    CANDLESTICK DATA - %s                          ║", side, side)
+                logger.info("[%s] ╚════════════════════════════════════════════════════════════════════╝", side)
+                header_lines = format_candle_header().split('\n')
+                for line in header_lines:
+                    logger.info("[%s] %s", side, line)
+                self._header_printed[side] = True
+            
+            # Log one row per engine/strategy
+            for strategy_name, engine in self.engines:
+                side_state = engine.state.ce if side == "CE" else engine.state.pe
+                candle_row, rsi_val, status = format_candle_data_with_status(
+                    strategy_name, self.cfg.spot_symbol, side, row, side_state
+                )
+                logger.info("[%s] %s", side, candle_row)
+            
+            # Buffer candle data for file export (just once per candle, for first engine)
+            first_strategy, _ = self.engines[0]
+            side_state = engine.state.ce if side == "CE" else engine.state.pe
+            _, rsi_val, status = format_candle_data_with_status(
+                first_strategy, self.cfg.spot_symbol, side, row, side_state
+            )
+            self._candle_buffer[side].append({
+                "datetime": self._last_bar_time[side],
+                "strategy": first_strategy,
+                "open": float(row["open"]),
+                "high": float(row["high"]),
+                "low": float(row["low"]),
+                "close": float(row["close"]),
+                "volume": int(row["volume"]) if "volume" in row else 0,
+                "rsi": rsi_val,
+                "status": status,
+            })
 
     def _poll_once(self) -> None:
         now = datetime.now()
         self._try_lock_atm(now)
         first_engine = self.engines[0][1]
         if not first_engine.state.atm_locked:
+            logger.debug("Poll: ATM not yet locked")
             return
 
+        logger.debug("[POLL] fetching data for CE/PE symbols")
         for side, symbol in (
             ("CE", first_engine.state.ce_symbol),
             ("PE", first_engine.state.pe_symbol),
@@ -509,28 +646,23 @@ class MultiEngineLiveFeedRunner:
             if not symbol:
                 continue
             try:
+                logger.debug("[POLL] fetching history for %s (%s)", symbol, side)
                 data = self._fetch_option_history(symbol)
+                logger.debug("[POLL] received %d rows for %s (%s)", len(data), symbol, side)
             except Exception as exc:
                 logger.warning("history fetch failed for %s %s: %s", side, symbol, exc)
                 continue
             self._process_new_bars_for_side(side, data)
 
     def _wait_with_countdown(self, seconds: float) -> bool:
-        import sys
+        """Wait for specified seconds, checking for stop signal."""
         deadline = datetime.now() + timedelta(seconds=seconds)
         while not self._stop.is_set():
             remaining = (deadline - datetime.now()).total_seconds()
             if remaining <= 0:
                 break
-            mins, secs = divmod(int(remaining), 60)
-            sys.stdout.write(f"\r⏳ Next candle in {mins:02d}:{secs:02d} ")
-            sys.stdout.flush()
             if self._stop.wait(min(1.0, remaining)):
-                sys.stdout.write("\r" + " " * 30 + "\r")
-                sys.stdout.flush()
                 return True
-        sys.stdout.write("\r" + " " * 30 + "\r")
-        sys.stdout.flush()
         return False
 
     def run_forever(self) -> None:
@@ -590,34 +722,16 @@ class MultiEngineLiveFeedRunner:
         first_engine = self.engines[0][1]
         state = first_engine.state
         if not state.atm_locked:
-            print(f"\n[{now.strftime('%H:%M:%S')}] Waiting for ATM lock...")
+            logger.debug("[%s] Waiting for ATM lock at %s", self.cfg.spot_symbol, self.cfg.atm_lock_time)
             return
 
-        print(f"\n┌─── {now.strftime('%H:%M:%S')} ─── Multi-Strategy Status {'─' * 24}┐")
-        print(f"│ Strikes: {state.ce_symbol} / {state.pe_symbol}")
+        # Collect status from all engines for tabular display
+        engines_status = {}
         for name, engine in self.engines:
-            pnl = engine.realized_pnl
-            entries = engine.total_entries
-            sl = engine.state.sl_hits_today
-            print(
-                f"│ [{name.upper()}] Entries={entries}  SL_hits={sl}/{engine.risk.max_sl_per_day}"
-                f"  PnL={pnl:+.1f}"
-            )
-            for side in ("CE", "PE"):
-                ss = engine._side_state(side)
-                setup = engine.signal_provider.format_setup_status(ss)
-                if ss.position:
-                    pos = ss.position
-                    trade = (
-                        f"LONG entry={pos.entry_price:.1f} SL={pos.option_stop_level:.1f} "
-                        f"qty={pos.quantity}/{pos.initial_quantity}"
-                    )
-                elif ss.pending_entry:
-                    trade = f"PENDING trigger={ss.pending_entry.option_trigger_level:.1f}"
-                else:
-                    trade = "FLAT"
-                print(f"│   {side}: {trade}  | {setup}")
-        print(f"└{'─' * 62}┘")
+            engines_status[name.upper()] = engine.get_status_snapshot()
+        
+        # Display as formatted table
+        print(format_status_table(self.cfg.spot_symbol, engines_status))
 
 
 # ===============================================================
