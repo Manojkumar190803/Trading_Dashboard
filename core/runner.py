@@ -11,7 +11,7 @@ from typing import Optional
 import pandas as pd
 
 from core.broker import HistoricalReplayBroker, OpenAlgoBroker
-from core.display import format_status_table, format_candle_table, format_candle_header, format_candle_footer, format_candle_data_with_status, save_candle_data, export_all_candles_to_csv, export_all_candles_to_single_csv
+from core.display import format_status_table, print_status_table, format_candle_table, format_candle_header, format_candle_footer, format_candle_data_with_status, save_candle_data, export_all_candles_to_csv, export_all_candles_to_single_csv
 from core.engine import BaseStrategyEngine, get_atm_strike
 from core.indicators import add_indicators
 from core.models import RiskConfig, StrategyConfig
@@ -730,8 +730,8 @@ class MultiEngineLiveFeedRunner:
         for name, engine in self.engines:
             engines_status[name.upper()] = engine.get_status_snapshot()
         
-        # Display as formatted table
-        print(format_status_table(self.cfg.spot_symbol, engines_status))
+        # Display as formatted table (with immediate flush for live terminal)
+        print_status_table(self.cfg.spot_symbol, engines_status)
 
 
 # ===============================================================

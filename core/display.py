@@ -2,6 +2,7 @@
 
 import csv
 import os
+import sys
 import pandas as pd
 from datetime import datetime
 from pathlib import Path
@@ -45,6 +46,17 @@ def format_status_table(instrument: str, engines_status: dict[str, Any]) -> str:
     lines.append(f"└──────────────────────────────────────────────────────────────────────────────────┘")
     
     return "\n".join(lines)
+
+
+def print_status_table(instrument: str, engines_status: dict[str, Any]) -> None:
+    """Print status table with immediate flush for live terminal display.
+    
+    Ensures status updates appear immediately in terminal (every 3 minutes).
+    """
+    output = format_status_table(instrument, engines_status)
+    if output:
+        print(output, flush=True)
+        sys.stdout.flush()
 
 
 def _format_side_status_detailed(side_data: dict[str, Any]) -> str:
