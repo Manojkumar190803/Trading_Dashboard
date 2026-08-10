@@ -326,6 +326,61 @@ def test_discover_payload_handles_method_errors_and_later_success(fake_openalgo)
     assert payload["status"] == "success"
 
 
+def test_discover_index_profile_optionchain_with_expiry_date_required(fake_openalgo, caplog):
+    broker = OpenAlgoBroker(api_key="k", host="h", dry_run=True)
+    client = fake_openalgo["client"]
+
+    def _optionchain(**kwargs):
+        if "expiry_date" not in kwargs:
+            raise TypeError("missing required argument: expiry_date")
+        return {
+            "status": "success",
+            "data": {
+                "Underlying": "NIFTY",
+                "LotSize": "65",
+                "StrikeInterval": "50",
+            },
+        }
+
+    def _expiry(**kwargs):
+        return {
+            "status": "success",
+            "data": [{"Expiry": "2026-08-11"}],
+        }
+
+    client.optionchain = _optionchain
+    client.expiry = _expiry
+
+    caplog.clear()
+    profile = broker.discover_index_profile("NIFTY")
+
+    assert profile["spot_symbol"] == "NIFTY"
+    assert profile["option_index_symbol"] == "NIFTY"
+    assert profile["strike_step"] == 50
+    assert profile["option_lot_size"] == 65
+    assert "missing strike/lot metadata" not in caplog.text
+
+
+def test_discover_index_profile_full_known_fallback_logs_info_not_warning(fake_openalgo, caplog):
+    broker = OpenAlgoBroker(api_key="k", host="h", dry_run=True)
+    client = fake_openalgo["client"]
+    client.optionchain_response = {
+        "status": "success",
+        "data": {"underlying": "NIFTY", "lotsize": None, "strike": None},
+    }
+
+    with caplog.at_level("INFO"):
+        profile = broker.discover_index_profile("NIFTY")
+
+    assert profile["strike_step"] == 50
+    assert profile["option_lot_size"] == 65
+    # For known scripts with both fields missing, this should be informational, not warning noise.
+    warns = [r for r in caplog.records if r.levelname == "WARNING" and "missing strike/lot metadata" in r.message]
+    infos = [r for r in caplog.records if r.levelname == "INFO" and "missing strike/lot metadata" in r.message]
+    assert not warns
+    assert infos
+
+
 def test_discovery_helper_parsers_cover_edge_cases(fake_openalgo):
     broker = OpenAlgoBroker(api_key="k", host="h", dry_run=True)
 
@@ -345,7 +400,12 @@ def test_discovery_helper_parsers_cover_edge_cases(fake_openalgo):
     assert numeric["lot_size"] == 65
     assert numeric["market_lot"] == 30
 
+    numeric_ci = broker._extract_numeric_fields({"data": [{"LotSize": "65"}, {"MarketLot": "30"}]})
+    assert numeric_ci["lot_size"] == 65
+    assert numeric_ci["market_lot"] == 30
+
     assert broker._extract_strike_step({"strike_interval": "50"}) == 50
+    assert broker._extract_strike_step({"StrikeInterval": "100"}) == 100
     assert broker._extract_strike_step({"data": [{"strike": 25000}, {"strike": 25100}]}) == 100
     assert broker._extract_strike_step({"data": [[25000, 25050, 25100]]}) == 50
     assert broker._extract_strike_step({"data": [{"strike": 25000}]}) is None

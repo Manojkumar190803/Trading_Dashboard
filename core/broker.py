@@ -339,6 +339,7 @@ class OpenAlgoBroker(BrokerInterface):
         lot_size = numeric.get("lot_size")
         if lot_size is None:
             lot_size = numeric.get("market_lot")
+        missing_both = strike_step is None and lot_size is None
         if strike_step is None or lot_size is None:
             fallback = fallback_metadata.get(canonical)
             if fallback is not None:
@@ -346,7 +347,8 @@ class OpenAlgoBroker(BrokerInterface):
                     strike_step = int(fallback["strike_step"])
                 if lot_size is None:
                     lot_size = int(fallback["option_lot_size"])
-                logger.warning(
+                log_fn = logger.info if missing_both else logger.warning
+                log_fn(
                     "OpenAlgo discovery missing strike/lot metadata for %s; using fallback strike_step=%s lot_size=%s",
                     canonical,
                     strike_step,
@@ -385,16 +387,50 @@ class OpenAlgoBroker(BrokerInterface):
         aliases = self._symbol_aliases(canonical)
         last_error: Optional[str] = None
         first_usable_payload = None
+        expiry_dates_by_alias: dict[str, list[str]] = {}
+
+        expiry_method = getattr(self.client, "expiry", None)
+        if expiry_method is not None:
+            for alias in aliases:
+                discovered_dates: list[str] = []
+                expiry_kwargs_candidates = [
+                    {"exchange": options_exchange, "symbol": alias, "instrumenttype": "OPTIDX"},
+                    {"exchange": options_exchange, "underlying": alias, "instrumenttype": "OPTIDX"},
+                    {"exchange": options_exchange, "symbol": alias},
+                ]
+                for kwargs in expiry_kwargs_candidates:
+                    try:
+                        resp = expiry_method(**kwargs)
+                    except Exception:
+                        continue
+                    if isinstance(resp, dict) and resp.get("status") == "error":
+                        msg = resp.get("message")
+                        if isinstance(msg, str) and msg.strip():
+                            last_error = msg.strip()
+                    discovered_dates.extend(self._extract_expiry_dates(resp))
+                if discovered_dates:
+                    # Keep first-seen order while de-duplicating.
+                    expiry_dates_by_alias[alias] = list(dict.fromkeys(discovered_dates))
+
         method_candidates: list[tuple[str, list[dict[str, object]]]] = []
         for alias in aliases:
+            optionchain_kwargs: list[dict[str, object]] = [
+                {"underlying": alias, "exchange": options_exchange},
+                {"underlying": alias, "exchange": spot_exchange},
+            ]
+            for expiry_date in expiry_dates_by_alias.get(alias, []):
+                optionchain_kwargs.append(
+                    {"underlying": alias, "exchange": options_exchange, "expiry_date": expiry_date}
+                )
+                optionchain_kwargs.append(
+                    {"underlying": alias, "exchange": spot_exchange, "expiry_date": expiry_date}
+                )
+
             method_candidates.extend(
                 [
                     (
                         "optionchain",
-                        [
-                            {"underlying": alias, "exchange": options_exchange},
-                            {"underlying": alias, "exchange": spot_exchange},
-                        ],
+                        optionchain_kwargs,
                     ),
                     (
                         "search",
@@ -523,10 +559,11 @@ class OpenAlgoBroker(BrokerInterface):
         for item in cls._walk_objects(payload):
             if not isinstance(item, dict):
                 continue
+            normalized = {str(k).lower(): v for k, v in item.items()}
             for raw_key, target in key_map.items():
-                if raw_key not in item:
+                if raw_key not in normalized:
                     continue
-                val = cls._coerce_number(item.get(raw_key))
+                val = cls._coerce_number(normalized.get(raw_key))
                 if val is None:
                     continue
                 if val > 0:
@@ -539,19 +576,21 @@ class OpenAlgoBroker(BrokerInterface):
         for item in cls._walk_objects(payload):
             if not isinstance(item, dict):
                 continue
+            normalized = {str(k).lower(): v for k, v in item.items()}
             for key in direct_keys:
-                if key not in item:
+                if key not in normalized:
                     continue
-                val = cls._coerce_number(item.get(key))
+                val = cls._coerce_number(normalized.get(key))
                 if val and val > 0:
                     return int(round(val))
 
         strikes: list[float] = []
         for item in cls._walk_objects(payload):
             if isinstance(item, dict):
+                normalized = {str(k).lower(): v for k, v in item.items()}
                 for key in ("strike", "strike_price", "strikeprice"):
-                    if key in item:
-                        val = cls._coerce_number(item.get(key))
+                    if key in normalized:
+                        val = cls._coerce_number(normalized.get(key))
                         if val is not None:
                             strikes.append(val)
             elif isinstance(item, (list, tuple)):
@@ -572,8 +611,9 @@ class OpenAlgoBroker(BrokerInterface):
         for item in cls._walk_objects(payload):
             if not isinstance(item, dict):
                 continue
+            normalized = {str(k).lower(): v for k, v in item.items()}
             for key in keys:
-                value = item.get(key)
+                value = normalized.get(key)
                 if isinstance(value, str) and value.strip():
                     root = cls._infer_index_root(value)
                     if root is not None:
@@ -594,8 +634,9 @@ class OpenAlgoBroker(BrokerInterface):
         for item in cls._walk_objects(payload):
             if not isinstance(item, dict):
                 continue
+            normalized = {str(k).lower(): v for k, v in item.items()}
             for key in keys:
-                value = item.get(key)
+                value = normalized.get(key)
                 if isinstance(value, str) and value.strip():
                     root = cls._infer_index_root(value)
                     if root is not None:
@@ -622,19 +663,21 @@ class OpenAlgoBroker(BrokerInterface):
         for item in cls._walk_objects(payload):
             if not isinstance(item, dict):
                 continue
+            normalized = {str(k).lower(): v for k, v in item.items()}
             for key in ("weekly_expiry_weekday", "expiry_weekday"):
-                if key in item:
-                    val = cls._coerce_number(item.get(key))
+                if key in normalized:
+                    val = cls._coerce_number(normalized.get(key))
                     if val is not None and 0 <= int(val) <= 6:
                         return int(val)
 
         dates: list[date] = []
         for item in cls._walk_objects(payload):
             if isinstance(item, dict):
+                normalized = {str(k).lower(): v for k, v in item.items()}
                 for key in ("expiry", "expiry_date", "expdate", "exp"):
-                    if key not in item:
+                    if key not in normalized:
                         continue
-                    parsed = cls._parse_date(item.get(key))
+                    parsed = cls._parse_date(normalized.get(key))
                     if parsed is not None:
                         dates.append(parsed)
             elif isinstance(item, (list, tuple)):
@@ -661,6 +704,7 @@ class OpenAlgoBroker(BrokerInterface):
             return None
         for fmt in (
             "%Y-%m-%d",
+            "%Y/%m/%d",
             "%d-%m-%Y",
             "%d/%m/%Y",
             "%d-%b-%y",
@@ -674,6 +718,26 @@ class OpenAlgoBroker(BrokerInterface):
             except ValueError:
                 continue
         return None
+
+    @classmethod
+    def _extract_expiry_dates(cls, payload) -> list[str]:
+        """Collect all parseable expiry values in ISO format (YYYY-MM-DD)."""
+        out: list[str] = []
+        for item in cls._walk_objects(payload):
+            if isinstance(item, dict):
+                normalized = {str(k).lower(): v for k, v in item.items()}
+                for key in ("expiry", "expiry_date", "expdate", "exp"):
+                    if key not in normalized:
+                        continue
+                    parsed = cls._parse_date(normalized.get(key))
+                    if parsed is not None:
+                        out.append(parsed.isoformat())
+            elif isinstance(item, (list, tuple)):
+                for value in item:
+                    parsed = cls._parse_date(value)
+                    if parsed is not None:
+                        out.append(parsed.isoformat())
+        return out
 
     def _infer_exchange(self, symbol: str) -> str:
         if symbol.endswith("CE") or symbol.endswith("PE"):
