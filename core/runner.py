@@ -310,8 +310,8 @@ class LiveFeedRunner:
         now = datetime.now()
         if now.weekday() >= 5:
             return False
-        open_t = self.cfg.market_open.replace(year=now.year, month=now.month, day=now.day)
-        close_t = self.cfg.market_close.replace(year=now.year, month=now.month, day=now.day)
+        open_t = datetime.combine(now.date(), self.cfg.market_open)
+        close_t = datetime.combine(now.date(), self.cfg.market_close)
         return open_t <= now < close_t
 
     def _format_side_status(self, side: str) -> str:
@@ -580,8 +580,8 @@ class MultiEngineLiveFeedRunner:
         now = datetime.now()
         if now.weekday() >= 5:
             return False
-        open_t = self.cfg.market_open.replace(year=now.year, month=now.month, day=now.day)
-        close_t = self.cfg.market_close.replace(year=now.year, month=now.month, day=now.day)
+        open_t = datetime.combine(now.date(), self.cfg.market_open)
+        close_t = datetime.combine(now.date(), self.cfg.market_close)
         return open_t <= now < close_t
 
     def _print_cycle_summary(self) -> None:
