@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from datetime import date, datetime, time, timedelta
-from typing import Optional
+from typing import Any, Optional
 
 import pandas as pd
 
@@ -70,6 +70,96 @@ class BaseStrategyEngine:
         self.diagnose: bool = False
         self.verbose: bool = False
         self._verbose_header_printed: bool = False
+        self.capture_trace: bool = False
+        self.trace_rows: list[dict[str, Any]] = []
+
+    @property
+    def strategy_name(self) -> str:
+        return self.signal_provider.__class__.__name__
+
+    def _trace_enabled(self) -> bool:
+        return self.verbose or self.capture_trace
+
+    def _fmt_signal(self, signal: Signal) -> str:
+        return signal.value if isinstance(signal, Signal) else str(signal)
+
+    def _safe_value(self, value: Any) -> Any:
+        if value is None:
+            return None
+        if isinstance(value, pd.Timestamp):
+            return value.to_pydatetime().isoformat(sep=" ")
+        if isinstance(value, datetime):
+            return value.isoformat(sep=" ")
+        if pd.isna(value):
+            return None
+        return value
+
+    def _record_trace_row(
+        self,
+        side: str,
+        side_state: BaseSideState,
+        row: pd.Series,
+        signal: Signal,
+        trade_initiated: bool,
+        remark: str,
+    ) -> None:
+        if not self._trace_enabled():
+            return
+
+        trace = {
+            "strategy": self.strategy_name,
+            "script": side_state.option_symbol or (self.state.ce_symbol if side == "CE" else self.state.pe_symbol) or "",
+            "spot_symbol": self.cfg.spot_symbol,
+            "timestamp": self._safe_value(row.get("datetime")),
+            "side": side,
+            "signal": self._fmt_signal(signal),
+            "trade_initiated": trade_initiated,
+            "remark": remark,
+            "sl_hits_today": self.state.sl_hits_today,
+            "sl_cap": self.risk.max_sl_per_day,
+            "atm_locked": self.state.atm_locked,
+            "has_position": side_state.position is not None,
+            "has_pending_entry": side_state.pending_entry is not None,
+            "setup_status": self.signal_provider.format_setup_status(side_state),
+        }
+
+        for col, value in row.items():
+            trace[str(col)] = self._safe_value(value)
+
+        pos = side_state.position
+        if pos is not None:
+            trace.update(
+                {
+                    "position_symbol": pos.option_symbol,
+                    "position_qty": pos.quantity,
+                    "position_entry_price": pos.entry_price,
+                    "position_stop": pos.option_stop_level,
+                }
+            )
+
+        pend = side_state.pending_entry
+        if pend is not None:
+            trace.update(
+                {
+                    "pending_symbol": pend.option_symbol,
+                    "pending_qty": pend.quantity,
+                    "pending_trigger": pend.option_trigger_level,
+                    "pending_stop": pend.option_stop_level,
+                }
+            )
+
+        for attr in (
+            "p1_price",
+            "p1_rsi",
+            "p1_candle_time",
+            "p2_price",
+            "p2_rsi",
+            "p2_candle_time",
+        ):
+            if hasattr(side_state, attr):
+                trace[attr] = self._safe_value(getattr(side_state, attr))
+
+        self.trace_rows.append(trace)
 
     # ── helpers ──────────────────────────────────────────────────────
 
@@ -662,6 +752,11 @@ class BaseStrategyEngine:
         self.on_day_transition_if_needed(ts)
 
         side_state = self._side_state(side)
+        signal: Signal = Signal.NONE
+        remark = "NO_ENTRY"
+        trade_initiated = False
+        had_pending_before = side_state.pending_entry is not None
+        had_position_before = side_state.position is not None
 
         # Update indicator cache for status display.
         side_state.last_close = float(row["close"])
@@ -673,12 +768,18 @@ class BaseStrategyEngine:
 
         if self.must_force_square_off(ts):
             self.force_square_off_side(side_state, ts)
+            remark = "FORCE_SQUARE_OFF"
+            self._record_trace_row(side, side_state, row, signal, False, remark)
             return
 
         if not self.in_trade_window(ts):
+            remark = "OUTSIDE_TRADE_WINDOW"
+            self._record_trace_row(side, side_state, row, signal, False, remark)
             return
 
         if side_state.option_symbol is None:
+            remark = "ATM_NOT_LOCKED"
+            self._record_trace_row(side, side_state, row, signal, False, remark)
             return
 
         if not self.in_signal_window(ts):
@@ -686,6 +787,8 @@ class BaseStrategyEngine:
                 side_state.pending_entry = None
                 self._record_alert(ts, "SESSION", f"{side} pending entry cancelled at signal cutoff")
             self.monitor_open_position(side_state, row)
+            remark = "OUTSIDE_SIGNAL_WINDOW"
+            self._record_trace_row(side, side_state, row, signal, False, remark)
             return
 
         self.try_fill_pending_entry(side, side_state, ts, row)
@@ -696,12 +799,32 @@ class BaseStrategyEngine:
         signal = self.signal_provider.generate_signal(side, side_state, row, prev_row)
 
         if signal in (Signal.BUY_CE, Signal.BUY_PE):
+            had_pending_after_pre_checks = side_state.pending_entry is not None
             self.place_pending_entry(side, side_state, ts, row)
+            if side_state.pending_entry is not None and not had_pending_after_pre_checks:
+                trade_initiated = True
+                remark = "PENDING_ENTRY_CREATED"
+            elif side_state.position is not None and not had_position_before:
+                trade_initiated = True
+                remark = "POSITION_OPENED"
+            else:
+                remark = "SIGNAL_REJECTED_BY_RISK_OR_STATE"
         elif self.diagnose:
             self._diagnose_side(side, side_state, ts, row, prev_row)
+            reason = self.signal_provider.diagnose_no_signal(side, side_state, row, prev_row)
+            remark = f"NO_ENTRY: {reason}" if reason else "NO_ENTRY: SIGNAL_NONE"
+        elif side_state.position is not None:
+            remark = "POSITION_MANAGEMENT"
+        elif side_state.pending_entry is not None:
+            remark = "PENDING_ENTRY_WAITING_TRIGGER"
+        else:
+            reason = self.signal_provider.diagnose_no_signal(side, side_state, row, prev_row)
+            remark = f"NO_ENTRY: {reason}" if reason else "NO_ENTRY: SIGNAL_NONE"
 
         if self.verbose:
             self._print_candle_summary(side, side_state, ts, row)
+
+        self._record_trace_row(side, side_state, row, signal, trade_initiated, remark)
 
     def process_candle(self, row: pd.Series, prev_row: Optional[pd.Series]) -> None:
         """Feed a single bar to both CE and PE sides."""

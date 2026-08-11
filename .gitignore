@@ -7,3 +7,4 @@ logs_store.csv
 replay_reports_sample/
 .DS_Store
 .coverage
+logs/

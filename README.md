@@ -167,3 +167,6 @@ Each service runs in IST timezone, auto-restarts on crash, and injects script-sp
 ## License
 
 MIT
+
+for backtesting verbose logging with CSV save
+ .venv/bin/python run_strategy.py --strategy hd,cd,tc --mode backtest --start 2026-08-10 --end 2026-08-10 --verbose-csv logs/live_runs/verbose_2026-08-10.csv

@@ -5,6 +5,7 @@ import os
 import re
 import threading
 from datetime import date, datetime, timedelta
+from pathlib import Path
 from typing import Optional
 
 import pandas as pd
@@ -670,6 +671,16 @@ def _find_atm_lock_price(spot_day: pd.DataFrame, cfg: StrategyConfig) -> Optiona
     return None
 
 
+def _write_verbose_trace_csv(trace_rows: list[dict], csv_path: str) -> None:
+    if not trace_rows:
+        logger.warning("verbose trace CSV skipped: no rows to write")
+        return
+    out_path = Path(csv_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(trace_rows).to_csv(out_path, index=False)
+    logger.info("verbose trace CSV saved: %s (%d rows)", out_path, len(trace_rows))
+
+
 def run_historical_replay(
     cfg: StrategyConfig,
     risk: RiskConfig,
@@ -677,6 +688,8 @@ def run_historical_replay(
     start_date: str,
     end_date: str,
     diagnose: bool = False,
+    verbose: bool = False,
+    verbose_csv_path: Optional[str] = None,
 ) -> None:
     api_key = os.getenv("OPENALGO_API_KEY")
     if not api_key:
@@ -706,6 +719,8 @@ def run_historical_replay(
     broker = HistoricalReplayBroker()
     engine = BaseStrategyEngine(cfg, risk, broker, signal_provider)
     engine.diagnose = diagnose
+    engine.verbose = verbose
+    engine.capture_trace = bool(verbose_csv_path)
 
     total_bars = 0
     skipped_days = 0
@@ -840,6 +855,9 @@ def run_historical_replay(
     print(f"Total exits       : {len(exits)}")
     print("=" * 72)
 
+    if verbose_csv_path:
+        _write_verbose_trace_csv(engine.trace_rows, verbose_csv_path)
+
 
 def run_multi_historical_replay(
     cfg: StrategyConfig,
@@ -848,6 +866,8 @@ def run_multi_historical_replay(
     start_date: str,
     end_date: str,
     diagnose: bool = False,
+    verbose: bool = False,
+    verbose_csv_path: Optional[str] = None,
 ) -> None:
     """Run multiple independent engines over the same historical data (single fetch)."""
     api_key = os.getenv("OPENALGO_API_KEY")
@@ -872,6 +892,8 @@ def run_multi_historical_replay(
         broker = HistoricalReplayBroker()
         engine = BaseStrategyEngine(cfg, risk, broker, provider)
         engine.diagnose = diagnose
+        engine.verbose = verbose
+        engine.capture_trace = bool(verbose_csv_path)
         engines.append((name, engine, broker))
 
     skipped_days = 0
@@ -1002,3 +1024,12 @@ def run_multi_historical_replay(
     print(f"\n{'─' * 72}")
     print(f"  COMBINED PnL    : {combined_pnl:.2f}")
     print("=" * 72)
+
+    if verbose_csv_path:
+        base = Path(verbose_csv_path)
+        for name, engine, _ in engines:
+            if len(engines) == 1:
+                out_path = base
+            else:
+                out_path = base.with_name(f"{base.stem}_{name}{base.suffix or '.csv'}")
+            _write_verbose_trace_csv(engine.trace_rows, str(out_path))

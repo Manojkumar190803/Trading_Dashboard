@@ -113,7 +113,13 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument("--diagnose", action="store_true",
                         help="Print per-candle diagnostic when no signal fires")
     parser.add_argument("--verbose", action="store_true",
-                        help="Print full candle summary every bar")
+                        help="Print full candle summary every bar (live + backtest)")
+    parser.add_argument(
+        "--verbose-csv",
+        type=str,
+        default=None,
+        help="Backtest only: save candle-by-candle verbose trace to CSV path",
+    )
     parser.add_argument("--log-level", type=str, default="INFO")
     return parser.parse_args(argv)
 
@@ -273,10 +279,28 @@ def main(argv: Optional[list[str]] = None) -> None:
         end_date = args.end or datetime.now().date().strftime("%Y-%m-%d")
         if len(strategy_names) > 1:
             providers = [(name, get_signal_provider(name, args)) for name in strategy_names]
-            run_multi_historical_replay(cfg, risk, providers, args.start, end_date, diagnose=args.diagnose)
+            run_multi_historical_replay(
+                cfg,
+                risk,
+                providers,
+                args.start,
+                end_date,
+                diagnose=args.diagnose,
+                verbose=args.verbose,
+                verbose_csv_path=args.verbose_csv,
+            )
         else:
             provider = get_signal_provider(strategy_names[0], args)
-            run_historical_replay(cfg, risk, provider, args.start, end_date, diagnose=args.diagnose)
+            run_historical_replay(
+                cfg,
+                risk,
+                provider,
+                args.start,
+                end_date,
+                diagnose=args.diagnose,
+                verbose=args.verbose,
+                verbose_csv_path=args.verbose_csv,
+            )
         return
 
     if args.mode == "smoke":

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Optional
 
 import pandas as pd
@@ -19,10 +20,13 @@ class CDSideState(BaseSideState):
     pullback_active: bool = False
     pullback_low_price: Optional[float] = None
     pullback_low_rsi: Optional[float] = None
+    pullback_low_time: Optional[datetime] = None
     p1_price: Optional[float] = None
     p1_rsi: Optional[float] = None
+    p1_candle_time: Optional[datetime] = None
     p2_price: Optional[float] = None
     p2_rsi: Optional[float] = None
+    p2_candle_time: Optional[datetime] = None
     divergence_ready: bool = False
     # Dual-candle confirmation state
     confirm_count: int = 0  # 0=not confirming, 1=first candle OK, 2=armed
@@ -117,10 +121,13 @@ class CDSignalProvider(SignalProvider):
         side_state.pullback_active = False
         side_state.pullback_low_price = None
         side_state.pullback_low_rsi = None
+        side_state.pullback_low_time = None
         side_state.p1_price = None
         side_state.p1_rsi = None
+        side_state.p1_candle_time = None
         side_state.p2_price = None
         side_state.p2_rsi = None
+        side_state.p2_candle_time = None
         side_state.divergence_ready = False
         side_state.confirm_count = 0
         side_state.confirm_lows = []
@@ -265,6 +272,7 @@ class CDSignalProvider(SignalProvider):
             ss.pullback_active = True
             ss.pullback_low_price = row["low"]
             ss.pullback_low_rsi = rsi
+            ss.pullback_low_time = row.get("datetime")
             # New sub-20 excursion resets any in-progress confirmation
             if not ss.divergence_ready:
                 ss.confirm_count = 0
@@ -279,8 +287,11 @@ class CDSignalProvider(SignalProvider):
         if ss.pullback_active and rsi < 20:
             if ss.pullback_low_price is None:
                 ss.pullback_low_price = row["low"]
+                ss.pullback_low_time = row.get("datetime")
             else:
-                ss.pullback_low_price = min(ss.pullback_low_price, row["low"])
+                if float(row["low"]) <= float(ss.pullback_low_price):
+                    ss.pullback_low_price = row["low"]
+                    ss.pullback_low_time = row.get("datetime")
             if ss.pullback_low_rsi is None:
                 ss.pullback_low_rsi = rsi
             else:
@@ -293,12 +304,15 @@ class CDSignalProvider(SignalProvider):
                 if ss.p1_price is None or ss.p1_rsi is None:
                     ss.p1_price = finished_price
                     ss.p1_rsi = finished_rsi
+                    ss.p1_candle_time = ss.pullback_low_time
                     ss.p2_price = None
                     ss.p2_rsi = None
+                    ss.p2_candle_time = None
                     ss.divergence_ready = False
                 else:
                     ss.p2_price = finished_price
                     ss.p2_rsi = finished_rsi
+                    ss.p2_candle_time = ss.pullback_low_time
                     # Classic divergence: Price LL + RSI HL
                     ss.divergence_ready = (
                         ss.p2_price < ss.p1_price and ss.p2_rsi > ss.p1_rsi
@@ -309,3 +323,4 @@ class CDSignalProvider(SignalProvider):
             ss.pullback_active = False
             ss.pullback_low_price = None
             ss.pullback_low_rsi = None
+            ss.pullback_low_time = None
