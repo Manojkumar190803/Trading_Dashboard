@@ -1,0 +1,2 @@
+side	symbol	quantity	entry_time	entry_price	stop_loss	target	exit_time	exit_price	exit_reason	gross_pnl
+CE	CE	130	2026-08-24 09:30:10	181.0	161.0	221.0	2026-08-24 09:30:10	181.0	ACTIVE	0.0

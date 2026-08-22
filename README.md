@@ -42,12 +42,41 @@ python3 run_strategy.py --script BANKNIFTY --strategy cd --mode paper
 # TC strategy
 python3 run_strategy.py --script NIFTY --strategy tc --mode paper
 
+# 9:30 OPT-Buy tick backtest
+python3 -m strategies.opt_buy_930 \
+	--candidates data/opt_buy_candidates.csv \
+	--ticks data/opt_buy_ticks.csv \
+	--csv logs/opt_buy_930_trades.csv \
+	--txt logs/opt_buy_930_trades.txt
+
 # Live trading
 python3 run_strategy.py --script SENSEX --strategy hd --mode live
 
 # Smoke test (fetch data, print indicators)
 python3 run_strategy.py --script NIFTY --strategy hd --mode smoke
 ```
+
+The 9:30 OPT-Buy backtest uses a dedicated tick path because selection occurs
+at 09:25 and entry confirmation occurs at 09:30. The candidate CSV must contain
+`symbol,side,strike,premium` and may include `tradable`. The tick CSV must
+contain `timestamp,side,price`, with ISO timestamps in IST. Defaults are a
+10-second sustained premium above 180, 130 units, a 20-point stop loss, and a
+40-point target. Use `--quantity` and `--sustain-seconds` for overrides.
+
+For a one-week OpenAlgo historical run using 1-minute closes as the available
+historical approximation of ticks:
+
+```bash
+python3 -m scripts.run_opt_buy_930_openalgo_backtest \
+	--start 2026-08-17 \
+	--end 2026-08-21 \
+	--csv logs/opt_buy_930_week.csv \
+	--txt logs/opt_buy_930_week.txt
+```
+
+This requires a valid OpenAlgo/Fyers session in `.env`. The historical API
+does not provide true tick replay in this repository, so the output must not
+be treated as equivalent to a tick-accurate backtest.
 
 ### Multi-Strategy (Independent Execution)
 
