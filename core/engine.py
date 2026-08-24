@@ -208,6 +208,11 @@ class BaseStrategyEngine:
     def _side_state(self, side: str) -> BaseSideState:
         return self.state.ce if side == "CE" else self.state.pe
 
+    def _pnl_entry_price(self, pos: Position) -> float:
+        if self._is_ema21_strategy():
+            return pos.option_entry_trigger
+        return pos.entry_price
+
     def _get_unrealized_pnl(self) -> float:
         pnl = 0.0
         for side_state in (self.state.ce, self.state.pe):
@@ -215,7 +220,7 @@ class BaseStrategyEngine:
             if pos is None:
                 continue
             option_ltp = self.broker.get_ltp(pos.option_symbol)
-            pnl += (option_ltp - pos.entry_price) * pos.quantity
+            pnl += (option_ltp - self._pnl_entry_price(pos)) * pos.quantity
         return pnl
 
     def _exit_position(
@@ -238,7 +243,8 @@ class BaseStrategyEngine:
         exit_ltp = self.broker.get_ltp(pos.option_symbol)
         self.broker.place_market_order(pos.option_symbol, OrderSide.SELL, qty)
 
-        trade_pnl = (exit_ltp - pos.entry_price) * qty
+        pnl_entry_price = self._pnl_entry_price(pos)
+        trade_pnl = (exit_ltp - pnl_entry_price) * qty
         self.realized_pnl += trade_pnl
 
         pos.quantity -= qty
@@ -246,7 +252,8 @@ class BaseStrategyEngine:
             ts,
             "EXIT",
             f"{reason}: exited qty={qty} at {exit_ltp:.2f}, "
-            f"trade_pnl={trade_pnl:.2f}, remaining={pos.quantity}",
+            f"pnl_entry={pnl_entry_price:.2f}, trade_pnl={trade_pnl:.2f}, "
+            f"remaining={pos.quantity}",
         )
         if row is not None:
             print(self._fmt_candle_context(row, pos.option_symbol, self._is_ema21_strategy()))
@@ -724,9 +731,6 @@ class BaseStrategyEngine:
         if pos is None:
             return
 
-        if self._is_ema21_strategy():
-            return
-
         option_low = float(row["low"])
 
         if option_low <= pos.option_stop_level:
@@ -738,6 +742,9 @@ class BaseStrategyEngine:
                 is_hard_sl=True,
                 row=row,
             )
+            return
+
+        if self._is_ema21_strategy():
             return
 
         self.manage_targets(side_state, row)

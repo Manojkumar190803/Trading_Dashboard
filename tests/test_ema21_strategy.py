@@ -1,6 +1,7 @@
 from datetime import datetime, timedelta
 
 import pandas as pd
+import pytest
 
 from core.models import Position, Signal
 from core.broker import ConsoleBroker, HistoricalReplayBroker
@@ -40,6 +41,7 @@ def test_provider_captures_setup_and_first_red_confirmation():
 
     assert state.confirmation_count == 1
     assert state.first_red_high == 106.0
+    assert state.first_red_low == 100.0
     assert provider.generate_signal("CE", state, first_confirmation, setup) == Signal.BUY_CE
 
 
@@ -55,8 +57,8 @@ def test_provider_emits_signal_on_first_red_confirmation():
 
     assert state.entry_ready is True
     assert provider.generate_signal("CE", state, first_red, setup) == Signal.BUY_CE
-    assert provider.compute_risk_points(state, first_red) == 13.0
-    assert provider.compute_stop_level(state, first_red) == 94.0
+    assert provider.compute_risk_points(state, first_red) == 7.0
+    assert provider.compute_stop_level(state, first_red) == 100.0
 
 
 def test_provider_cancels_setup_when_confirmation_closes_on_ema():
@@ -101,7 +103,7 @@ def test_engine_enters_ema21_at_alert_with_market_order():
     assert position is not None
     assert position.entry_price == 107.0
     assert position.option_entry_trigger == 106.0
-    assert position.option_stop_level == 94.0
+    assert position.option_stop_level == 100.0
     assert position.quantity == 130
     assert position.initial_quantity == 130
     assert engine.state.ce.pending_entry is None
@@ -125,6 +127,7 @@ def test_engine_does_not_create_order_when_entry_stop_gap_exceeds_25_points():
     state = engine.state.ce
     state.setup_candle_low = 95.0
     state.first_red_high = 130.0
+    state.first_red_low = 100.0
     row = _row(2, open_=125, high=130, low=120, close=126, ema=121)
 
     engine.place_pending_entry("CE", state, row["datetime"], row)
@@ -159,6 +162,98 @@ def test_engine_ema21_tick_management_moves_stop_without_profit_exit():
     assert engine.state.ce.position is not None
     assert engine.state.ce.position.option_stop_level == 133.0
     assert engine.state.ce.position.quantity == 65
+
+
+def test_engine_ema21_exit_pnl_uses_entry_trigger_price():
+    provider = EMA21SignalProvider()
+    engine = BaseStrategyEngine(
+        StrategyConfig(),
+        RiskConfig(),
+        ConsoleBroker(ltp_fallback=127.10),
+        provider,
+    )
+    engine.state.ce.position = Position(
+        option_symbol="NIFTY12AUG2625000CE",
+        option_type="CE",
+        quantity=130,
+        initial_quantity=130,
+        entry_price=57.10,
+        entry_time=datetime(2026, 8, 10, 10, 0),
+        option_stop_level=50.0,
+        option_entry_trigger=57.90,
+        option_risk_points=7.90,
+    )
+
+    engine._exit_position(
+        engine.state.ce,
+        datetime(2026, 8, 10, 13, 24),
+        130,
+        "EMA-21 close exit",
+    )
+
+    assert engine.realized_pnl == pytest.approx(8996.0)
+    assert engine.state.ce.position is None
+    assert "pnl_entry=57.90" in engine.alerts[-1].message
+
+
+def test_engine_ema21_candle_low_breach_exits_position():
+    provider = EMA21SignalProvider()
+    engine = BaseStrategyEngine(
+        StrategyConfig(),
+        RiskConfig(),
+        ConsoleBroker(ltp_fallback=128.50),
+        provider,
+    )
+    engine.state.ce.position = Position(
+        option_symbol="NIFTY25AUG2624300PE",
+        option_type="PE",
+        quantity=130,
+        initial_quantity=130,
+        entry_price=129.20,
+        entry_time=datetime(2026, 8, 24, 13, 36),
+        option_stop_level=128.55,
+        option_entry_trigger=138.80,
+        option_risk_points=10.25,
+    )
+
+    engine.monitor_open_position(
+        engine.state.ce,
+        _row(3, open_=129.00, high=129.10, low=128.50, close=128.60, ema=130.00),
+    )
+
+    assert engine.state.ce.position is None
+    assert engine.state.sl_hits_today == 1
+    assert "option low 128.50 <= SL 128.55" in engine.alerts[-1].message
+
+
+def test_engine_ema21_does_not_book_partial_profit_at_two_rr():
+    provider = EMA21SignalProvider()
+    engine = BaseStrategyEngine(
+        StrategyConfig(),
+        RiskConfig(),
+        ConsoleBroker(ltp_fallback=160.0),
+        provider,
+    )
+    engine.state.ce.position = Position(
+        option_symbol="NIFTY25AUG2624300PE",
+        option_type="PE",
+        quantity=130,
+        initial_quantity=130,
+        entry_price=57.10,
+        entry_time=datetime(2026, 8, 24, 10, 0),
+        option_stop_level=50.0,
+        option_entry_trigger=57.90,
+        option_risk_points=10.25,
+    )
+
+    engine.monitor_open_position(
+        engine.state.ce,
+        _row(4, open_=150.0, high=160.0, low=149.0, close=159.0, ema=140.0),
+    )
+
+    assert engine.state.ce.position is not None
+    assert engine.state.ce.position.quantity == 130
+    assert not any("RR hit" in alert.message for alert in engine.alerts)
 
 
 def test_replay_stop_limit_fill_uses_trigger_not_candle_close():
@@ -202,7 +297,7 @@ def test_ema21_market_entry_does_not_repeat_signal():
     setup = _row(1, open_=99, high=103, low=95, close=101, ema=100)
     confirmations = [
         _row(2, open_=105, high=106, low=100, close=102, ema=101),
-        _row(3, open_=101, high=104, low=100, close=103, ema=102),
+        _row(3, open_=101, high=104, low=101, close=103, ema=102),
         _row(4, open_=102, high=105, low=101, close=104, ema=103),
     ]
     engine.process_option_candle("CE", setup, previous)

@@ -17,6 +17,7 @@ class EMA21SideState(BaseSideState):
     setup_candle_time: Optional[datetime] = None
     confirmation_count: int = 0
     first_red_high: Optional[float] = None
+    first_red_low: Optional[float] = None
     first_red_time: Optional[datetime] = None
     entry_ready: bool = False
     ema_failure: bool = False
@@ -49,6 +50,7 @@ class EMA21SignalProvider(SignalProvider):
             side_state.confirmation_count += 1
             if side_state.first_red_high is None and float(row["close"]) < float(row["open"]):
                 side_state.first_red_high = float(row["high"])
+                side_state.first_red_low = float(row["low"])
                 side_state.first_red_time = row.get("datetime")
                 side_state.entry_ready = True
 
@@ -68,6 +70,7 @@ class EMA21SignalProvider(SignalProvider):
             side_state.setup_candle_time = row.get("datetime")
             side_state.confirmation_count = 0
             side_state.first_red_high = None
+            side_state.first_red_low = None
             side_state.first_red_time = None
             side_state.entry_ready = False
 
@@ -85,10 +88,10 @@ class EMA21SignalProvider(SignalProvider):
 
     def compute_risk_points(self, side_state: BaseSideState, row: pd.Series) -> Optional[float]:
         assert isinstance(side_state, EMA21SideState)
-        if side_state.setup_candle_low is None or side_state.first_red_high is None:
+        if side_state.first_red_low is None or side_state.first_red_high is None:
             return None
         trigger = side_state.first_red_high + 1.0
-        stop = side_state.setup_candle_low - 1.0
+        stop = side_state.first_red_low
         return trigger - stop
 
     def compute_entry_lots(self, row: pd.Series, cfg: StrategyConfig) -> int:
@@ -96,9 +99,9 @@ class EMA21SignalProvider(SignalProvider):
 
     def compute_stop_level(self, side_state: BaseSideState, row: pd.Series) -> float:
         assert isinstance(side_state, EMA21SideState)
-        if side_state.setup_candle_low is None:
-            raise ValueError("EMA21 setup candle is not available")
-        return side_state.setup_candle_low - 1.0
+        if side_state.first_red_low is None:
+            raise ValueError("EMA21 entry candle is not available")
+        return side_state.first_red_low
 
     def reset_after_entry(self, side_state: BaseSideState) -> None:
         assert isinstance(side_state, EMA21SideState)
@@ -111,6 +114,7 @@ class EMA21SignalProvider(SignalProvider):
         side_state.setup_candle_time = None
         side_state.confirmation_count = 0
         side_state.first_red_high = None
+        side_state.first_red_low = None
         side_state.first_red_time = None
         side_state.entry_ready = False
 

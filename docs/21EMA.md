@@ -26,8 +26,8 @@ The strategy calculates a separate 21-period Exponential Moving Average (EMA)
 from the close of each completed 3-minute ATM CE and ATM PE option candle. A
 buy setup begins independently for each option when its price crosses from
 below the EMA and a candle closes above it. That first candle is the setup
-candle. Its low, less a 1-point protective buffer, defines the initial
-stop-loss.
+candle. After the first red confirmation candle triggers entry, the low of that
+entry candle defines the initial stop-loss with no additional buffer.
 
 The next three completed candles are confirmation candles. Every one must close
 above the 21 EMA, and at least one must be red (`close < open`). The pending
@@ -61,10 +61,12 @@ ticks.
    candle. If more than one red candle forms, later red candles do not replace
    the first valid reference.
 7. A candle that closes exactly on the EMA fails the above-EMA requirement.
-8. The initial stop is setup-candle low minus 1 point. The first red candle high
-is an alert reference only; no entry buffer is applied.
+8. The initial stop is the low of the first red confirmation candle that triggers
+   entry. The first red candle high is an alert reference only; no entry buffer
+   is applied.
 9. EMA21 entry and exit orders use market orders without entry or exit buffers.
-The observed market entry price is used for P&L and risk calculations.
+The entry-trigger price is used as the P&L basis. The observed market fill price
+is retained for execution records and risk calculations.
 10. The strategy shall use both ATM CE and ATM PE contracts for the current
    weekly expiry. If the trading day is the expiry day, it shall use the next
    available weekly expiry. The selected expiry shall be locked and recorded
@@ -84,7 +86,7 @@ The observed market entry price is used for P&L and risk calculations.
 | `entry_cutoff` | 14:45 IST | No new entry may be accepted at or after this time |
 | `force_square_off` | 15:10 IST | Mandatory exit time for every open position |
 | `entry_buffer_points` | 0.0 | No EMA21 entry buffer; retained for legacy strategies |
-| `stop_buffer_points` | 1.0 | Subtracted below the setup candle low for buys |
+| `stop_buffer_points` | 0.0 | EMA21 uses the entry-trigger candle low directly; legacy strategies may configure a buffer |
 | `entry_limit_buffer_points` | 0.5 | Retained for legacy stop-limit strategies |
 | `max_initial_risk_points` | 25.0 | Discard setup when initial risk is greater than this value |
 | `breakeven_rr` | 1.0 | Move stop to cost at 1R |
@@ -112,14 +114,14 @@ The observed market entry price is used for P&L and risk calculations.
 |---|---|---|
 | FR-06 | A buy setup shall begin only when the previous candle close is at or below the previous EMA-21 and the current candle close is strictly above the current EMA-21. | Must |
 | FR-07 | The current candle shall be recorded as the setup candle, including open, high, low, close, EMA-21, and timestamp. | Must |
-| FR-08 | The initial stop level shall be `setup_candle_low - 1.0`. | Must |
+| FR-08 | The initial stop level shall be the low of the first red confirmation candle that triggers entry. No additional stop buffer shall be applied. | Must |
 | FR-09 | The system shall evaluate only the next three completed candles after the setup candle as the confirmation window. | Must |
 | FR-10 | Each confirmation candle shall close strictly above its EMA-21. A close at or below EMA-21 shall cancel the setup immediately. | Must |
 | FR-11 | At least one confirmation candle shall be red (`close < open`). | Must |
 | FR-12 | The first red confirmation candle shall define the alert reference as `red_candle_high`, without a buffer. The system shall enter at market immediately after that candle closes; the red candle may be any of the next three confirmations. | Must |
 | FR-13 | The setup shall be cancelled if no red candle occurs in the three-candle window. | Must |
 | FR-14 | The system shall enter immediately after the first valid red confirmation; there is no pending EMA21 entry to wait for or expire. | Must |
-| FR-15 | The system shall discard the setup when `entry_trigger - initial_stop > 25.0` option-premium points. | Must |
+| FR-15 | The system shall discard the setup when `entry_trigger - initial_stop > 25.0` option-premium points, where `initial_stop` is the low of the entry-trigger candle. | Must |
 | FR-16 | A setup shall be cancelled when its entry window reaches 14:45 IST without a valid market-entry alert. | Must |
 
 ### 5.3 Entry Execution
@@ -129,7 +131,7 @@ The observed market entry price is used for P&L and risk calculations.
 | FR-17 | The system shall scan for new 21 EMA setups and accept new entries only from 09:20:00 IST through 14:44:59 IST. | Must |
 | FR-18 | The system shall submit a BUY market order for the relevant ATM CE or ATM PE option immediately when the EMA21 alert is generated, using `lots * 65` quantity by default. | Must |
 | FR-19 | EMA21 entry and exit orders shall use market orders without entry or exit price buffers. | Must |
-| FR-20 | The system shall use the broker-confirmed average option-premium fill price as the actual entry price for all risk and reward calculations. | Must |
+| FR-20 | The system shall record the broker-confirmed average option-premium fill price as the actual execution price. EMA21 realized and unrealized P&L shall use the entry-trigger price as the P&L basis. | Must |
 | FR-21 | The system shall calculate `R = actual_entry_price - initial_stop`. A non-positive R shall invalidate the trade and trigger protective cleanup. | Must |
 | FR-22 | The system shall reserve and increment the daily trade count only for a broker-confirmed filled entry. | Must |
 | FR-23 | The system shall permit no more than three filled entries per trading day, including entries that later exit during the same day. | Must |
@@ -140,7 +142,7 @@ The observed market entry price is used for P&L and risk calculations.
 
 | ID | Requirement | Priority |
 |---|---|---|
-| FR-26 | Immediately after entry confirmation, the system shall place or maintain the initial stop at the already-calculated tick-rounded `initial_stop` (`setup_candle_low - 1.0`). The 1-point stop buffer shall be applied exactly once. | Must |
+| FR-26 | Immediately after entry confirmation, the system shall place or maintain the already-calculated tick-rounded `initial_stop`, equal to the low of the entry-trigger candle. No stop buffer shall be applied. | Must |
 | FR-27 | At 1R, where a live option-premium tick reaches `entry + R`, the system shall move the stop to the actual entry price, creating a loss-free trade before fees and slippage. | Must |
 | FR-28 | At every additional 0.5R milestone based on live option-premium ticks, the system shall advance the stop by 0.5R. For example, at 1.5R the stop is `entry + 0.5R`; at 2R it is `entry + 1R`; at 2.5R it is `entry + 1.5R`. | Must |
 | FR-29 | The stop shall never move backward. Repeated observations of the same milestone shall be idempotent. | Must |
@@ -156,7 +158,7 @@ The observed market entry price is used for P&L and risk calculations.
 | FR-34 | The 15:10 IST exit shall apply regardless of profit, loss, EMA position, or trailing-stop state. | Must |
 | FR-35 | The system shall not submit a new entry at or after 14:45 IST, including an entry trigger observed after the cutoff. | Must |
 | FR-36 | The system shall persist the final option-premium exit price, exit timestamp, exit reason, realized P&L, order IDs, and cleanup result. | Must |
-| FR-37 | The system shall record the broker-observed market entry price and use it for position and P&L calculations. | Must |
+| FR-37 | The system shall record the broker-observed market entry price for execution audit. EMA21 P&L calculations shall use the entry-trigger price, not the observed market fill price. | Must |
 | FR-38 | If a market entry or exit order fails, the system shall record the failure and reconcile broker state before retrying. | Must |
 | FR-39 | If actual fill risk, calculated as `actual_entry_price - initial_stop`, is greater than 25 option-premium points, the system shall exit the filled quantity immediately and record the risk breach. | Must |
 | FR-40 | The system shall lock new trading for the day after three filled trades exit at their initial or active stop-loss, regardless of the remaining filled-entry allowance. | Must |
@@ -248,9 +250,9 @@ The system shall record:
 2. The ATM strike, expiry, order type, and tick-size metadata remain
    configuration or broker inputs. They must not be silently changed after the
    CE and PE contracts are locked for the session.
-3. “1 point” is an option-premium price-point buffer, not a percentage or tick count. The
-   implementation shall round the resulting trigger and stop to the execution
-   instrument's valid tick size before validating risk or submitting orders.
+3. The entry trigger and stop shall be rounded to the execution instrument's
+   valid tick size before validating risk or submitting orders. No 1-point stop
+   buffer is applied to the EMA21 entry candle low.
 4. The requested 65 quantity per lot is the current Nifty lot-size assumption;
    broker metadata and configured fallback values must be reconciled before
    live orders.
