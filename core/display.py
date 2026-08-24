@@ -33,8 +33,9 @@ def format_status_table(instrument: str, engines_status: dict[str, Any]) -> str:
         status = engines_status[strategy_name]
         
         try:
-            ce_status = _format_side_status_detailed(status.get("ce", {}))
-            pe_status = _format_side_status_detailed(status.get("pe", {}))
+            ema21_only = strategy_name.lower() == "ema21"
+            ce_status = _format_side_status_detailed(status.get("ce", {}), ema21_only)
+            pe_status = _format_side_status_detailed(status.get("pe", {}), ema21_only)
         except Exception as e:
             ce_status = f"ERROR: {str(e)[:40]}"
             pe_status = f"ERROR: {str(e)[:40]}"
@@ -59,14 +60,24 @@ def print_status_table(instrument: str, engines_status: dict[str, Any]) -> None:
         sys.stdout.flush()
 
 
-def _format_side_status_detailed(side_data: dict[str, Any]) -> str:
+def _format_side_status_detailed(side_data: dict[str, Any], ema21_only: bool = False) -> str:
     """Format detailed status for a single side (CE/PE) with indicators.
     
     Shows RSI, EMA13/20/50, VWAP, and position status.
     Format: "RSI=45.5 E13=100.5 E20=99.5 E50=98.5 VWAP=99.0 | FLAT ▲"
     """
     if not side_data:
+        if ema21_only:
+            return "EMA21=-- | FLAT ▲"
         return "RSI=-- E13=-- E20=-- E50=-- VWAP=-- | FLAT ▲"
+
+    if ema21_only:
+        ema21 = side_data.get("ema21")
+        ema21_str = f"{ema21:.1f}" if ema21 is not None else "--"
+        position = side_data.get("position")
+        pending = side_data.get("pending_entry")
+        status = "TRADE @" + f"{position.get('entry_price', 0):.1f}" if position else "PENDING ⊙" if pending else "FLAT ▲"
+        return f"EMA21={ema21_str} | {status}"
     
     # Extract indicator values
     rsi = side_data.get("rsi")

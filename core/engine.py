@@ -80,6 +80,13 @@ class BaseStrategyEngine:
     def _trace_enabled(self) -> bool:
         return self.verbose or self.capture_trace
 
+    def _is_ema21_strategy(self) -> bool:
+        return getattr(self.signal_provider, "strategy_key", None) == "ema21"
+
+    def _round_option_price(self, price: float) -> float:
+        tick_size = max(float(getattr(self.cfg, "option_tick_size", 0.05)), 0.0001)
+        return round(round(float(price) / tick_size) * tick_size, 10)
+
     def _fmt_signal(self, signal: Signal) -> str:
         return signal.value if isinstance(signal, Signal) else str(signal)
 
@@ -170,7 +177,17 @@ class BaseStrategyEngine:
         print(f"[ENGINE][{category}] {message}")
 
     @staticmethod
-    def _fmt_candle_context(row: pd.Series, symbol: str) -> str:
+    def _fmt_candle_context(row: pd.Series, symbol: str, ema21_only: bool = False) -> str:
+        if ema21_only:
+            ema21 = row.get("ema21")
+            ema21_text = "NA" if ema21 is None or pd.isna(ema21) else f"{ema21:.2f}"
+            ts = row.get("datetime")
+            ts_str = ts.strftime("%Y-%m-%d %H:%M") if ts is not None else "?"
+            return (
+                f"  >> [{ts_str}] {symbol} O={row['open']:.2f} H={row['high']:.2f} "
+                f"L={row['low']:.2f} C={row['close']:.2f} | EMA21={ema21_text}"
+            )
+
         rsi = row.get("rsi3")
         ema13 = row.get("ema13")
         ema20 = row.get("ema20")
@@ -232,7 +249,7 @@ class BaseStrategyEngine:
             f"trade_pnl={trade_pnl:.2f}, remaining={pos.quantity}",
         )
         if row is not None:
-            print(self._fmt_candle_context(row, pos.option_symbol))
+            print(self._fmt_candle_context(row, pos.option_symbol, self._is_ema21_strategy()))
 
         if pos.quantity <= 0:
             side_state.position = None
@@ -381,6 +398,20 @@ class BaseStrategyEngine:
         if side_state.position is not None or side_state.pending_entry is not None:
             return
 
+        if self._is_ema21_strategy():
+            if ts.time() < self.cfg.entry_start or ts.time() >= self.cfg.entry_cutoff:
+                return
+            if any(
+                other.position is not None or other.pending_entry is not None
+                for other in (self.state.ce, self.state.pe)
+                if other is not side_state
+            ):
+                self._record_alert(ts, "RISK", f"{side} trade skipped: another side is active")
+                return
+            if self.total_entries >= self.cfg.max_trades_per_day:
+                self._record_alert(ts, "RISK", "Trade skipped: daily filled-entry cap reached")
+                return
+
         if self.state.sl_hits_today >= self.risk.max_sl_per_day:
             self._record_alert(
                 ts, "RISK",
@@ -399,31 +430,50 @@ class BaseStrategyEngine:
             )
             return
 
-        if risk_points > self.cfg.max_option_risk_points:
+        if not self._is_ema21_strategy() and risk_points > self.cfg.max_option_risk_points:
             self._record_alert(
                 ts, "RISK",
                 f"{side} trade cancelled: risk {risk_points:.2f} > {self.cfg.max_option_risk_points:.2f}",
             )
             return
 
-        # VWAP room filter: entry below VWAP must have at least 1.5 RR of headroom.
-        entry_level = float(row["high"] + 1.0)
-        vwap = float(row["vwap"]) if not pd.isna(row["vwap"]) else None
-        if vwap is not None and entry_level < vwap:
-            room = vwap - entry_level
-            required = self.cfg.min_vwap_room_rr * risk_points
-            if room < required:
+        if self._is_ema21_strategy():
+            entry_level = float(getattr(side_state, "first_red_high") + self.cfg.entry_buffer_points)
+        else:
+            entry_level = float(row["high"] + 1.0)
+        stop_level = self.signal_provider.compute_stop_level(side_state, row)
+        if self._is_ema21_strategy():
+            entry_level = self._round_option_price(entry_level)
+            stop_level = self._round_option_price(stop_level)
+            risk_points = entry_level - stop_level
+            if risk_points > self.cfg.max_option_risk_points:
                 self._record_alert(
                     ts, "RISK",
-                    f"{side} trade cancelled: VWAP room {room:.2f} < {self.cfg.min_vwap_room_rr} RR ({required:.2f})",
+                    f"{side} trade cancelled before order: entry-SL gap {risk_points:.2f} "
+                    f"> {self.cfg.max_option_risk_points:.2f} points",
                 )
                 return
+
+        # Legacy strategies retain the existing VWAP room filter.
+        if not self._is_ema21_strategy():
+            # VWAP room filter: entry below VWAP must have at least 1.5 RR of headroom.
+            vwap = float(row["vwap"]) if not pd.isna(row["vwap"]) else None
+            if vwap is not None and entry_level < vwap:
+                room = vwap - entry_level
+                required = self.cfg.min_vwap_room_rr * risk_points
+                if room < required:
+                    self._record_alert(
+                        ts, "RISK",
+                        f"{side} trade cancelled: VWAP room {room:.2f} < {self.cfg.min_vwap_room_rr} RR ({required:.2f})",
+                    )
+                    return
+        else:
+            vwap = None
 
         lots = self.signal_provider.compute_entry_lots(row, self.cfg)
         quantity = lots * self.cfg.option_lot_size
 
-        trigger_level = float(row["high"] + 1.0)
-        stop_level = self.signal_provider.compute_stop_level(side_state, row)
+        trigger_level = entry_level
 
         side_state.pending_entry = PendingEntry(
             signal=Signal.BUY_CE if side == "CE" else Signal.BUY_PE,
@@ -442,7 +492,7 @@ class BaseStrategyEngine:
             f"trigger={trigger_level:.2f} SL={stop_level:.2f} lots={lots} "
             f"option_risk={risk_points:.2f}",
         )
-        print(self._fmt_candle_context(row, side_state.option_symbol))
+        print(self._fmt_candle_context(row, side_state.option_symbol, self._is_ema21_strategy()))
 
     def try_fill_pending_entry(
         self,
@@ -482,11 +532,30 @@ class BaseStrategyEngine:
             return
 
         option_symbol = pending.option_symbol
-        option_ltp = self.broker.get_ltp(option_symbol)
         risk_points = abs(pending.option_trigger_level - pending.option_stop_level)
 
         # FRD §5.1: entry via STOP_LIMIT (trigger + 0.5 limit buffer).
-        limit_price = pending.option_trigger_level + 0.5
+        limit_price = pending.option_trigger_level + self.cfg.entry_limit_buffer_points
+        simulated_fill = self.broker.simulate_stop_limit_fill(
+            option_symbol,
+            pending.option_trigger_level,
+            limit_price,
+        )
+        if simulated_fill is not None:
+            option_ltp = simulated_fill
+        else:
+            option_ltp = self.broker.get_ltp(option_symbol)
+            if self.broker.is_replay:
+                self._record_alert(
+                    ts,
+                    "CANCEL",
+                    f"{side} pending cancelled: stop-limit trigger exceeded limit or no replay fill",
+                )
+                side_state.pending_entry = None
+                if self._is_ema21_strategy():
+                    self.signal_provider.reset_after_entry(side_state)
+                return
+
         self.broker.place_stop_limit_order(
             option_symbol, OrderSide.BUY, pending.quantity,
             trigger_price=pending.option_trigger_level,
@@ -514,7 +583,7 @@ class BaseStrategyEngine:
             f"trigger={pending.option_trigger_level:.2f}, "
             f"SL={pending.option_stop_level:.2f}, option_risk={risk_points:.2f}",
         )
-        print(self._fmt_candle_context(row, option_symbol))
+        print(self._fmt_candle_context(row, option_symbol, self._is_ema21_strategy()))
 
     # ── position monitoring ────────────────────────────────────────
 
@@ -630,6 +699,9 @@ class BaseStrategyEngine:
         if pos is None:
             return
 
+        if self._is_ema21_strategy():
+            return
+
         option_low = float(row["low"])
 
         if option_low <= pos.option_stop_level:
@@ -676,6 +748,32 @@ class BaseStrategyEngine:
         self.last_processed_candle_time = ts
         ir = pos.option_risk_points
         if ir <= 0:
+            return
+
+        if self._is_ema21_strategy():
+            if ltp <= pos.option_stop_level:
+                self._exit_position(
+                    side_state,
+                    ts,
+                    pos.quantity,
+                    f"Stop hit (tick): LTP {ltp:.2f} <= SL {pos.option_stop_level:.2f}",
+                    is_hard_sl=True,
+                )
+                return
+
+            rr = (ltp - pos.entry_price) / ir
+            if rr >= 1.0:
+                pos.breakeven_armed = True
+                current_step = int(rr / 0.5) * 0.5
+                if current_step > pos.highest_rr_step:
+                    pos.highest_rr_step = current_step
+                    pos.trailing_sl_level = pos.entry_price + (current_step - 1.0) * ir
+                    pos.option_stop_level = pos.trailing_sl_level
+                    self._record_alert(
+                        ts,
+                        "TSL",
+                        f"{pos.option_type} {current_step:.1f} RR (tick) — SL={pos.option_stop_level:.2f}",
+                    )
             return
 
         # Hard SL check.
@@ -760,6 +858,8 @@ class BaseStrategyEngine:
 
         # Update indicator cache for status display.
         side_state.last_close = float(row["close"])
+        ema21_val = row.get("ema21")
+        side_state.last_ema21 = None if (ema21_val is None or pd.isna(ema21_val)) else float(ema21_val)
         rsi_val = row.get("rsi3")
         side_state.last_rsi = None if (rsi_val is None or pd.isna(rsi_val)) else float(rsi_val)
         for attr, col in (("last_ema13", "ema13"), ("last_ema20", "ema20"), ("last_ema50", "ema50")):
@@ -796,6 +896,38 @@ class BaseStrategyEngine:
 
         # Delegate signal generation to the strategy provider.
         self.signal_provider.update_state(side_state, row, prev_row)
+        if self._is_ema21_strategy() and getattr(side_state, "ema_failure", False):
+            if side_state.pending_entry is not None:
+                side_state.pending_entry = None
+                self._record_alert(ts, "CANCEL", f"{side} pending entry cancelled: confirmation EMA failure")
+            if side_state.position is not None:
+                self._exit_position(
+                    side_state,
+                    ts,
+                    side_state.position.quantity,
+                    "Confirmation EMA failure",
+                    is_hard_sl=False,
+                    row=row,
+                )
+            remark = "EMA_FAILURE_CLEANUP"
+            self._record_trace_row(side, side_state, row, signal, False, remark)
+            return
+        if (
+            self._is_ema21_strategy()
+            and side_state.position is not None
+            and float(row["close"]) < float(row["ema21"])
+        ):
+            self._exit_position(
+                side_state,
+                ts,
+                side_state.position.quantity,
+                "EMA-21 close exit",
+                is_hard_sl=False,
+                row=row,
+            )
+            remark = "EMA_CLOSE_EXIT"
+            self._record_trace_row(side, side_state, row, signal, False, remark)
+            return
         signal = self.signal_provider.generate_signal(side, side_state, row, prev_row)
 
         if signal in (Signal.BUY_CE, Signal.BUY_PE):
@@ -841,16 +973,25 @@ class BaseStrategyEngine:
         row: pd.Series,
         prev_row: Optional[pd.Series],
     ) -> None:
-        rsi = row.get("rsi3")
-        ema13, ema20, ema50 = row.get("ema13"), row.get("ema20"), row.get("ema50")
-        base = (
-            f"[DIAG] {ts.time()} {side} "
-            f"O={row['open']:.2f} H={row['high']:.2f} L={row['low']:.2f} C={row['close']:.2f} "
-            f"rsi={'NA' if pd.isna(rsi) else f'{rsi:.1f}'} "
-            f"e13={'NA' if pd.isna(ema13) else f'{ema13:.2f}'} "
-            f"e20={'NA' if pd.isna(ema20) else f'{ema20:.2f}'} "
-            f"e50={'NA' if pd.isna(ema50) else f'{ema50:.2f}'}"
-        )
+        if self._is_ema21_strategy():
+            ema21 = row.get("ema21")
+            ema21_text = "NA" if ema21 is None or pd.isna(ema21) else f"{ema21:.2f}"
+            base = (
+                f"[DIAG] {ts.time()} {side} "
+                f"O={row['open']:.2f} H={row['high']:.2f} L={row['low']:.2f} C={row['close']:.2f} "
+                f"EMA21={ema21_text}"
+            )
+        else:
+            rsi = row.get("rsi3")
+            ema13, ema20, ema50 = row.get("ema13"), row.get("ema20"), row.get("ema50")
+            base = (
+                f"[DIAG] {ts.time()} {side} "
+                f"O={row['open']:.2f} H={row['high']:.2f} L={row['low']:.2f} C={row['close']:.2f} "
+                f"rsi={'NA' if pd.isna(rsi) else f'{rsi:.1f}'} "
+                f"e13={'NA' if pd.isna(ema13) else f'{ema13:.2f}'} "
+                f"e20={'NA' if pd.isna(ema20) else f'{ema20:.2f}'} "
+                f"e50={'NA' if pd.isna(ema50) else f'{ema50:.2f}'}"
+            )
 
         # Check generic gates first.
         if self.state.sl_hits_today >= self.risk.max_sl_per_day:
@@ -880,12 +1021,32 @@ class BaseStrategyEngine:
     ) -> None:
         from core.indicators import is_hammer_candle, is_strong_green_candle
 
+        ema21_only = self._is_ema21_strategy()
         if not self._verbose_header_printed:
-            print(f"  {'TIME':<5s} │ {'SYMBOL':<22s} │ {'OHLC':<42s} │ {'PATTERN / RSI / TREND'}")
+            indicator_header = "EMA21" if ema21_only else "PATTERN / RSI / TREND"
+            print(f"  {'TIME':<5s} │ {'SYMBOL':<22s} │ {'OHLC':<42s} │ {indicator_header}")
             print("  ─────┼" + "─" * 24 + "┼" + "─" * 44 + "┼" + "─" * 30)
             self._verbose_header_printed = True
 
         o, h, l, c = row["open"], row["high"], row["low"], row["close"]
+        if ema21_only:
+            ema21 = row.get("ema21")
+            ema21_str = f"{ema21:.2f}" if ema21 is not None and not pd.isna(ema21) else "--"
+            symbol = side_state.option_symbol or side
+            print(
+                f"  {ts.strftime('%H:%M')} │ {symbol:<22s} │ "
+                f"O={o:<7.1f} H={h:<7.1f} L={l:<7.1f} C={c:<7.1f} │ EMA21={ema21_str}"
+            )
+            if side_state.position is not None:
+                pos = side_state.position
+                rr = self.compute_rr_progress(pos, row)
+                print(f"       │ {'':22s} │ {'':42s} │ IN TRADE entry={pos.entry_price:.1f} SL={pos.option_stop_level:.1f} qty={pos.quantity} RR={rr:.1f}")
+            elif side_state.pending_entry is not None:
+                pend = side_state.pending_entry
+                print(f"       │ {'':22s} │ {'':42s} │ PENDING trigger={pend.option_trigger_level:.1f} SL={pend.option_stop_level:.1f}")
+            print("  ─────┼" + "─" * 24 + "┼" + "─" * 44 + "┼" + "─" * 30)
+            return
+
         rsi = row.get("rsi3")
         ema13, ema20, ema50 = row.get("ema13"), row.get("ema20"), row.get("ema50")
         vwap = row.get("vwap")

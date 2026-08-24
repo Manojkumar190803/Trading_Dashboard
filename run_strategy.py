@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import threading
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
@@ -41,13 +42,23 @@ def _register_tc() -> SignalProvider:
     return TCSignalProvider(TCConfig())
 
 
+def _register_ema21() -> SignalProvider:
+    from strategies.ema21 import EMA21SignalProvider
+    return EMA21SignalProvider()
+
+
 STRATEGY_REGISTRY["hd"] = _register_hd
 STRATEGY_REGISTRY["cd"] = _register_cd
 STRATEGY_REGISTRY["tc"] = _register_tc
+STRATEGY_REGISTRY["ema21"] = _register_ema21
+STRATEGY_REGISTRY["opt_buy_930"] = lambda: None
 
 
 def get_signal_provider(name: str, args: argparse.Namespace) -> SignalProvider:
     """Instantiate the named strategy, applying any strategy-specific CLI overrides."""
+    if name == "opt_buy_930":
+        raise SystemExit("opt_buy_930 is routed through its dedicated live/backtest runner")
+
     if name == "hd":
         from strategies.hd import HDConfig, HDSignalProvider
         hd_cfg = HDConfig()
@@ -68,6 +79,10 @@ def get_signal_provider(name: str, args: argparse.Namespace) -> SignalProvider:
         if args.body_threshold is not None:
             tc_cfg.strong_body_threshold = args.body_threshold
         return TCSignalProvider(tc_cfg)
+
+    if name == "ema21":
+        from strategies.ema21 import EMA21SignalProvider
+        return EMA21SignalProvider()
 
     factory = STRATEGY_REGISTRY.get(name)
     if factory is None:
@@ -166,7 +181,7 @@ def _build_broker(cfg: StrategyConfig, dry_run: bool) -> OpenAlgoBroker:
     )
 
 
-def _apply_discovered_script_profile(cfg: StrategyConfig, script: str) -> None:
+def _apply_discovered_script_profile(cfg: StrategyConfig, script: str) -> dict[str, object]:
     """Discover and apply script-specific instrument metadata via OpenAlgo."""
     probe_broker = _build_broker(cfg, dry_run=True)
     profile = probe_broker.discover_index_profile(script)
@@ -189,6 +204,7 @@ def _apply_discovered_script_profile(cfg: StrategyConfig, script: str) -> None:
         cfg.option_lot_size,
         cfg.weekly_expiry_weekday,
     )
+    return profile
 
 
 def _run_smoke(cfg: StrategyConfig) -> None:
@@ -243,6 +259,50 @@ def _run_multi_live(
         runner.stop()
 
 
+def _run_mixed_live(
+    cfg: StrategyConfig,
+    risk: RiskConfig,
+    strategy_names: list[str],
+    profile: dict[str, object],
+    args: argparse.Namespace,
+    dry_run: bool,
+) -> None:
+    """Run the dedicated tick strategy beside the candle-based strategies."""
+    from scripts.run_opt_buy_930_openalgo_backtest import run_openalgo_live
+
+    stop_event = threading.Event()
+    opt_thread = threading.Thread(
+        target=run_openalgo_live,
+        args=(profile,),
+        kwargs={"dry_run": dry_run, "stop_event": stop_event},
+        name="opt-buy-930-live",
+        daemon=True,
+    )
+    opt_thread.start()
+    candle_names = [name for name in strategy_names if name != "opt_buy_930"]
+    if not candle_names:
+        try:
+            opt_thread.join()
+        except KeyboardInterrupt:
+            stop_event.set()
+            opt_thread.join()
+        return
+
+    try:
+        _run_multi_live(
+            cfg,
+            risk,
+            candle_names,
+            args,
+            dry_run=dry_run,
+            diagnose=args.diagnose,
+            verbose=args.verbose,
+        )
+    finally:
+        stop_event.set()
+        opt_thread.join(timeout=5)
+
+
 def main(argv: Optional[list[str]] = None) -> None:
     args = _parse_args(argv)
     _setup_logging(args.log_level)
@@ -253,7 +313,7 @@ def main(argv: Optional[list[str]] = None) -> None:
     if script not in SCRIPT_CHOICES:
         allowed = ", ".join(SCRIPT_CHOICES)
         raise SystemExit(f"Invalid --script '{args.script}'. Allowed: {allowed}")
-    _apply_discovered_script_profile(cfg, script)
+    profile = _apply_discovered_script_profile(cfg, script)
 
     # Manual overrides still win over discovered defaults.
     if args.symbol:
@@ -266,18 +326,50 @@ def main(argv: Optional[list[str]] = None) -> None:
     if args.max_risk is not None:
         cfg.max_option_risk_points = args.max_risk
 
+    # Support comma-separated strategies: --strategy hd,cd
+    strategy_names = [s.strip() for s in args.strategy.split(",")]
+
+    if "ema21" in strategy_names:
+        from datetime import time
+
+        cfg.timeframe_minutes = 5
+        cfg.market_open = time(9, 20)
+        cfg.entry_start = time(9, 20)
+        cfg.signal_cutoff = time(14, 45)
+        cfg.entry_cutoff = time(14, 45)
+        cfg.market_close = time(15, 10)
+        cfg.force_square_off = time(15, 10)
+        cfg.max_option_risk_points = 25.0 if args.max_risk is None else args.max_risk
+        cfg.max_trades_per_day = 3
+
     risk = RiskConfig()
     if args.max_sl is not None:
         risk.max_sl_per_day = args.max_sl
-
-    # Support comma-separated strategies: --strategy hd,cd
-    strategy_names = [s.strip() for s in args.strategy.split(",")]
 
     if args.mode == "backtest":
         if not args.start:
             raise SystemExit("backtest mode requires --start YYYY-MM-DD")
         end_date = args.end or datetime.now().date().strftime("%Y-%m-%d")
+        if len(strategy_names) == 1 and strategy_names[0] == "opt_buy_930":
+            from scripts.run_opt_buy_930_openalgo_backtest import run_openalgo_backtest
+
+            results = run_openalgo_backtest(
+                args.start,
+                end_date,
+                output_csv=None,
+                output_txt=None,
+                profile=profile,
+            )
+            fields = ["side", "symbol", "quantity", "entry_time", "entry_price", "stop_loss", "target", "exit_time", "exit_price", "exit_reason", "gross_pnl"]
+            print("\t".join(fields))
+            for trade in results:
+                print("\t".join(str(getattr(trade, field) if field != "gross_pnl" else trade.gross_pnl) for field in fields))
+            print(f"Trades: {len(results)}")
+            print(f"Gross PnL (INR): {sum(trade.gross_pnl for trade in results):.2f}")
+            return
         if len(strategy_names) > 1:
+            if "opt_buy_930" in strategy_names:
+                raise SystemExit("opt_buy_930 cannot be combined with candle strategies in backtest mode")
             providers = [(name, get_signal_provider(name, args)) for name in strategy_names]
             run_multi_historical_replay(
                 cfg,
@@ -301,6 +393,21 @@ def main(argv: Optional[list[str]] = None) -> None:
                 verbose=args.verbose,
                 verbose_csv_path=args.verbose_csv,
             )
+        return
+
+    if len(strategy_names) == 1 and strategy_names[0] == "opt_buy_930":
+        if args.mode not in ("paper", "live"):
+            raise SystemExit("opt_buy_930 supports only paper, live, and backtest modes")
+        from scripts.run_opt_buy_930_openalgo_backtest import run_openalgo_live
+
+        run_openalgo_live(profile, dry_run=args.mode == "paper")
+        return
+
+    if "opt_buy_930" in strategy_names:
+        if args.mode not in ("paper", "live"):
+            raise SystemExit("opt_buy_930 supports only paper and live modes")
+        dry_run = args.mode == "paper"
+        _run_mixed_live(cfg, risk, strategy_names, profile, args, dry_run=dry_run)
         return
 
     if args.mode == "smoke":

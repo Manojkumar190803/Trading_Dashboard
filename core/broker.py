@@ -16,6 +16,8 @@ logger = logging.getLogger("core.broker")
 class BrokerInterface:
     """Abstract broker — subclass and implement for your broker API."""
 
+    is_replay = False
+
     def get_ltp(self, symbol: str) -> float:
         raise NotImplementedError
 
@@ -31,6 +33,15 @@ class BrokerInterface:
 
     def place_market_order(self, symbol: str, side: OrderSide, quantity: int) -> str:
         raise NotImplementedError
+
+    def simulate_stop_limit_fill(
+        self,
+        symbol: str,
+        trigger_price: float,
+        limit_price: float,
+    ) -> Optional[float]:
+        """Return a simulated fill price for replay, or None when unfilled."""
+        return None
 
     def resolve_nearest_expiry(
         self,
@@ -335,7 +346,12 @@ class OpenAlgoBroker(BrokerInterface):
             )
 
         numeric = self._extract_numeric_fields(payload)
+        discovered_root = self._extract_option_root(payload)
+        if canonical in fallback_metadata and discovered_root not in (None, canonical):
+            numeric = {}
         strike_step = self._extract_strike_step(payload)
+        if canonical in fallback_metadata and discovered_root not in (None, canonical):
+            strike_step = None
         lot_size = numeric.get("lot_size")
         if lot_size is None:
             lot_size = numeric.get("market_lot")
@@ -365,7 +381,9 @@ class OpenAlgoBroker(BrokerInterface):
                     )
 
         symbol_guess = self._extract_symbol(payload) or canonical
-        option_root = self._extract_option_root(payload) or symbol_guess or canonical
+        option_root = canonical if canonical in fallback_metadata else (
+            discovered_root or symbol_guess or canonical
+        )
         weekly_expiry_weekday = self._extract_weekly_expiry_weekday(payload)
 
         return {
@@ -763,6 +781,8 @@ class OpenAlgoBroker(BrokerInterface):
 class HistoricalReplayBroker(BrokerInterface):
     """Backtest broker driven by pre-loaded per-symbol bars."""
 
+    is_replay = True
+
     def __init__(self) -> None:
         self._bars: dict[str, pd.Series] = {}
 
@@ -774,6 +794,19 @@ class HistoricalReplayBroker(BrokerInterface):
         if row is None:
             return 0.0
         return float(row["close"])
+
+    def simulate_stop_limit_fill(
+        self,
+        symbol: str,
+        trigger_price: float,
+        limit_price: float,
+    ) -> Optional[float]:
+        row = self._bars.get(symbol)
+        if row is None or float(row["high"]) < trigger_price:
+            return None
+        if float(row["high"]) > limit_price:
+            return None
+        return float(trigger_price)
 
     def place_market_order(self, symbol: str, side: OrderSide, quantity: int) -> str:
         return f"BT-MKT-{symbol}-{side.value}-{quantity}"

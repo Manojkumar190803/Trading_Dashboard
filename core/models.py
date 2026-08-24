@@ -39,17 +39,25 @@ class StrategyConfig:
     force_square_off: time = time(15, 15)
     signal_cutoff: time = time(15, 0)
     atm_lock_time: time = time(9, 20)
+    entry_start: time = time(9, 20)
+    entry_cutoff: time = time(14, 45)
 
     # ── Indicators (applied to the option premium chart) ─────────────
     ema_fast: int = 13
     ema_mid: int = 20
     ema_slow: int = 50
+    ema_period: int = 21
     rsi_length: int = 3
 
     # ── Risk (all on option premium points) ──────────────────────────
     max_option_risk_points: float = 20.0
     min_vwap_room_rr: float = 1.5
     pending_entry_expiry_candles: int = 3
+    entry_buffer_points: float = 1.0
+    stop_buffer_points: float = 1.0
+    entry_limit_buffer_points: float = 0.5
+    option_tick_size: float = 0.05
+    max_trades_per_day: int = 3
 
     # ── Targets (RR multiples) ───────────────────────────────────────
     t1_rr: float = 1.5
@@ -107,6 +115,7 @@ class BaseSideState:
     position: Optional[Position] = None
     pending_entry: Optional[PendingEntry] = None
     last_close: Optional[float] = None
+    last_ema21: Optional[float] = None
     last_rsi: Optional[float] = None
     last_ema13: Optional[float] = None
     last_ema20: Optional[float] = None

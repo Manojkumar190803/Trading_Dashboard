@@ -19,6 +19,17 @@ from strategies.base import SignalProvider
 logger = logging.getLogger("core.runner")
 
 
+def _seconds_until_market_open(cfg: StrategyConfig, now: Optional[datetime] = None) -> float:
+    """Return the wait until the next weekday market open."""
+    current = now or datetime.now()
+    next_open = datetime.combine(current.date(), cfg.market_open)
+    if current >= next_open or current.weekday() >= 5:
+        next_open += timedelta(days=1)
+    while next_open.weekday() >= 5:
+        next_open += timedelta(days=1)
+    return max(1.0, (next_open - current).total_seconds())
+
+
 def _normalize_history_df(df: pd.DataFrame) -> pd.DataFrame:
     """Convert an OpenAlgo history DataFrame into canonical columns."""
     out = df.copy()
@@ -275,7 +286,7 @@ class LiveFeedRunner:
                 "Market is closed — will sleep and resume at next session open."
             )
             while not self._is_market_open() and not self._stop.is_set():
-                wait = 3600.0  # 1 hour
+                wait = _seconds_until_market_open(self.cfg)
                 if self._wait_with_countdown(wait):
                     break
 
@@ -319,6 +330,15 @@ class LiveFeedRunner:
         side_state = self.engine._side_state(side)
         symbol = side_state.option_symbol or "NOT LOCKED"
         lines = [f"│ {side}: {symbol}"]
+
+        if self.engine._is_ema21_strategy():
+            ema21 = f"{side_state.last_ema21:.1f}" if side_state.last_ema21 is not None else "--"
+            ltp = f"{side_state.last_close:.1f}" if side_state.last_close is not None else "--"
+            lines.append(f"│     LTP={ltp}  EMA21={ema21}")
+            setup_status = self.engine.signal_provider.format_setup_status(side_state)
+            if setup_status:
+                lines.append(f"│     Setup: {setup_status}")
+            return "\n".join(lines)
 
         rsi_str = f"{side_state.last_rsi:.1f}" if side_state.last_rsi is not None else "--"
         e13 = f"{side_state.last_ema13:.1f}" if side_state.last_ema13 is not None else "--"
@@ -546,7 +566,7 @@ class MultiEngineLiveFeedRunner:
                 "Market is closed — will sleep and resume at next session open."
             )
             while not self._is_market_open() and not self._stop.is_set():
-                wait = 3600.0  # 1 hour
+                wait = _seconds_until_market_open(self.cfg)
                 if self._wait_with_countdown(wait):
                     break
 

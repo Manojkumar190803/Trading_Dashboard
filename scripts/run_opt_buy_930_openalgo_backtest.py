@@ -1,26 +1,20 @@
 from __future__ import annotations
 
-import argparse
+import logging
 import os
-from datetime import date, datetime, time, timedelta
+import time as time_module
+from datetime import date, datetime, time
 from pathlib import Path
+from typing import Optional
 
 import pandas as pd
 
 from core.broker import OpenAlgoBroker
 from strategies.opt_buy_930 import OptionCandidate, OptBuy930Config, TradeResult, run_backtest, select_watchlist
 
-
+logger = logging.getLogger("opt_buy_930.runner")
 IST_START = time(9, 20)
 IST_END = time(10, 1)
-
-
-def load_environment() -> None:
-    try:
-        from dotenv import load_dotenv
-    except ImportError:
-        return
-    load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
 
 def normalize_history(raw: pd.DataFrame) -> pd.DataFrame:
@@ -42,10 +36,6 @@ def normalize_history(raw: pd.DataFrame) -> pd.DataFrame:
     return frame.dropna(subset=["datetime", "close"]).sort_values("datetime").reset_index(drop=True)
 
 
-def trading_days(frame: pd.DataFrame) -> list[date]:
-    return sorted({stamp.date() for stamp in frame["datetime"] if stamp.weekday() < 5})
-
-
 def day_window(frame: pd.DataFrame, day: date) -> pd.DataFrame:
     return frame[(frame["datetime"].dt.date == day) & (frame["datetime"].dt.time >= IST_START) & (frame["datetime"].dt.time <= IST_END)]
 
@@ -58,96 +48,104 @@ def fetch_history(broker: OpenAlgoBroker, symbol: str, exchange: str, start: str
     return normalize_history(broker.fetch_history(symbol, exchange, "1m", start, end))
 
 
-def run_openalgo_backtest(start: str, end: str, output_csv: str, output_txt: str, strikes_each_side: int = 8) -> list[TradeResult]:
+def run_openalgo_backtest(start: str, end: str, output_csv: Optional[str], output_txt: Optional[str], profile: Optional[dict[str, object]] = None, strikes_each_side: int = 8) -> list[TradeResult]:
     api_key = os.getenv("OPENALGO_API_KEY")
     if not api_key:
         raise SystemExit("OPENALGO_API_KEY not set (check .env)")
     host = os.getenv("OPENALGO_HOST") or os.getenv("OPENALGO_URL") or "http://127.0.0.1:5002"
     broker = OpenAlgoBroker(api_key=api_key, host=host, dry_run=True)
-    profile = broker.discover_index_profile("NIFTY")
+    profile = profile or broker.discover_index_profile("NIFTY")
     spot = fetch_history(broker, str(profile["spot_symbol"]), str(profile["exchange_spot"]), start, end)
     config = OptBuy930Config(quantity=130, lot_size=int(profile["option_lot_size"]))
     results: list[TradeResult] = []
-
-    for day in trading_days(spot):
+    for day in sorted({stamp.date() for stamp in spot["datetime"] if stamp.weekday() < 5}):
         spot_day = day_window(spot, day)
-        spot_at_scan = spot_day[spot_day["datetime"].dt.time >= time(9, 25)]
-        if spot_at_scan.empty:
+        scan = spot_day[spot_day["datetime"].dt.time >= time(9, 25)]
+        if scan.empty:
             continue
-        spot_price = float(spot_at_scan.iloc[0]["close"])
-        strike_step = int(profile["strike_step"])
-        atm = int(round(spot_price / strike_step) * strike_step)
-        expiry = broker.resolve_nearest_expiry(
-            str(profile["option_index_symbol"]), day, atm, strike_step, int(profile["weekly_expiry_weekday"])
-        )
+        step = int(profile["strike_step"])
+        atm = int(round(float(scan.iloc[0]["close"]) / step) * step)
+        expiry = broker.resolve_nearest_expiry(str(profile["option_index_symbol"]), day, atm, step, int(profile["weekly_expiry_weekday"]))
         if expiry is None:
             continue
-
         candidate_data: list[tuple[OptionCandidate, pd.DataFrame]] = []
         for offset in range(-strikes_each_side, strikes_each_side + 1):
-            strike = atm + offset * strike_step
             for side in ("CE", "PE"):
+                strike = atm + offset * step
                 symbol = build_symbol(str(profile["option_index_symbol"]), expiry, strike, side)
                 try:
                     history = fetch_history(broker, symbol, str(profile["exchange_options"]), start, end)
                 except Exception:
                     continue
-                scan_rows = history[(history["datetime"].dt.date == day) & (history["datetime"].dt.time >= time(9, 25))]
-                if scan_rows.empty:
-                    continue
-                premium = float(scan_rows.iloc[0]["close"])
-                candidate_data.append((OptionCandidate(symbol, side, strike, premium), history))
-
-        candidates = [candidate for candidate, _ in candidate_data]
+                rows = history[(history["datetime"].dt.date == day) & (history["datetime"].dt.time >= time(9, 25))]
+                if not rows.empty:
+                    candidate_data.append((OptionCandidate(symbol, side, strike, float(rows.iloc[0]["close"])), history))
         try:
-            selected_candidates = select_watchlist(candidates, config)
-        except (StopIteration, ValueError):
+            selected = select_watchlist([candidate for candidate, _ in candidate_data], config)
+        except ValueError:
             continue
-
         histories = {candidate.symbol: history for candidate, history in candidate_data}
-        ticks: list[tuple[str, float, datetime]] = []
-        for side, candidate in selected_candidates.items():
-            history = histories[candidate.symbol]
-            rows = day_window(history, day)
-            for _, row in rows[rows["datetime"].dt.time >= config.signal_start].iterrows():
-                ticks.append((side, float(row["close"]), row["datetime"].to_pydatetime()))
-        trade = run_backtest(selected_candidates.values(), ticks, config)
+        ticks = [(side, float(row["close"]), row["datetime"].to_pydatetime()) for side, candidate in selected.items() for _, row in day_window(histories[candidate.symbol], day).iterrows() if row["datetime"].time() >= config.signal_start]
+        trade = run_backtest(selected.values(), ticks, config)
         if trade is not None:
             results.append(trade)
-
     if output_csv is not None and output_txt is not None:
         fields = ["side", "symbol", "quantity", "entry_time", "entry_price", "stop_loss", "target", "exit_time", "exit_price", "exit_reason", "gross_pnl"]
-        with Path(output_csv).open("w", encoding="utf-8", newline="") as handle:
-            handle.write(",".join(fields) + "\n")
+        with Path(output_csv).open("w", encoding="utf-8") as csv_handle, Path(output_txt).open("w", encoding="utf-8") as txt_handle:
+            csv_handle.write(",".join(fields) + "\n")
+            txt_handle.write("\t".join(fields) + "\n")
             for trade in results:
-                handle.write(",".join(str(getattr(trade, field) if field != "gross_pnl" else trade.gross_pnl) for field in fields) + "\n")
-        with Path(output_txt).open("w", encoding="utf-8") as handle:
-            handle.write("\t".join(fields) + "\n")
-            for trade in results:
-                handle.write("\t".join(str(getattr(trade, field) if field != "gross_pnl" else trade.gross_pnl) for field in fields) + "\n")
+                values = [getattr(trade, field) if field != "gross_pnl" else trade.gross_pnl for field in fields]
+                csv_handle.write(",".join(str(value) for value in values) + "\n")
+                txt_handle.write("\t".join(str(value) for value in values) + "\n")
     return results
 
 
-def main() -> None:
-    load_environment()
-    parser = argparse.ArgumentParser(description="One-week OpenAlgo 1-minute approximation backtest for 9:30 OPT-Buy")
-    parser.add_argument("--start", required=True, help="Start date YYYY-MM-DD")
-    parser.add_argument("--end", required=True, help="End date YYYY-MM-DD")
-    parser.add_argument("--csv", default="logs/opt_buy_930_week.csv")
-    parser.add_argument("--txt", default="logs/opt_buy_930_week.txt")
-    parser.add_argument("--terminal-only", action="store_true", help="Print the tradebook without creating output files")
-    parser.add_argument("--strikes-each-side", type=int, default=8)
-    args = parser.parse_args()
-    output_csv = None if args.terminal_only else args.csv
-    output_txt = None if args.terminal_only else args.txt
-    results = run_openalgo_backtest(args.start, args.end, output_csv, output_txt, args.strikes_each_side)
-    fields = ["side", "symbol", "quantity", "entry_time", "entry_price", "stop_loss", "target", "exit_time", "exit_price", "exit_reason", "gross_pnl"]
-    print("\t".join(fields))
-    for trade in results:
-        print("\t".join(str(getattr(trade, field) if field != "gross_pnl" else trade.gross_pnl) for field in fields))
-    print(f"Trades: {len(results)}")
-    print(f"Gross PnL (INR): {sum(trade.gross_pnl for trade in results):.2f}")
+def _broker_from_env(profile: dict[str, object], dry_run: bool) -> OpenAlgoBroker:
+    api_key = os.getenv("OPENALGO_API_KEY")
+    if not api_key:
+        raise SystemExit("OPENALGO_API_KEY not set (check .env)")
+    host = os.getenv("OPENALGO_HOST") or os.getenv("OPENALGO_URL") or "http://127.0.0.1:5002"
+    return OpenAlgoBroker(api_key=api_key, host=host, ws_url=os.getenv("OPENALGO_WS_URL"), exchange_options=str(profile["exchange_options"]), dry_run=dry_run)
 
 
-if __name__ == "__main__":
-    main()
+def run_openalgo_live(profile: dict[str, object], dry_run: bool = True, stop_event: Optional[object] = None) -> None:
+    """Run the 09:30 strategy by polling quotes until its session is complete."""
+    broker = _broker_from_env(profile, dry_run)
+    config = OptBuy930Config(quantity=130, lot_size=int(profile["option_lot_size"]))
+    while datetime.now().time() < time(9, 25):
+        if stop_event is not None and stop_event.is_set():
+            return
+        time_module.sleep(1)
+    spot = broker.get_ltp(str(profile["spot_symbol"]))
+    step = int(profile["strike_step"])
+    atm = int(round(spot / step) * step)
+    expiry = broker.resolve_nearest_expiry(str(profile["option_index_symbol"]), datetime.now().date(), atm, step, int(profile["weekly_expiry_weekday"]))
+    if expiry is None:
+        raise RuntimeError("unable to resolve OPT-Buy expiry")
+    candidates = []
+    for offset in range(-8, 9):
+        for side in ("CE", "PE"):
+            strike = atm + offset * step
+            symbol = build_symbol(str(profile["option_index_symbol"]), expiry, strike, side)
+            premium = broker.get_ltp(symbol)
+            if premium:
+                candidates.append(OptionCandidate(symbol, side, strike, premium))
+    from strategies.opt_buy_930 import OptBuy930Strategy
+    strategy = OptBuy930Strategy(config)
+    strategy.scan(candidates)
+    logger.info("OPT-Buy watchlist: %s", {side: item.symbol for side, item in strategy.state.selected.items()})
+    while datetime.now().time() < config.hard_exit_time and (stop_event is None or not stop_event.is_set()):
+        now = datetime.now()
+        for side, candidate in strategy.state.selected.items():
+            price = broker.get_ltp(candidate.symbol)
+            if price:
+                if strategy.state.trade is None:
+                    strategy.process_tick(side, price, now)
+                else:
+                    strategy.process_position_tick(price, now)
+                    strategy.process_time(price, now)
+        if strategy.state.trade and strategy.state.trade.exit_reason != "ACTIVE":
+            logger.info("OPT-Buy trade closed: %s", strategy.state.trade)
+            return
+        time_module.sleep(1)

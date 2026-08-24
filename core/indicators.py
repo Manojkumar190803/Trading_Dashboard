@@ -17,6 +17,7 @@ def compute_rsi(close: pd.Series, length: int) -> pd.Series:
 
 def add_indicators(df: pd.DataFrame, cfg: StrategyConfig) -> pd.DataFrame:
     data = df.copy()
+    data["ema21"] = data["close"].ewm(span=cfg.ema_period, adjust=False).mean()
     data["ema13"] = data["close"].ewm(span=cfg.ema_fast, adjust=False).mean()
     data["ema20"] = data["close"].ewm(span=cfg.ema_mid, adjust=False).mean()
     data["ema50"] = data["close"].ewm(span=cfg.ema_slow, adjust=False).mean()
