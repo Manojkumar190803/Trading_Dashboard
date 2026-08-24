@@ -8,7 +8,7 @@
 | Version | 1.0 |
 | Strategy name | 21 EMA Strategy |
 | Market timezone | Asia/Kolkata (IST) |
-| Signal timeframe | 5-minute candles |
+| Signal timeframe | 3-minute candles |
 | Signal instrument | Nifty ATM CE and ATM PE option premiums |
 | Execution instrument | Nifty ATM CE and ATM PE options for the current weekly expiry; next weekly expiry when today is expiry day |
 | Initial implementation scope | Buy setup |
@@ -23,7 +23,7 @@ recorded before release.
 ## 2. Executive Summary
 
 The strategy calculates a separate 21-period Exponential Moving Average (EMA)
-from the close of each completed 5-minute ATM CE and ATM PE option candle. A
+from the close of each completed 3-minute ATM CE and ATM PE option candle. A
 buy setup begins independently for each option when its price crosses from
 below the EMA and a candle closes above it. That first candle is the setup
 candle. Its low, less a 1-point protective buffer, defines the initial
@@ -40,7 +40,7 @@ exceeds 25 option-premium points.
 After entry, the position remains open through the first 1R milestone. At 1R,
 the stop moves to entry price. Thereafter, the stop advances by 0.5R for every
 additional 0.5R milestone. The position exits when its stop is hit, when a
-5-minute option candle closes below its EMA, or at the mandatory 15:10 IST
+3-minute option candle closes below its EMA, or at the mandatory 15:10 IST
 square-off. Stop, milestone, and trailing triggers use live option-premium
 ticks.
 
@@ -75,7 +75,7 @@ ticks.
 
 | Parameter | Default | Requirement |
 |---|---:|---|
-| `timeframe_minutes` | 5 | Signal candle interval |
+| `timeframe_minutes` | 3 | Signal candle interval |
 | `ema_period` | 21 | EMA period, calculated on close |
 | `atm_lock_time` | 09:20 IST | Time when the ATM strike and CE/PE contracts are calculated and locked |
 | `expiry_policy` | Current weekly | Use current weekly expiry; use the immediately following weekly expiry when today is expiry day |
@@ -100,7 +100,7 @@ ticks.
 | ID | Requirement | Priority |
 |---|---|---|
 | FR-01 | The system shall create one strategy session per Nifty trading day and reset the filled-trade counter at session start. | Must |
-| FR-02 | The system shall use completed 5-minute candles and shall not evaluate a partially formed candle as a signal candle. | Must |
+| FR-02 | The system shall use completed 3-minute candles and shall not evaluate a partially formed candle as a signal candle. | Must |
 | FR-03 | The system shall calculate EMA-21 from candle closes in chronological order. | Must |
 | FR-04 | The system shall block new entries when the signal data is missing, malformed, stale, or not sufficiently initialized to calculate EMA-21. | Must |
 | FR-05 | At `atm_lock_time` (09:20 IST), the system shall calculate and lock the Nifty ATM strike and resolve the ATM CE and ATM PE contracts for the current weekly expiry. If today is expiry day, it shall select the immediately following tradable weekly expiry. Missing expiry or contract metadata shall prevent live order placement. | Must |
@@ -144,8 +144,8 @@ ticks.
 | FR-28 | At every additional 0.5R milestone based on live option-premium ticks, the system shall advance the stop by 0.5R. For example, at 1.5R the stop is `entry + 0.5R`; at 2R it is `entry + 1R`; at 2.5R it is `entry + 1.5R`. | Must |
 | FR-29 | The stop shall never move backward. Repeated observations of the same milestone shall be idempotent. | Must |
 | FR-30 | The position shall be exited when the active stop is hit. | Must |
-| FR-31 | An already-filled position shall be exited when its completed 5-minute option-premium candle closes strictly below its EMA-21. | Must |
-| FR-32 | Stop-loss, trailing-stop, and milestone conditions shall be evaluated from ticks. The EMA-close exit shall be evaluated when the completed 5-minute option candle closes. If a later confirmation candle closes at or below EMA before entry, the pending order shall be cancelled; if the entry has already filled, the position shall also be exited. If multiple tick events have the same timestamp, the engine shall process them in feed order and record that ordering. | Must |
+| FR-31 | An already-filled position shall be exited when its completed 3-minute option-premium candle closes strictly below its EMA-21. | Must |
+| FR-32 | Stop-loss, trailing-stop, and milestone conditions shall be evaluated from ticks. The EMA-close exit shall be evaluated when the completed 3-minute option candle closes. If a later confirmation candle closes at or below EMA before entry, the pending order shall be cancelled; if the entry has already filled, the position shall also be exited. If multiple tick events have the same timestamp, the engine shall process them in feed order and record that ordering. | Must |
 
 ### 5.5 Time-Based Exit and Cleanup
 

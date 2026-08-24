@@ -332,7 +332,7 @@ def main(argv: Optional[list[str]] = None) -> None:
     if "ema21" in strategy_names:
         from datetime import time
 
-        cfg.timeframe_minutes = 5
+        cfg.timeframe_minutes = 3
         cfg.market_open = time(9, 20)
         cfg.entry_start = time(9, 20)
         cfg.signal_cutoff = time(14, 45)

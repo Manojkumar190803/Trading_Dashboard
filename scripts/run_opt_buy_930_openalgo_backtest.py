@@ -118,6 +118,13 @@ def run_openalgo_live(profile: dict[str, object], dry_run: bool = True, stop_eve
             return
         time_module.sleep(1)
     spot = broker.get_ltp(str(profile["spot_symbol"]))
+    if spot <= 0:
+        logger.error(
+            "OPT-Buy cannot start: no spot quote for %s. "
+            "OpenAlgo/Fyers returned no price; refresh the broker session/token and retry.",
+            profile["spot_symbol"],
+        )
+        return
     step = int(profile["strike_step"])
     atm = int(round(spot / step) * step)
     expiry = broker.resolve_nearest_expiry(str(profile["option_index_symbol"]), datetime.now().date(), atm, step, int(profile["weekly_expiry_weekday"]))
@@ -133,7 +140,14 @@ def run_openalgo_live(profile: dict[str, object], dry_run: bool = True, stop_eve
                 candidates.append(OptionCandidate(symbol, side, strike, premium))
     from strategies.opt_buy_930 import OptBuy930Strategy
     strategy = OptBuy930Strategy(config)
-    strategy.scan(candidates)
+    try:
+        strategy.scan(candidates)
+    except ValueError:
+        logger.error(
+            "OPT-Buy cannot start: CE and PE quotes were unavailable or outside "
+            "the premium selection range. Check the broker session and option symbols."
+        )
+        return
     logger.info("OPT-Buy watchlist: %s", {side: item.symbol for side, item in strategy.state.selected.items()})
     while datetime.now().time() < config.hard_exit_time and (stop_event is None or not stop_event.is_set()):
         now = datetime.now()
