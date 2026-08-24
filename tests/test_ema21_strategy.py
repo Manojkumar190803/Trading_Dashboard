@@ -40,28 +40,23 @@ def test_provider_captures_setup_and_first_red_confirmation():
 
     assert state.confirmation_count == 1
     assert state.first_red_high == 106.0
-    assert provider.generate_signal("CE", state, first_confirmation, setup) == Signal.NONE
+    assert provider.generate_signal("CE", state, first_confirmation, setup) == Signal.BUY_CE
 
 
-def test_provider_emits_signal_after_three_valid_confirmations():
+def test_provider_emits_signal_on_first_red_confirmation():
     provider = EMA21SignalProvider()
     state = provider.create_side_state()
     previous = _row(0, open_=100, high=101, low=98, close=99, ema=100)
     setup = _row(1, open_=99, high=103, low=95, close=101, ema=100)
     provider.update_state(state, setup, previous)
 
-    confirmations = [
-        _row(2, open_=105, high=106, low=100, close=102, ema=101),
-        _row(3, open_=101, high=104, low=100, close=103, ema=102),
-        _row(4, open_=102, high=105, low=101, close=104, ema=103),
-    ]
-    for row in confirmations:
-        provider.update_state(state, row, setup)
+    first_red = _row(2, open_=105, high=106, low=100, close=102, ema=101)
+    provider.update_state(state, first_red, setup)
 
     assert state.entry_ready is True
-    assert provider.generate_signal("CE", state, confirmations[-1], confirmations[-2]) == Signal.BUY_CE
-    assert provider.compute_risk_points(state, confirmations[-1]) == 13.0
-    assert provider.compute_stop_level(state, confirmations[-1]) == 94.0
+    assert provider.generate_signal("CE", state, first_red, setup) == Signal.BUY_CE
+    assert provider.compute_risk_points(state, first_red) == 13.0
+    assert provider.compute_stop_level(state, first_red) == 94.0
 
 
 def test_provider_cancels_setup_when_confirmation_closes_on_ema():
@@ -79,7 +74,7 @@ def test_provider_cancels_setup_when_confirmation_closes_on_ema():
     assert provider.generate_signal("CE", state, invalid, setup) == Signal.NONE
 
 
-def test_engine_uses_first_red_high_for_ema21_pending_trigger():
+def test_engine_enters_ema21_at_alert_with_market_order():
     provider = EMA21SignalProvider()
     engine = BaseStrategyEngine(
         StrategyConfig(max_option_risk_points=25.0),
@@ -101,13 +96,16 @@ def test_engine_uses_first_red_high_for_ema21_pending_trigger():
 
     engine.process_option_candle("CE", setup, previous)
     engine.process_option_candle("CE", first_red, setup)
-    engine.process_option_candle("CE", second, first_red)
-    engine.process_option_candle("CE", third, second)
 
-    pending = engine.state.ce.pending_entry
-    assert pending is not None
-    assert pending.option_trigger_level == 107.0
-    assert pending.option_stop_level == 94.0
+    position = engine.state.ce.position
+    assert position is not None
+    assert position.entry_price == 107.0
+    assert position.option_entry_trigger == 106.0
+    assert position.option_stop_level == 94.0
+    assert position.quantity == 130
+    assert position.initial_quantity == 130
+    assert engine.state.ce.pending_entry is None
+    assert engine.total_entries == 1
 
 
 def test_engine_does_not_create_order_when_entry_stop_gap_exceeds_25_points():
@@ -186,7 +184,7 @@ def test_replay_stop_limit_fill_is_rejected_when_limit_is_exceeded():
     assert broker.simulate_stop_limit_fill(symbol, 144.85, 145.35) is None
 
 
-def test_rejected_ema21_pending_entry_does_not_repeat_signal():
+def test_ema21_market_entry_does_not_repeat_signal():
     provider = EMA21SignalProvider()
     engine = BaseStrategyEngine(
         StrategyConfig(max_option_risk_points=25.0),
@@ -212,17 +210,13 @@ def test_rejected_ema21_pending_entry_does_not_repeat_signal():
         engine.process_option_candle("CE", row, prior)
 
     state = engine.state.ce
-    assert state.pending_entry is not None
-    rejection = _row(5, open_=143, high=150, low=140, close=149, ema=105)
-    engine.process_option_candle("CE", rejection, confirmations[-1])
-
-    assert state.pending_entry is None
+    assert state.position is not None
     assert state.entry_ready is False
 
     engine.process_option_candle(
         "CE",
-        _row(6, open_=149, high=151, low=148, close=150, ema=106),
-        rejection,
+        _row(5, open_=149, high=151, low=148, close=150, ema=106),
+        confirmations[-1],
     )
-    assert state.pending_entry is None
-    assert sum(alert.category == "PENDING_ENTRY" for alert in engine.alerts) == 1
+    assert engine.total_entries == 1
+    assert sum(alert.category == "ENTRY" for alert in engine.alerts) == 1

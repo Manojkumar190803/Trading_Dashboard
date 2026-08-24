@@ -147,6 +147,7 @@ class LiveFeedRunner:
         self.poll_slack_seconds = poll_slack_seconds
         self._stop = threading.Event()
         self._last_bar_time: dict[str, Optional[datetime]] = {"CE": None, "PE": None}
+        self._startup_baselined: set[str] = set()
 
     def stop(self) -> None:
         self._stop.set()
@@ -210,6 +211,14 @@ class LiveFeedRunner:
             return
 
         last_ts = self._last_bar_time.get(side)
+        if side not in self._startup_baselined and last_ts is None:
+            latest_ts = closed["datetime"].iloc[-1]
+            self._last_bar_time[side] = (
+                latest_ts.to_pydatetime() if hasattr(latest_ts, "to_pydatetime") else latest_ts
+            )
+            self._startup_baselined.add(side)
+            logger.info("baselined %s at %s; historical bars will not create orders", side, self._last_bar_time[side])
+            return
         if last_ts is not None:
             closed = closed[closed["datetime"] > last_ts]
             if closed.empty:
@@ -428,6 +437,7 @@ class MultiEngineLiveFeedRunner:
         self.poll_slack_seconds = poll_slack_seconds
         self._stop = threading.Event()
         self._last_bar_time: dict[str, Optional[datetime]] = {"CE": None, "PE": None}
+        self._startup_baselined: set[str] = set()
 
     def stop(self) -> None:
         self._stop.set()
@@ -493,6 +503,14 @@ class MultiEngineLiveFeedRunner:
             return
 
         last_ts = self._last_bar_time.get(side)
+        if side not in self._startup_baselined and last_ts is None:
+            latest_ts = closed["datetime"].iloc[-1]
+            self._last_bar_time[side] = (
+                latest_ts.to_pydatetime() if hasattr(latest_ts, "to_pydatetime") else latest_ts
+            )
+            self._startup_baselined.add(side)
+            logger.info("baselined %s at %s; historical bars will not create orders", side, self._last_bar_time[side])
+            return
         if last_ts is not None:
             closed = closed[closed["datetime"] > last_ts]
             if closed.empty:

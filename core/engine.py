@@ -438,7 +438,7 @@ class BaseStrategyEngine:
             return
 
         if self._is_ema21_strategy():
-            entry_level = float(getattr(side_state, "first_red_high") + self.cfg.entry_buffer_points)
+            entry_level = float(getattr(side_state, "first_red_high"))
         else:
             entry_level = float(row["high"] + 1.0)
         stop_level = self.signal_provider.compute_stop_level(side_state, row)
@@ -474,6 +474,31 @@ class BaseStrategyEngine:
         quantity = lots * self.cfg.option_lot_size
 
         trigger_level = entry_level
+
+        if self._is_ema21_strategy():
+            option_ltp = self.broker.get_ltp(side_state.option_symbol)
+            self.broker.place_market_order(side_state.option_symbol, OrderSide.BUY, quantity)
+            side_state.position = Position(
+                option_symbol=side_state.option_symbol,
+                option_type=side,
+                quantity=quantity,
+                initial_quantity=quantity,
+                entry_price=option_ltp,
+                entry_time=ts,
+                option_stop_level=stop_level,
+                option_entry_trigger=trigger_level,
+                option_risk_points=risk_points,
+            )
+            self.total_entries += 1
+            self.signal_provider.reset_after_entry(side_state)
+            self._record_alert(
+                ts, "ENTRY",
+                f"Entered {side} {side_state.option_symbol} @ {option_ltp:.2f}, "
+                f"alert_trigger={trigger_level:.2f}, SL={stop_level:.2f}, "
+                f"option_risk={risk_points:.2f}",
+            )
+            print(self._fmt_candle_context(row, side_state.option_symbol, True))
+            return
 
         side_state.pending_entry = PendingEntry(
             signal=Signal.BUY_CE if side == "CE" else Signal.BUY_PE,

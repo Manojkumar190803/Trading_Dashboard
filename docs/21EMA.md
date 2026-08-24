@@ -14,7 +14,7 @@
 | Initial implementation scope | Buy setup |
 | Deferred scope | Sell setup is documented in Section 11 but is not part of the first implementation |
 | Maximum filled trades | 3 per trading day, with trading also locked after 3 stop-loss exits |
-| Default position size | 1 lot = 65 quantity |
+| Default position size | 2 lots = 130 quantity |
 
 This document is the behavioral contract for backtesting, paper trading, and
 live trading. Any behavior not defined here must be made configurable and
@@ -31,8 +31,10 @@ stop-loss.
 
 The next three completed candles are confirmation candles. Every one must close
 above the 21 EMA, and at least one must be red (`close < open`). The pending
-entry order is placed immediately after the first red confirmation candle
-closes, at 1 point above that candle's high. If a later confirmation candle
+entry is placed at market immediately after the first red confirmation candle
+closes. The first red candle high is recorded as the alert reference without an
+entry buffer. The red candle may be the first, second, or third confirmation
+candle. If a later confirmation candle
 closes at or below the EMA, any pending order is cancelled and any already-filled
 position is exited. The setup is discarded when the resulting initial risk
 exceeds 25 option-premium points.
@@ -59,17 +61,16 @@ ticks.
    candle. If more than one red candle forms, later red candles do not replace
    the first valid reference.
 7. A candle that closes exactly on the EMA fails the above-EMA requirement.
-8. The 1-point buffer is applied in the adverse direction: entry is red-candle
-   high plus 1 point, and the initial stop is setup-candle low minus 1 point.
-9. Prices are rounded to the execution instrument's valid tick size before an
-   order is submitted. The rounded entry trigger and rounded initial stop are
-   also used to calculate and validate initial risk.
+8. The initial stop is setup-candle low minus 1 point. The first red candle high
+is an alert reference only; no entry buffer is applied.
+9. EMA21 entry and exit orders use market orders without entry or exit buffers.
+The observed market entry price is used for P&L and risk calculations.
 10. The strategy shall use both ATM CE and ATM PE contracts for the current
    weekly expiry. If the trading day is the expiry day, it shall use the next
    available weekly expiry. The selected expiry shall be locked and recorded
    for the session.
-11. A filled entry consumes one daily trade allowance. A cancelled or rejected
-    pending entry does not consume an allowance.
+11. A filled market entry consumes one daily trade allowance. A rejected alert
+   does not consume an allowance.
 
 ## 4. Configuration Parameters
 
@@ -82,16 +83,16 @@ ticks.
 | `entry_start` | 09:20 IST | Earliest time the strategy may scan for a new setup or trigger an entry |
 | `entry_cutoff` | 14:45 IST | No new entry may be accepted at or after this time |
 | `force_square_off` | 15:10 IST | Mandatory exit time for every open position |
-| `entry_buffer_points` | 1.0 | Added above the red candle high for buys |
+| `entry_buffer_points` | 0.0 | No EMA21 entry buffer; retained for legacy strategies |
 | `stop_buffer_points` | 1.0 | Subtracted below the setup candle low for buys |
-| `entry_limit_buffer_points` | 0.5 | Added to the stop-limit trigger to calculate the limit price |
+| `entry_limit_buffer_points` | 0.5 | Retained for legacy stop-limit strategies |
 | `max_initial_risk_points` | 25.0 | Discard setup when initial risk is greater than this value |
 | `breakeven_rr` | 1.0 | Move stop to cost at 1R |
 | `trail_step_rr` | 0.5 | Advance stop at each additional 0.5R |
 | `max_trades_per_day` | 3 | Maximum filled entries per trading day |
-| `lots` | 1 | Initial lot count |
+| `lots` | 2 | Initial lot count |
 | `option_lot_size` | 65 | Quantity per Nifty lot |
-| `quantity` | 65 | `lots * option_lot_size` per filled CE or PE entry |
+| `quantity` | 130 | `lots * option_lot_size` per filled CE or PE entry |
 
 ## 5. Functional Requirements
 
@@ -115,25 +116,25 @@ ticks.
 | FR-09 | The system shall evaluate only the next three completed candles after the setup candle as the confirmation window. | Must |
 | FR-10 | Each confirmation candle shall close strictly above its EMA-21. A close at or below EMA-21 shall cancel the setup immediately. | Must |
 | FR-11 | At least one confirmation candle shall be red (`close < open`). | Must |
-| FR-12 | The first red confirmation candle shall define the entry trigger as `red_candle_high + 1.0`, and the system shall place the pending entry immediately after that candle closes. | Must |
+| FR-12 | The first red confirmation candle shall define the alert reference as `red_candle_high`, without a buffer. The system shall enter at market immediately after that candle closes; the red candle may be any of the next three confirmations. | Must |
 | FR-13 | The setup shall be cancelled if no red candle occurs in the three-candle window. | Must |
-| FR-14 | The system shall cancel the pending entry if it is not filled by the end of the three-candle confirmation window. | Must |
+| FR-14 | The system shall enter immediately after the first valid red confirmation; there is no pending EMA21 entry to wait for or expire. | Must |
 | FR-15 | The system shall discard the setup when `entry_trigger - initial_stop > 25.0` option-premium points. | Must |
-| FR-16 | A setup shall be cancelled when its entry window or trigger time reaches 14:45 IST without a filled entry. | Must |
+| FR-16 | A setup shall be cancelled when its entry window reaches 14:45 IST without a valid market-entry alert. | Must |
 
 ### 5.3 Entry Execution
 
 | ID | Requirement | Priority |
 |---|---|---|
 | FR-17 | The system shall scan for new 21 EMA setups and accept new entries only from 09:20:00 IST through 14:44:59 IST. | Must |
-| FR-18 | The system shall submit a BUY stop-limit order for the relevant ATM CE or ATM PE option, triggered at `red_candle_high + 1.0`, using `lots * 65` quantity by default. | Must |
-| FR-19 | The stop-limit order's limit price shall be the trigger price plus a configurable positive limit buffer. The default limit buffer shall be `0.5` option-premium points. | Must |
+| FR-18 | The system shall submit a BUY market order for the relevant ATM CE or ATM PE option immediately when the EMA21 alert is generated, using `lots * 65` quantity by default. | Must |
+| FR-19 | EMA21 entry and exit orders shall use market orders without entry or exit price buffers. | Must |
 | FR-20 | The system shall use the broker-confirmed average option-premium fill price as the actual entry price for all risk and reward calculations. | Must |
 | FR-21 | The system shall calculate `R = actual_entry_price - initial_stop`. A non-positive R shall invalidate the trade and trigger protective cleanup. | Must |
 | FR-22 | The system shall reserve and increment the daily trade count only for a broker-confirmed filled entry. | Must |
 | FR-23 | The system shall permit no more than three filled entries per trading day, including entries that later exit during the same day. | Must |
-| FR-24 | Only one position may be active globally at a time. If CE is active, any PE signal or pending entry shall be rejected or cancelled; if PE is active, any CE signal or pending entry shall be rejected or cancelled. A new setup may be considered after the prior position is confirmed closed, subject to the daily limit. | Must |
-| FR-25 | The system shall cancel an unfilled pending entry when its setup is invalidated, its confirmation window expires, its entry cutoff is reached, or the opposite side has an active position. | Must |
+| FR-24 | Only one position may be active globally at a time. If CE is active, any PE signal shall be rejected; if PE is active, any CE signal shall be rejected. A new setup may be considered after the prior position is confirmed closed, subject to the daily limit. | Must |
+| FR-25 | The system shall reject an alert when its setup is invalidated, its entry cutoff is reached, or the opposite side has an active position. | Must |
 
 ### 5.4 Initial Risk and Stop Management
 
@@ -155,8 +156,8 @@ ticks.
 | FR-34 | The 15:10 IST exit shall apply regardless of profit, loss, EMA position, or trailing-stop state. | Must |
 | FR-35 | The system shall not submit a new entry at or after 14:45 IST, including an entry trigger observed after the cutoff. | Must |
 | FR-36 | The system shall persist the final option-premium exit price, exit timestamp, exit reason, realized P&L, order IDs, and cleanup result. | Must |
-| FR-37 | If a stop-limit trigger is reached but the market price exceeds the limit and no fill occurs, the system shall cancel the stop-limit order immediately and record the missed-fill reason. | Must |
-| FR-38 | If a stop-limit order is partially filled, the system shall cancel the unfilled remainder, protect the filled quantity, and manage the filled position using the confirmed average fill price. | Must |
+| FR-37 | The system shall record the broker-observed market entry price and use it for position and P&L calculations. | Must |
+| FR-38 | If a market entry or exit order fails, the system shall record the failure and reconcile broker state before retrying. | Must |
 | FR-39 | If actual fill risk, calculated as `actual_entry_price - initial_stop`, is greater than 25 option-premium points, the system shall exit the filled quantity immediately and record the risk breach. | Must |
 | FR-40 | The system shall lock new trading for the day after three filled trades exit at their initial or active stop-loss, regardless of the remaining filled-entry allowance. | Must |
 
@@ -173,7 +174,7 @@ The strategy shall track one global session state and one setup/position state:
 | `BREAKEVEN` | 1R reached; stop moved to entry |
 | `TRAILING` | One or more 0.5R trailing milestones reached |
 | `CLOSED` | Position exited; may return to `WAITING` if daily limit remains |
-| `CANCELLED` | Setup or pending entry invalidated without a fill |
+| `CANCELLED` | Setup invalidated without a fill |
 | `DAY_LOCKED` | Three filled entries recorded, three stop-loss exits recorded, or session is past the entry cutoff |
 | `FORCE_EXIT` | Mandatory 15:10 cleanup is in progress |
 
@@ -182,13 +183,12 @@ The strategy shall track one global session state and one setup/position state:
 | Case | Required behavior |
 |---|---|
 | Setup candle does not close above EMA-21 | No setup is created |
-| A confirmation candle closes at or below EMA-21 | Cancel the setup/pending entry |
+| A confirmation candle closes at or below EMA-21 | Cancel the setup |
 | No red candle in three confirmations | Cancel the setup |
 | More than 25 points initial risk | Discard the setup without placing an entry |
-| Entry trigger is not reached in the window | Cancel the pending entry |
-| Stop-limit trigger is reached but price exceeds the limit | Cancel the order immediately and record a missed fill |
-| Stop-limit entry is partially filled | Cancel the remainder and protect the filled quantity |
-| Entry cutoff reached with pending order | Cancel the pending order |
+| EMA21 alert is generated | Submit a market entry immediately |
+| Market entry or exit fails | Record the failure and reconcile broker state before retrying |
+| Entry cutoff reached before alert | Cancel the setup |
 | Entry order rejected or cancelled | Do not increment the filled-trade count; record the broker reason |
 | Stop order placement fails after fill | Attempt immediate market exit and mark the trade operationally unresolved until broker quantity is zero |
 | WebSocket or live price feed unavailable | Block new entries; retain broker-side protection and use fallback order/position reconciliation for active trades |
@@ -196,7 +196,7 @@ The strategy shall track one global session state and one setup/position state:
 | Three filled entries reached | Cancel pending entries and lock new entries for the day |
 | Three trades exit at their stop-loss | Cancel pending entries and lock new entries for the day |
 | Actual fill risk exceeds 25 points | Exit the filled quantity immediately and record the risk breach |
-| Later confirmation candle closes at or below EMA | Cancel pending entry; exit any already-filled position |
+| Later confirmation candle closes at or below EMA | Cancel setup; exit any already-filled position |
 | Exit order fails at 15:10 | Retry and alert until the broker confirms zero remaining quantity |
 
 ## 8. Audit and Reporting Requirements
@@ -219,7 +219,7 @@ The system shall record:
 | ID | Scenario | Expected result |
 |---|---|---|
 | TC-01 | Previous close is below EMA-21 and setup candle closes above it | Buy setup begins and setup low is recorded |
-| TC-02 | First confirmation candle is red and closes above EMA-21 | Entry trigger is red high + 1 point |
+| TC-02 | First confirmation candle is red and closes above EMA-21 | Market entry occurs after the first confirmation |
 | TC-03 | All three confirmation candles close above EMA-21 and none is red | Setup is cancelled |
 | TC-04 | A confirmation candle closes at EMA-21 | Setup is cancelled |
 | TC-05 | Tick-rounded entry trigger minus tick-rounded initial stop is 25 points | Setup remains eligible |
@@ -232,11 +232,11 @@ The system shall record:
 | TC-12 | A pending trigger appears at 14:45 | It is rejected and no entry is placed |
 | TC-13 | Position remains active at 15:10 | All remaining quantity is force-exited |
 | TC-14 | Trading day is the current weekly expiry day | Next available weekly expiry is selected for both ATM options |
-| TC-15 | First red candle closes with high 100 | BUY stop-limit trigger is 101 and default limit price is 101.5 |
+| TC-15 | First red candle closes with high 100 | Alert reference is 100 and market entry has no buffer |
 | TC-16 | CE position is active and a PE signal is generated | PE signal/order is rejected and CE remains the only active position |
 | TC-17 | PE position is active and a CE signal is generated | CE signal/order is rejected and PE remains the only active position |
-| TC-18 | Stop-limit trigger is reached but price exceeds the limit | Order is cancelled immediately with a missed-fill result |
-| TC-19 | Stop-limit order is partially filled | Remainder is cancelled and the filled quantity receives protection |
+| TC-18 | EMA21 alert is generated | BUY market order is submitted immediately |
+| TC-19 | Market entry or exit fails | Failure is recorded and broker state is reconciled |
 | TC-20 | Actual fill risk is greater than 25 points | Filled quantity is exited immediately |
 | TC-21 | Later confirmation candle closes at or below EMA | Pending order is cancelled; any filled position is exited |
 | TC-22 | Three filled trades exit at their stop-loss | All pending entries are cancelled and trading is locked for the day |

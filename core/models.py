@@ -53,7 +53,7 @@ class StrategyConfig:
     max_option_risk_points: float = 20.0
     min_vwap_room_rr: float = 1.5
     pending_entry_expiry_candles: int = 3
-    entry_buffer_points: float = 1.0
+    entry_buffer_points: float = 0.0
     stop_buffer_points: float = 1.0
     entry_limit_buffer_points: float = 0.5
     option_tick_size: float = 0.05

@@ -50,12 +50,11 @@ class EMA21SignalProvider(SignalProvider):
             if side_state.first_red_high is None and float(row["close"]) < float(row["open"]):
                 side_state.first_red_high = float(row["high"])
                 side_state.first_red_time = row.get("datetime")
+                side_state.entry_ready = True
 
             if side_state.confirmation_count >= 3:
                 if side_state.first_red_high is None:
                     self._clear_setup(side_state)
-                else:
-                    side_state.entry_ready = True
             return
 
         if prev_row is None:
@@ -93,7 +92,7 @@ class EMA21SignalProvider(SignalProvider):
         return trigger - stop
 
     def compute_entry_lots(self, row: pd.Series, cfg: StrategyConfig) -> int:
-        return 1
+        return 2
 
     def compute_stop_level(self, side_state: BaseSideState, row: pd.Series) -> float:
         assert isinstance(side_state, EMA21SideState)
