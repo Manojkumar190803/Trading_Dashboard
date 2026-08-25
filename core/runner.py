@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import csv
 import os
 import re
 import threading
@@ -17,6 +18,67 @@ from core.models import RiskConfig, StrategyConfig
 from strategies.base import SignalProvider
 
 logger = logging.getLogger("core.runner")
+
+
+def _print_persisted_trade_alerts(strategy_name: str, trading_day: date) -> None:
+    path = Path("logs") / f"trade_alerts_{trading_day:%Y%m%d}.csv"
+    if not path.exists():
+        return
+    try:
+        with path.open(newline="", encoding="utf-8") as handle:
+            rows = [row for row in csv.DictReader(handle) if row.get("strategy") == strategy_name]
+    except OSError as exc:
+        logger.warning("could not read persisted trade alerts: %s", exc)
+        return
+    if not rows:
+        return
+    print(f"\nPast {strategy_name} trades for {trading_day}:")
+    for row in rows:
+        print(f"[HISTORY][{row.get('category', '?')}] {row.get('timestamp', '?')} {row.get('message', '')}")
+
+
+def _restore_open_positions(engine: BaseStrategyEngine, broker: OpenAlgoBroker, trading_day: date) -> None:
+    """Restore matching OpenAlgo positions without replaying historical candles."""
+    path = Path("logs") / f"trade_alerts_{trading_day:%Y%m%d}.csv"
+    if not path.exists():
+        return
+    try:
+        with path.open(newline="", encoding="utf-8") as handle:
+            alerts = [row for row in csv.DictReader(handle) if row.get("strategy") == engine.strategy_name]
+        broker_positions = broker.get_position_book()
+    except (OSError, ValueError) as exc:
+        logger.warning("could not restore persisted positions: %s", exc)
+        return
+
+    entry_pattern = re.compile(
+        r"Entered (CE|PE) (\S+) @ ([\d.]+), qty=(\d+), alert_trigger=([\d.]+), "
+        r"SL=([\d.]+), option_risk=([\d.]+)"
+    )
+    for position in broker_positions:
+        symbol = str(position.get("symbol") or "")
+        quantity = int(float(position.get("quantity") or 0))
+        if not symbol or quantity <= 0:
+            continue
+        matching = [row for row in alerts if row.get("category") == "ENTRY" and symbol in str(row.get("message") or "")]
+        if not matching:
+            continue
+        match = entry_pattern.search(str(matching[-1].get("message") or ""))
+        if match is None:
+            logger.warning("could not parse persisted entry for open position %s", symbol)
+            continue
+        side, _, _, _, trigger, stop, risk = match.groups()
+        entry_alert = matching[-1]
+        engine.restore_open_position(
+            side,
+            quantity,
+            float(position.get("average_price") or 0),
+            datetime.fromisoformat(str(entry_alert["timestamp"])),
+            float(stop),
+            float(trigger),
+            float(risk),
+        )
+        engine.total_entries = sum(row.get("category") == "ENTRY" for row in alerts)
+        logger.info("restored open %s position from OpenAlgo: %s qty=%s", side, symbol, quantity)
 
 
 def _seconds_until_market_open(cfg: StrategyConfig, now: Optional[datetime] = None) -> float:
@@ -148,6 +210,7 @@ class LiveFeedRunner:
         self._stop = threading.Event()
         self._last_bar_time: dict[str, Optional[datetime]] = {"CE": None, "PE": None}
         self._startup_baselined: set[str] = set()
+        self._shown_alert_times: dict[str, Optional[datetime]] = {"ENTRY": None, "EXIT": None}
 
     def stop(self) -> None:
         self._stop.set()
@@ -168,6 +231,7 @@ class LiveFeedRunner:
         lock_ts = datetime.combine(now.date(), self.cfg.atm_lock_time)
         self.engine.on_day_transition_if_needed(lock_ts)
         self.engine.lock_atm_for_day(lock_ts, float(spot_ltp))
+        _restore_open_positions(self.engine, self.broker, now.date())
 
     def _fetch_option_history(self, option_symbol: str) -> pd.DataFrame:
         today = datetime.now().date()
@@ -217,7 +281,12 @@ class LiveFeedRunner:
                 latest_ts.to_pydatetime() if hasattr(latest_ts, "to_pydatetime") else latest_ts
             )
             self._startup_baselined.add(side)
-            logger.info("baselined %s at %s; historical bars will not create orders", side, self._last_bar_time[side])
+            logger.info(
+                "baselined %s at %s; historical bars will not create orders, "
+                "new live signals remain enabled",
+                side,
+                self._last_bar_time[side],
+            )
             return
         if last_ts is not None:
             closed = closed[closed["datetime"] > last_ts]
@@ -288,6 +357,7 @@ class LiveFeedRunner:
             "LiveFeedRunner starting (spot=%s exchange=%s tf=%sm)",
             self.cfg.spot_symbol, self.cfg.exchange_spot, self.cfg.timeframe_minutes,
         )
+        _print_persisted_trade_alerts(self.engine.strategy_name, datetime.now().date())
 
         # ── Market-hours awareness ───────────────────────────────────────
         if not self._is_market_open():
@@ -347,6 +417,24 @@ class LiveFeedRunner:
             setup_status = self.engine.signal_provider.format_setup_status(side_state)
             if setup_status:
                 lines.append(f"│     Setup: {setup_status}")
+            if side_state.position is not None:
+                pos = side_state.position
+                current_ltp = self.engine.broker.get_ltp(pos.option_symbol)
+                pnl_entry = self.engine._pnl_entry_price(pos)
+                unrealized_pnl = (current_ltp - pnl_entry) * pos.quantity
+                lines.append(
+                    f"│     Trade: LONG entry={pos.entry_price:.2f} current={current_ltp:.2f} "
+                    f"SL={pos.option_stop_level:.2f} qty={pos.quantity}/{pos.initial_quantity} "
+                    f"P&L={unrealized_pnl:+.2f}"
+                )
+            elif side_state.pending_entry is not None:
+                pending = side_state.pending_entry
+                lines.append(
+                    f"│     Trade: PENDING trigger={pending.option_trigger_level:.2f} "
+                    f"SL={pending.option_stop_level:.2f} qty={pending.quantity}"
+                )
+            else:
+                lines.append("│     Trade: FLAT")
             return "\n".join(lines)
 
         rsi_str = f"{side_state.last_rsi:.1f}" if side_state.last_rsi is not None else "--"
@@ -403,11 +491,27 @@ class LiveFeedRunner:
 
         print(f"\n┌─── {now.strftime('%H:%M:%S')} ─── Strategy Status {'─' * 30}┐")
         print(f"│ Strikes: {state.ce_symbol} / {state.pe_symbol}")
+        unrealized_pnl = self.engine._get_unrealized_pnl()
         print(
             f"│ SL hits: {state.sl_hits_today}/{self.engine.risk.max_sl_per_day}"
             f"   Entries today: {self.engine.total_entries}"
-            f"   PnL: {self.engine.realized_pnl:+.1f}"
+            f"   PnL: {self.engine.realized_pnl + unrealized_pnl:+.1f}"
         )
+        today_alerts = [
+            alert for alert in self.engine.alerts
+            if alert.timestamp.date() == state.trading_day
+            and alert.category in ("ENTRY", "EXIT")
+        ]
+        for category in ("ENTRY", "EXIT"):
+            matching = [alert for alert in today_alerts if alert.category == category]
+            latest = matching[-1] if matching else None
+            previous_time = self._shown_alert_times[category]
+            if latest is not None and (previous_time is None or latest.timestamp > previous_time):
+                self._shown_alert_times[category] = latest.timestamp
+                alert = matching[-1]
+                print(f"│ Last {category.lower()}: [{alert.timestamp.strftime('%H:%M:%S')}] {alert.message}")
+            else:
+                print(f"│ Last {category.lower()}: --")
         print(f"├{'─' * 62}┤")
         print(ce_status)
         print(pe_status)
@@ -460,6 +564,7 @@ class MultiEngineLiveFeedRunner:
         for _, engine in self.engines:
             engine.on_day_transition_if_needed(lock_ts)
             engine.lock_atm_for_day(lock_ts, float(spot_ltp))
+            _restore_open_positions(engine, self.broker, now.date())
 
     def _fetch_option_history(self, option_symbol: str) -> pd.DataFrame:
         today = datetime.now().date()
@@ -509,7 +614,12 @@ class MultiEngineLiveFeedRunner:
                 latest_ts.to_pydatetime() if hasattr(latest_ts, "to_pydatetime") else latest_ts
             )
             self._startup_baselined.add(side)
-            logger.info("baselined %s at %s; historical bars will not create orders", side, self._last_bar_time[side])
+            logger.info(
+                "baselined %s at %s; historical bars will not create orders, "
+                "new live signals remain enabled",
+                side,
+                self._last_bar_time[side],
+            )
             return
         if last_ts is not None:
             closed = closed[closed["datetime"] > last_ts]
@@ -577,6 +687,8 @@ class MultiEngineLiveFeedRunner:
             "MultiEngineLiveFeedRunner starting [%s] (spot=%s tf=%sm)",
             names, self.cfg.spot_symbol, self.cfg.timeframe_minutes,
         )
+        for engine in self.engines:
+            _print_persisted_trade_alerts(engine.strategy_name, datetime.now().date())
 
         # ── Market-hours awareness ───────────────────────────────────────
         if not self._is_market_open():

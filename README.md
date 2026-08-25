@@ -63,6 +63,20 @@ contain `timestamp,side,price`, with ISO timestamps in IST. Defaults are a
 10-second sustained premium above 180, 130 units, a 20-point stop loss, and a
 40-point target. Use `--quantity` and `--sustain-seconds` for overrides.
 
+### EMA21 Profit Booking and Trailing Stop
+
+EMA21 uses the filled option entry price and initial stop loss to calculate
+risk (`1R`). For a 2-lot position:
+
+- At `1.5R`, the stop loss moves to the entry price (breakeven).
+- At `2.0R`, one lot is booked with a market exit and the remaining lot stays open.
+- After `2.0R`, the remaining lot's stop loss advances by `0.5R` for each additional
+	`0.5R` milestone. The stop can only move in the profitable direction.
+
+For a 1-lot position, no partial booking occurs: the lot remains open after
+`1.5R` and is trailed until the active trailing SL is hit. Failed or unavailable
+LTP responses do not trigger a false trailing-stop exit.
+
 For a one-week OpenAlgo historical run using 1-minute closes as the available
 historical approximation of ticks:
 

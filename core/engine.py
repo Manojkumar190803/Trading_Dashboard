@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import logging
+import csv
 from datetime import date, datetime, time, timedelta
+from pathlib import Path
 from typing import Any, Optional
 
 import pandas as pd
@@ -72,6 +74,7 @@ class BaseStrategyEngine:
         self._verbose_header_printed: bool = False
         self.capture_trace: bool = False
         self.trace_rows: list[dict[str, Any]] = []
+        self.persist_alerts: bool = False
 
     @property
     def strategy_name(self) -> str:
@@ -174,7 +177,45 @@ class BaseStrategyEngine:
         self.alerts.append(StrategyAlert(timestamp=ts, category=category, message=message))
         if len(self.alerts) > 500:
             self.alerts = self.alerts[-500:]
+        if self.persist_alerts and category in ("ENTRY", "EXIT"):
+            self._persist_trade_alert(ts, category, message)
         print(f"[ENGINE][{category}] {message}")
+
+    def restore_open_position(
+        self,
+        side: str,
+        quantity: int,
+        entry_price: float,
+        entry_time: datetime,
+        stop_level: float,
+        entry_trigger: float,
+        risk_points: float,
+    ) -> None:
+        """Restore broker-confirmed live state after a process restart."""
+        side_state = self._side_state(side)
+        if side_state.position is not None or quantity <= 0:
+            return
+        side_state.position = Position(
+            option_symbol=side_state.option_symbol or "",
+            option_type=side,
+            quantity=quantity,
+            initial_quantity=quantity,
+            entry_price=entry_price,
+            entry_time=entry_time,
+            option_stop_level=stop_level,
+            option_entry_trigger=entry_trigger,
+            option_risk_points=risk_points,
+        )
+
+    def _persist_trade_alert(self, ts: datetime, category: str, message: str) -> None:
+        path = Path("logs") / f"trade_alerts_{ts:%Y%m%d}.csv"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        needs_header = not path.exists()
+        with path.open("a", newline="", encoding="utf-8") as handle:
+            writer = csv.writer(handle)
+            if needs_header:
+                writer.writerow(("timestamp", "strategy", "category", "message"))
+            writer.writerow((ts.isoformat(sep=" "), self.strategy_name, category, message))
 
     @staticmethod
     def _fmt_candle_context(row: pd.Series, symbol: str, ema21_only: bool = False) -> str:
@@ -209,8 +250,6 @@ class BaseStrategyEngine:
         return self.state.ce if side == "CE" else self.state.pe
 
     def _pnl_entry_price(self, pos: Position) -> float:
-        if self._is_ema21_strategy():
-            return pos.option_entry_trigger
         return pos.entry_price
 
     def _get_unrealized_pnl(self) -> float:
@@ -251,7 +290,7 @@ class BaseStrategyEngine:
         self._record_alert(
             ts,
             "EXIT",
-            f"{reason}: exited qty={qty} at {exit_ltp:.2f}, "
+            f"{reason}: exited {pos.option_type} {pos.option_symbol} qty={qty} at {exit_ltp:.2f}, "
             f"pnl_entry={pnl_entry_price:.2f}, trade_pnl={trade_pnl:.2f}, "
             f"remaining={pos.quantity}",
         )
@@ -483,29 +522,15 @@ class BaseStrategyEngine:
         trigger_level = entry_level
 
         if self._is_ema21_strategy():
-            option_ltp = self.broker.get_ltp(side_state.option_symbol)
-            self.broker.place_market_order(side_state.option_symbol, OrderSide.BUY, quantity)
-            side_state.position = Position(
-                option_symbol=side_state.option_symbol,
-                option_type=side,
-                quantity=quantity,
-                initial_quantity=quantity,
-                entry_price=option_ltp,
-                entry_time=ts,
-                option_stop_level=stop_level,
-                option_entry_trigger=trigger_level,
-                option_risk_points=risk_points,
+            order_id = self.broker.place_stop_limit_order(
+                side_state.option_symbol,
+                OrderSide.BUY,
+                quantity,
+                trigger_price=trigger_level,
+                limit_price=trigger_level + self.cfg.entry_limit_buffer_points,
             )
-            self.total_entries += 1
-            self.signal_provider.reset_after_entry(side_state)
-            self._record_alert(
-                ts, "ENTRY",
-                f"Entered {side} {side_state.option_symbol} @ {option_ltp:.2f}, "
-                f"alert_trigger={trigger_level:.2f}, SL={stop_level:.2f}, "
-                f"option_risk={risk_points:.2f}",
-            )
-            print(self._fmt_candle_context(row, side_state.option_symbol, True))
-            return
+        else:
+            order_id = None
 
         side_state.pending_entry = PendingEntry(
             signal=Signal.BUY_CE if side == "CE" else Signal.BUY_PE,
@@ -516,6 +541,7 @@ class BaseStrategyEngine:
             option_stop_level=stop_level,
             trigger_candle_high=float(row["high"]),
             trigger_candle_low=float(row["low"]),
+            order_id=order_id,
         )
 
         self._record_alert(
@@ -525,6 +551,27 @@ class BaseStrategyEngine:
             f"option_risk={risk_points:.2f}",
         )
         print(self._fmt_candle_context(row, side_state.option_symbol, self._is_ema21_strategy()))
+        if self._is_ema21_strategy() and self.broker.is_replay and float(row["high"]) >= trigger_level:
+            side_state.position = Position(
+                option_symbol=side_state.option_symbol,
+                option_type=side,
+                quantity=quantity,
+                initial_quantity=quantity,
+                entry_price=trigger_level,
+                entry_time=ts,
+                option_stop_level=stop_level,
+                option_entry_trigger=trigger_level,
+                option_risk_points=risk_points,
+            )
+            side_state.pending_entry = None
+            self.total_entries += 1
+            self.signal_provider.reset_after_entry(side_state)
+            self._record_alert(
+                ts, "ENTRY",
+                f"Entered {side} {side_state.option_symbol} @ {trigger_level:.2f}, "
+                f"qty={quantity}, trigger={trigger_level:.2f}, SL={stop_level:.2f}, "
+                f"option_risk={risk_points:.2f}",
+            )
 
     def try_fill_pending_entry(
         self,
@@ -535,6 +582,39 @@ class BaseStrategyEngine:
     ) -> None:
         pending = side_state.pending_entry
         if pending is None:
+            return
+
+        if self._is_ema21_strategy() and not self.broker.is_replay:
+            status = self.broker.get_order_status(pending.order_id or "")
+            order_status = str(status.get("order_status") or status.get("status") or "").lower()
+            if order_status in {"cancelled", "rejected", "failed"}:
+                self._record_alert(ts, "CANCEL", f"{side} EMA21 entry order {order_status}")
+                side_state.pending_entry = None
+            elif order_status in {"complete", "filled", "executed"}:
+                option_ltp = float(
+                    status.get("average_price") or status.get("price") or pending.option_trigger_level
+                )
+                side_state.position = Position(
+                    option_symbol=pending.option_symbol,
+                    option_type=side,
+                    quantity=pending.quantity,
+                    initial_quantity=pending.quantity,
+                    entry_price=option_ltp,
+                    entry_time=ts,
+                    option_stop_level=pending.option_stop_level,
+                    option_entry_trigger=pending.option_trigger_level,
+                    option_risk_points=abs(pending.option_trigger_level - pending.option_stop_level),
+                )
+                side_state.pending_entry = None
+                self.total_entries += 1
+                self.signal_provider.reset_after_entry(side_state)
+                self._record_alert(
+                    ts, "ENTRY",
+                    f"Entered {side} {pending.option_symbol} @ {option_ltp:.2f}, "
+                    f"qty={pending.quantity}, trigger={pending.option_trigger_level:.2f}, "
+                    f"SL={pending.option_stop_level:.2f}, "
+                    f"option_risk={abs(pending.option_trigger_level - pending.option_stop_level):.2f}",
+                )
             return
 
         # Cancel pending after configured number of candles from setup bar.
@@ -619,11 +699,11 @@ class BaseStrategyEngine:
 
     # ── position monitoring ────────────────────────────────────────
 
-    @staticmethod
-    def compute_rr_progress(pos: Position, row: pd.Series) -> float:
+    def compute_rr_progress(self, pos: Position, row: pd.Series) -> float:
         if pos.option_risk_points <= 0:
             return 0.0
-        favorable_move = float(row["high"]) - pos.option_entry_trigger
+        rr_entry = pos.entry_price if self._is_ema21_strategy() else pos.option_entry_trigger
+        favorable_move = float(row["high"]) - rr_entry
         return favorable_move / pos.option_risk_points
 
     def execute_partial_exit(
@@ -649,9 +729,10 @@ class BaseStrategyEngine:
     def manage_targets(self, side_state: BaseSideState, row: pd.Series) -> None:
         """FRD §6: Step-trailing SL logic.
 
-        - 1-lot: full exit at 1.5 RR.
-        - 2-lot: at 1.5 RR arm BE, at 2.0 RR book 1 lot + start trailing,
-          then trail remaining lot every 0.5 RR indefinitely.
+                - At 1.5 RR arm breakeven for every position size.
+                - 2-lot: at 2.0 RR book 1 lot, then trail the remaining lot every
+                    0.5 RR indefinitely.
+                - 1-lot: keep the lot open and trail it until the trailing SL hits.
         """
         pos = side_state.position
         if pos is None:
@@ -661,22 +742,12 @@ class BaseStrategyEngine:
         lot_qty = self.cfg.option_lot_size
         ir = pos.option_risk_points
 
-        # 1-lot path: full exit at 1.5 RR.
-        if pos.initial_quantity == lot_qty:
-            if rr >= self.cfg.t1_rr and not pos.t1_done:
-                self.execute_partial_exit(
-                    side_state, pos.quantity,
-                    f"Target hit (1:{self.cfg.t1_rr} RR) - full exit (1-lot)",
-                )
-                pos.t1_done = True
-            return
-
-        # 2-lot path with step-trailing.
-        # Phase 2: At 1.5 RR — arm breakeven.
+        # At 1.5 RR — arm breakeven for both 1-lot and 2-lot positions.
         if rr >= self.cfg.t1_rr and not pos.t1_done:
             pos.breakeven_armed = True
             pos.t1_done = True
             pos.trailing_sl_level = pos.entry_price
+            pos.option_stop_level = pos.entry_price
             pos.highest_rr_step = 1.5
             self._record_alert(
                 self.last_processed_candle_time or pos.entry_time,
@@ -685,7 +756,7 @@ class BaseStrategyEngine:
             )
 
         # Phase 3: At 2.0 RR — partial exit 1 lot.
-        if rr >= self.cfg.t2_rr and not pos.t2_done:
+        if pos.initial_quantity > lot_qty and rr >= self.cfg.t2_rr and not pos.t2_done:
             self.execute_partial_exit(
                 side_state, lot_qty,
                 f"2.0 RR hit — booked 1 lot",
@@ -702,6 +773,7 @@ class BaseStrategyEngine:
                 new_sl = pos.entry_price + (current_step - 1.5) * ir
                 if pos.trailing_sl_level is None or new_sl > pos.trailing_sl_level:
                     pos.trailing_sl_level = new_sl
+                    pos.option_stop_level = new_sl
                     pos.highest_rr_step = current_step
                     self._record_alert(
                         self.last_processed_candle_time or pos.entry_time,
@@ -716,6 +788,8 @@ class BaseStrategyEngine:
             return
         sl_level = pos.trailing_sl_level if pos.trailing_sl_level is not None else pos.entry_price
         option_ltp = self.broker.get_ltp(pos.option_symbol)
+        if option_ltp <= 0:
+            return
         if option_ltp <= sl_level:
             self._exit_position(
                 side_state,
@@ -744,9 +818,6 @@ class BaseStrategyEngine:
             )
             return
 
-        if self._is_ema21_strategy():
-            return
-
         self.manage_targets(side_state, row)
         self.check_trailing_stop(side_state, row=row)
 
@@ -769,8 +840,8 @@ class BaseStrategyEngine:
         Handles:
         - Hard SL exit
         - Step-trailing SL advancement + exit
-        - Partial exit at 2.0 RR
-        - 1-lot full exit at 1.5 RR
+        - Partial exit at 2.0 RR for multi-lot positions
+        - Breakeven at 1.5 RR and trailing for every position size
         """
         side_state = self._side_state(side)
         pos = side_state.position
@@ -780,32 +851,6 @@ class BaseStrategyEngine:
         self.last_processed_candle_time = ts
         ir = pos.option_risk_points
         if ir <= 0:
-            return
-
-        if self._is_ema21_strategy():
-            if ltp <= pos.option_stop_level:
-                self._exit_position(
-                    side_state,
-                    ts,
-                    pos.quantity,
-                    f"Stop hit (tick): LTP {ltp:.2f} <= SL {pos.option_stop_level:.2f}",
-                    is_hard_sl=True,
-                )
-                return
-
-            rr = (ltp - pos.entry_price) / ir
-            if rr >= 1.0:
-                pos.breakeven_armed = True
-                current_step = int(rr / 0.5) * 0.5
-                if current_step > pos.highest_rr_step:
-                    pos.highest_rr_step = current_step
-                    pos.trailing_sl_level = pos.entry_price + (current_step - 1.0) * ir
-                    pos.option_stop_level = pos.trailing_sl_level
-                    self._record_alert(
-                        ts,
-                        "TSL",
-                        f"{pos.option_type} {current_step:.1f} RR (tick) — SL={pos.option_stop_level:.2f}",
-                    )
             return
 
         # Hard SL check.
@@ -818,31 +863,21 @@ class BaseStrategyEngine:
             return
 
         # Compute current RR from tick LTP.
-        rr = (ltp - pos.option_entry_trigger) / ir
+        rr_entry = pos.entry_price if self._is_ema21_strategy() else pos.option_entry_trigger
+        rr = (ltp - rr_entry) / ir
         lot_qty = self.cfg.option_lot_size
 
-        # 1-lot: full exit at 1.5 RR.
-        if pos.initial_quantity == lot_qty:
-            if rr >= self.cfg.t1_rr and not pos.t1_done:
-                pos.t1_done = True
-                self._exit_position(
-                    side_state, ts, pos.quantity,
-                    f"Target hit (tick): {self.cfg.t1_rr} RR — full exit (1-lot)",
-                    is_hard_sl=False,
-                )
-            return
-
-        # 2-lot path.
-        # Phase 2: 1.5 RR — arm breakeven.
+        # At 1.5 RR — arm breakeven for both 1-lot and 2-lot positions.
         if rr >= self.cfg.t1_rr and not pos.t1_done:
             pos.breakeven_armed = True
             pos.t1_done = True
             pos.trailing_sl_level = pos.entry_price
+            pos.option_stop_level = pos.entry_price
             pos.highest_rr_step = 1.5
             self._record_alert(ts, "TSL", f"{pos.option_type} 1.5 RR (tick) — SL to entry")
 
         # Phase 3: 2.0 RR — partial exit.
-        if rr >= self.cfg.t2_rr and not pos.t2_done:
+        if pos.initial_quantity > lot_qty and rr >= self.cfg.t2_rr and not pos.t2_done:
             self.execute_partial_exit(side_state, lot_qty, f"2.0 RR (tick) — booked 1 lot")
             if side_state.position is None:
                 return
@@ -856,6 +891,7 @@ class BaseStrategyEngine:
                 new_sl = pos.entry_price + (current_step - 1.5) * ir
                 if pos.trailing_sl_level is None or new_sl > pos.trailing_sl_level:
                     pos.trailing_sl_level = new_sl
+                    pos.option_stop_level = new_sl
                     pos.highest_rr_step = current_step
                     self._record_alert(ts, "TSL", f"{pos.option_type} {current_step:.1f} RR (tick) — TSL={new_sl:.2f}")
 

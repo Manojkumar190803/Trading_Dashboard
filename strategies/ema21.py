@@ -88,10 +88,10 @@ class EMA21SignalProvider(SignalProvider):
 
     def compute_risk_points(self, side_state: BaseSideState, row: pd.Series) -> Optional[float]:
         assert isinstance(side_state, EMA21SideState)
-        if side_state.first_red_low is None or side_state.first_red_high is None:
+        if side_state.setup_candle_low is None or side_state.first_red_high is None:
             return None
-        trigger = side_state.first_red_high + 1.0
-        stop = side_state.first_red_low
+        trigger = side_state.first_red_high
+        stop = side_state.setup_candle_low
         return trigger - stop
 
     def compute_entry_lots(self, row: pd.Series, cfg: StrategyConfig) -> int:
@@ -99,9 +99,9 @@ class EMA21SignalProvider(SignalProvider):
 
     def compute_stop_level(self, side_state: BaseSideState, row: pd.Series) -> float:
         assert isinstance(side_state, EMA21SideState)
-        if side_state.first_red_low is None:
-            raise ValueError("EMA21 entry candle is not available")
-        return side_state.first_red_low
+        if side_state.setup_candle_low is None:
+            raise ValueError("EMA21 setup candle is not available")
+        return side_state.setup_candle_low
 
     def reset_after_entry(self, side_state: BaseSideState) -> None:
         assert isinstance(side_state, EMA21SideState)

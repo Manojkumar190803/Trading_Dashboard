@@ -98,6 +98,7 @@ class PendingEntry:
     option_stop_level: float
     trigger_candle_high: float
     trigger_candle_low: float
+    order_id: Optional[str] = None
 
 
 @dataclass

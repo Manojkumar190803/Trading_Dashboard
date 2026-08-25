@@ -21,6 +21,12 @@ class BrokerInterface:
     def get_ltp(self, symbol: str) -> float:
         raise NotImplementedError
 
+    def get_position_book(self) -> list[dict[str, object]]:
+        raise NotImplementedError
+
+    def get_order_status(self, order_id: str) -> dict[str, object]:
+        raise NotImplementedError
+
     def place_stop_limit_order(
         self,
         symbol: str,
@@ -64,6 +70,12 @@ class ConsoleBroker(BrokerInterface):
     def get_ltp(self, symbol: str) -> float:
         print(f"[BROKER] get_ltp {symbol} -> {self.ltp_fallback}")
         return self.ltp_fallback
+
+    def get_position_book(self) -> list[dict[str, object]]:
+        return []
+
+    def get_order_status(self, order_id: str) -> dict[str, object]:
+        return {"order_status": "complete", "orderid": order_id, "price": self.ltp_fallback}
 
     def place_stop_limit_order(
         self,
@@ -128,9 +140,12 @@ class OpenAlgoBroker(BrokerInterface):
         strike_step: int,
         preferred_weekday: Optional[int] = None,
     ) -> Optional[date]:
-        """Probe option symbols to find the nearest tradable expiry.
+        """Probe option symbols to find the next tradable expiry.
 
-        This handles broker feeds that don't expose explicit weekly/monthly expiry metadata.
+        The trade day itself is excluded because these strategies carry the
+        selected contract into the session and must not select an expiry that
+        expires today. This handles broker feeds that don't expose explicit
+        weekly/monthly expiry metadata.
         """
         root = (index_symbol or "").upper().strip()
         key = (
@@ -151,7 +166,7 @@ class OpenAlgoBroker(BrokerInterface):
 
         # Prioritize the configured/script-specific expiry weekday first.
         if preferred_weekday is not None and 0 <= preferred_weekday <= 6:
-            for day_offset in range(0, 70):
+            for day_offset in range(1, 70):
                 d = trade_day + timedelta(days=day_offset)
                 if d.weekday() == preferred_weekday:
                     candidate_days.append(d)
@@ -163,7 +178,7 @@ class OpenAlgoBroker(BrokerInterface):
             if preferred_weekday is not None and wd == preferred_weekday:
                 continue
             count = 0
-            for day_offset in range(0, 35):
+            for day_offset in range(1, 35):
                 d = trade_day + timedelta(days=day_offset)
                 if d.weekday() == wd:
                     if d not in candidate_days:
@@ -221,19 +236,53 @@ class OpenAlgoBroker(BrokerInterface):
 
     def get_ltp(self, symbol: str) -> float:
         exchange = self._infer_exchange(symbol)
-        try:
-            resp = self.client.quotes(symbol=symbol, exchange=exchange)
-        except Exception as exc:
-            logger.warning("quotes(%s) error: %s", symbol, exc)
-            return 0.0
+        for attempt in range(3):
+            try:
+                resp = self.client.quotes(symbol=symbol, exchange=exchange)
+            except Exception as exc:
+                logger.warning("quotes(%s) error: %s", symbol, exc)
+                return 0.0
 
-        if isinstance(resp, dict) and resp.get("status") == "success":
-            data = resp.get("data") or {}
-            ltp = data.get("ltp") or resp.get("ltp")
-            if ltp is not None:
-                return round(float(ltp), 2)
-        logger.warning("quotes(%s) unexpected response: %s", symbol, resp)
+            if isinstance(resp, dict) and resp.get("status") == "success":
+                data = resp.get("data") or {}
+                ltp = data.get("ltp") or resp.get("ltp")
+                if ltp is not None:
+                    return round(float(ltp), 2)
+
+            message = str(resp.get("message") if isinstance(resp, dict) else resp)
+            if "429" not in message or attempt == 2:
+                logger.warning("quotes(%s) unexpected response: %s", symbol, resp)
+                return 0.0
+            delay = 0.5 * (attempt + 1)
+            logger.warning("quotes(%s) rate-limited; retrying in %.1fs", symbol, delay)
+            time_module.sleep(delay)
         return 0.0
+
+    def get_position_book(self) -> list[dict[str, object]]:
+        try:
+            response = self.client.positionbook()
+        except Exception as exc:
+            logger.warning("positionbook error: %s", exc)
+            return []
+        if not isinstance(response, dict) or response.get("status") != "success":
+            logger.warning("positionbook unexpected response: %s", response)
+            return []
+        data = response.get("data")
+        if not isinstance(data, list):
+            return []
+        return [row for row in data if isinstance(row, dict)]
+
+    def get_order_status(self, order_id: str) -> dict[str, object]:
+        try:
+            response = self.client.orderstatus(order_id=order_id, strategy=self.strategy_tag)
+        except Exception as exc:
+            logger.warning("orderstatus(%s) error: %s", order_id, exc)
+            return {}
+        if not isinstance(response, dict) or response.get("status") != "success":
+            logger.warning("orderstatus(%s) unexpected response: %s", order_id, response)
+            return {}
+        data = response.get("data")
+        return data if isinstance(data, dict) else {}
 
     def place_stop_limit_order(
         self,

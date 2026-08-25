@@ -224,8 +224,10 @@ def _run_smoke(cfg: StrategyConfig) -> None:
 def _run_live(cfg: StrategyConfig, risk: RiskConfig, signal_provider: SignalProvider, dry_run: bool, diagnose: bool, verbose: bool) -> None:
     broker = _build_broker(cfg, dry_run=dry_run)
     engine = BaseStrategyEngine(cfg, risk, broker, signal_provider)
+    engine.persist_alerts = True
     engine.diagnose = diagnose
     engine.verbose = verbose
+    print("[ORDER ROUTING] " + ("PAPER mode: orders are simulated" if dry_run else "LIVE mode: orders will be sent to OpenAlgo"))
     runner = LiveFeedRunner(engine, broker, cfg)
     try:
         runner.run_forever()
@@ -248,8 +250,10 @@ def _run_multi_live(
     for name in strategy_names:
         provider = get_signal_provider(name, args)
         engine = BaseStrategyEngine(cfg, risk, broker, provider)
+        engine.persist_alerts = True
         engine.diagnose = diagnose
         engine.verbose = verbose
+        print("[ORDER ROUTING] " + ("PAPER mode: orders are simulated" if dry_run else "LIVE mode: orders will be sent to OpenAlgo"))
         engines.append((name, engine))
     runner = MultiEngineLiveFeedRunner(engines, broker, cfg)
     try:

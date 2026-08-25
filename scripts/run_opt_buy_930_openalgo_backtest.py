@@ -113,10 +113,21 @@ def run_openalgo_live(profile: dict[str, object], dry_run: bool = True, stop_eve
     """Run the 09:30 strategy by polling quotes until its session is complete."""
     broker = _broker_from_env(profile, dry_run)
     config = OptBuy930Config(quantity=130, lot_size=int(profile["option_lot_size"]))
+    logger.info(
+        "OPT-Buy live started (spot=%s dry_run=%s); waiting for scan at 09:25",
+        profile["spot_symbol"], dry_run,
+    )
+    last_wait_log = 0.0
     while datetime.now().time() < time(9, 25):
         if stop_event is not None and stop_event.is_set():
+            logger.info("OPT-Buy live stopped before scan")
             return
+        now_monotonic = time_module.monotonic()
+        if now_monotonic - last_wait_log >= 30:
+            logger.info("OPT-Buy waiting for 09:25 scan; current time=%s", datetime.now().strftime("%H:%M:%S"))
+            last_wait_log = now_monotonic
         time_module.sleep(1)
+    logger.info("OPT-Buy scan starting")
     spot = broker.get_ltp(str(profile["spot_symbol"]))
     if spot <= 0:
         logger.error(
@@ -130,6 +141,7 @@ def run_openalgo_live(profile: dict[str, object], dry_run: bool = True, stop_eve
     expiry = broker.resolve_nearest_expiry(str(profile["option_index_symbol"]), datetime.now().date(), atm, step, int(profile["weekly_expiry_weekday"]))
     if expiry is None:
         raise RuntimeError("unable to resolve OPT-Buy expiry")
+    logger.info("OPT-Buy spot=%.2f ATM=%s next_expiry=%s; probing option quotes", spot, atm, expiry)
     candidates = []
     for offset in range(-8, 9):
         for side in ("CE", "PE"):
@@ -138,6 +150,15 @@ def run_openalgo_live(profile: dict[str, object], dry_run: bool = True, stop_eve
             premium = broker.get_ltp(symbol)
             if premium:
                 candidates.append(OptionCandidate(symbol, side, strike, premium))
+            time_module.sleep(0.15)
+    logger.info("OPT-Buy quote scan complete: %d valid candidates", len(candidates))
+    for side in ("CE", "PE"):
+        premiums = [candidate.premium for candidate in candidates if candidate.side == side]
+        if premiums:
+            logger.info(
+                "OPT-Buy %s premiums: min=%.2f max=%.2f count=%d",
+                side, min(premiums), max(premiums), len(premiums),
+            )
     from strategies.opt_buy_930 import OptBuy930Strategy
     strategy = OptBuy930Strategy(config)
     try:
@@ -145,17 +166,36 @@ def run_openalgo_live(profile: dict[str, object], dry_run: bool = True, stop_eve
     except ValueError:
         logger.error(
             "OPT-Buy cannot start: CE and PE quotes were unavailable or outside "
-            "the premium selection range. Check the broker session and option symbols."
+            "the premium selection range (%.2f +/- %.2f). Check the premium "
+            "range, broker session, and option symbols.",
+            config.reference_premium, config.max_selection_distance,
         )
         return
     logger.info("OPT-Buy watchlist: %s", {side: item.symbol for side, item in strategy.state.selected.items()})
+    logger.info("OPT-Buy watching for entries from 09:30 to 09:45")
+    last_heartbeat = 0.0
     while datetime.now().time() < config.hard_exit_time and (stop_event is None or not stop_event.is_set()):
         now = datetime.now()
+        now_monotonic = time_module.monotonic()
+        if now_monotonic - last_heartbeat >= 30:
+            logger.info(
+                "OPT-Buy heartbeat: status=%s time=%s selected=%s",
+                strategy.state.session_status,
+                now.strftime("%H:%M:%S"),
+                {side: item.symbol for side, item in strategy.state.selected.items()},
+            )
+            last_heartbeat = now_monotonic
         for side, candidate in strategy.state.selected.items():
             price = broker.get_ltp(candidate.symbol)
             if price:
                 if strategy.state.trade is None:
-                    strategy.process_tick(side, price, now)
+                    trade = strategy.process_tick(side, price, now)
+                    if trade is not None:
+                        logger.info(
+                            "OPT-Buy entry: side=%s symbol=%s price=%.2f qty=%s SL=%.2f target=%.2f",
+                            trade.side, trade.symbol, trade.entry_price, trade.quantity,
+                            trade.stop_loss, trade.target,
+                        )
                 else:
                     strategy.process_position_tick(price, now)
                     strategy.process_time(price, now)
@@ -163,3 +203,7 @@ def run_openalgo_live(profile: dict[str, object], dry_run: bool = True, stop_eve
             logger.info("OPT-Buy trade closed: %s", strategy.state.trade)
             return
         time_module.sleep(1)
+    if stop_event is not None and stop_event.is_set():
+        logger.info("OPT-Buy live stopped; final status=%s", strategy.state.session_status)
+    else:
+        logger.info("OPT-Buy session complete at 10:00; final status=%s", strategy.state.session_status)
