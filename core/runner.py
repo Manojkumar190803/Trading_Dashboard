@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import csv
+import json
 import os
 import re
 import threading
@@ -18,6 +19,129 @@ from core.models import RiskConfig, StrategyConfig
 from strategies.base import SignalProvider
 
 logger = logging.getLogger("core.runner")
+
+
+def _atm_lock_path(trading_day: date) -> Path:
+    return Path("logs") / f"atm_lock_{trading_day:%Y%m%d}.json"
+
+
+def _persist_atm_lock(engine: BaseStrategyEngine, spot_price: float) -> None:
+    if not engine.state.atm_locked or not engine.state.trading_day:
+        return
+    path = _atm_lock_path(engine.state.trading_day)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "trading_day": engine.state.trading_day.isoformat(),
+        "spot_price": spot_price,
+        "ce_symbol": engine.state.ce_symbol,
+        "pe_symbol": engine.state.pe_symbol,
+    }
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    temporary.replace(path)
+
+
+def _restore_atm_lock(engine: BaseStrategyEngine, trading_day: date) -> bool:
+    path = _atm_lock_path(trading_day)
+    if not path.exists():
+        return False
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        ce_symbol = str(payload["ce_symbol"])
+        pe_symbol = str(payload["pe_symbol"])
+        if not ce_symbol or not pe_symbol:
+            return False
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        logger.warning("could not restore ATM lock from %s: %s", path, exc)
+        return False
+
+    engine.on_day_transition_if_needed(datetime.combine(trading_day, engine.cfg.atm_lock_time))
+    engine.state.ce_symbol = ce_symbol
+    engine.state.pe_symbol = pe_symbol
+    engine.state.ce.option_symbol = ce_symbol
+    engine.state.pe.option_symbol = pe_symbol
+    engine.state.atm_locked = True
+    logger.info("restored ATM lock for %s: CE=%s PE=%s", trading_day, ce_symbol, pe_symbol)
+    return True
+
+
+def _restore_atm_lock_from_positions(
+    engine: BaseStrategyEngine,
+    broker: OpenAlgoBroker,
+    trading_day: date,
+) -> bool:
+    """Keep a restart aligned with an already-held option instrument."""
+    try:
+        positions = broker.get_position_book()
+    except Exception as exc:
+        logger.warning("could not inspect positions while restoring ATM lock: %s", exc)
+        return False
+
+    for position in positions:
+        symbol = str(position.get("symbol") or "")
+        quantity = int(float(position.get("quantity") or 0))
+        if quantity <= 0:
+            continue
+        try:
+            root, expiry_code, strike, option_type = _parse_option_symbol(symbol)
+        except ValueError:
+            continue
+        if root != engine.cfg.option_index_symbol:
+            continue
+        ce_symbol = build_option_symbol(root, expiry_code, strike, "CE")
+        pe_symbol = build_option_symbol(root, expiry_code, strike, "PE")
+        engine.on_day_transition_if_needed(datetime.combine(trading_day, engine.cfg.atm_lock_time))
+        engine.state.ce_symbol = ce_symbol
+        engine.state.pe_symbol = pe_symbol
+        engine.state.ce.option_symbol = ce_symbol
+        engine.state.pe.option_symbol = pe_symbol
+        engine.state.atm_locked = True
+        logger.warning(
+            "restored ATM lock for %s from held broker position: CE=%s PE=%s",
+            trading_day, ce_symbol, pe_symbol,
+        )
+        return True
+    return False
+
+
+def _restore_atm_lock_from_alerts(engine: BaseStrategyEngine, trading_day: date) -> bool:
+    """Recover the exact live-day strike from persisted entry alerts."""
+    path = Path("logs") / f"trade_alerts_{trading_day:%Y%m%d}.csv"
+    if not path.exists():
+        return False
+    try:
+        with path.open(newline="", encoding="utf-8") as handle:
+            rows = [
+                row for row in csv.DictReader(handle)
+                if row.get("strategy") == engine.strategy_name and row.get("category") == "ENTRY"
+            ]
+    except OSError as exc:
+        logger.warning("could not restore ATM lock from alerts: %s", exc)
+        return False
+    if not rows:
+        return False
+
+    symbols = re.findall(r"\b([A-Z]+\d{2}[A-Z]{3}\d{2}\d+(?:CE|PE))\b", str(rows[-1].get("message") or ""))
+    if not symbols:
+        return False
+    try:
+        root, expiry_code, strike, _ = _parse_option_symbol(symbols[-1])
+    except ValueError:
+        return False
+    if root != engine.cfg.option_index_symbol:
+        return False
+
+    engine.on_day_transition_if_needed(datetime.combine(trading_day, engine.cfg.atm_lock_time))
+    engine.state.ce_symbol = _build_option_symbol(root, expiry_code, strike, "CE")
+    engine.state.pe_symbol = _build_option_symbol(root, expiry_code, strike, "PE")
+    engine.state.ce.option_symbol = engine.state.ce_symbol
+    engine.state.pe.option_symbol = engine.state.pe_symbol
+    engine.state.atm_locked = True
+    logger.info(
+        "replay restored ATM lock for %s from alerts: CE=%s PE=%s",
+        trading_day, engine.state.ce_symbol, engine.state.pe_symbol,
+    )
+    return True
 
 
 def _print_persisted_trade_alerts(strategy_name: str, trading_day: date) -> None:
@@ -218,6 +342,12 @@ class LiveFeedRunner:
     def _try_lock_atm(self, now: datetime) -> None:
         if self.engine.state.atm_locked:
             return
+        if _restore_atm_lock(self.engine, now.date()):
+            _restore_open_positions(self.engine, self.broker, now.date())
+            return
+        if _restore_atm_lock_from_positions(self.engine, self.broker, now.date()):
+            _restore_open_positions(self.engine, self.broker, now.date())
+            return
         if now.time() < self.cfg.atm_lock_time:
             return
         try:
@@ -231,6 +361,7 @@ class LiveFeedRunner:
         lock_ts = datetime.combine(now.date(), self.cfg.atm_lock_time)
         self.engine.on_day_transition_if_needed(lock_ts)
         self.engine.lock_atm_for_day(lock_ts, float(spot_ltp))
+        _persist_atm_lock(self.engine, float(spot_ltp))
         _restore_open_positions(self.engine, self.broker, now.date())
 
     def _fetch_option_history(self, option_symbol: str) -> pd.DataFrame:
@@ -550,6 +681,30 @@ class MultiEngineLiveFeedRunner:
         first_engine = self.engines[0][1]
         if first_engine.state.atm_locked:
             return
+        if _restore_atm_lock(first_engine, now.date()):
+            lock_ts = datetime.combine(now.date(), self.cfg.atm_lock_time)
+            for _, engine in self.engines[1:]:
+                engine.on_day_transition_if_needed(lock_ts)
+                engine.state.ce_symbol = first_engine.state.ce_symbol
+                engine.state.pe_symbol = first_engine.state.pe_symbol
+                engine.state.ce.option_symbol = first_engine.state.ce_symbol
+                engine.state.pe.option_symbol = first_engine.state.pe_symbol
+                engine.state.atm_locked = True
+            for _, engine in self.engines:
+                _restore_open_positions(engine, self.broker, now.date())
+            return
+        if _restore_atm_lock_from_positions(first_engine, self.broker, now.date()):
+            lock_ts = datetime.combine(now.date(), self.cfg.atm_lock_time)
+            for _, engine in self.engines[1:]:
+                engine.on_day_transition_if_needed(lock_ts)
+                engine.state.ce_symbol = first_engine.state.ce_symbol
+                engine.state.pe_symbol = first_engine.state.pe_symbol
+                engine.state.ce.option_symbol = first_engine.state.ce_symbol
+                engine.state.pe.option_symbol = first_engine.state.pe_symbol
+                engine.state.atm_locked = True
+            for _, engine in self.engines:
+                _restore_open_positions(engine, self.broker, now.date())
+            return
         if now.time() < self.cfg.atm_lock_time:
             return
         try:
@@ -565,6 +720,7 @@ class MultiEngineLiveFeedRunner:
             engine.on_day_transition_if_needed(lock_ts)
             engine.lock_atm_for_day(lock_ts, float(spot_ltp))
             _restore_open_positions(engine, self.broker, now.date())
+        _persist_atm_lock(first_engine, float(spot_ltp))
 
     def _fetch_option_history(self, option_symbol: str) -> pd.DataFrame:
         today = datetime.now().date()
@@ -887,15 +1043,16 @@ def run_historical_replay(
 
         engine.reset_for_new_day(day)
         lock_ts = datetime.combine(day, cfg.atm_lock_time)
-        atm_strike = get_atm_strike(atm_price, cfg.strike_step)
-        expiry_day = history_broker.resolve_nearest_expiry(
-            cfg.option_index_symbol,
-            day,
-            atm_strike,
-            cfg.strike_step,
-            preferred_weekday=cfg.weekly_expiry_weekday,
-        )
-        engine.lock_atm_for_day(lock_ts, atm_price, expiry_day_override=expiry_day)
+        if not _restore_atm_lock_from_alerts(engine, day):
+            atm_strike = get_atm_strike(atm_price, cfg.strike_step)
+            expiry_day = history_broker.resolve_nearest_expiry(
+                cfg.option_index_symbol,
+                day,
+                atm_strike,
+                cfg.strike_step,
+                preferred_weekday=cfg.weekly_expiry_weekday,
+            )
+            engine.lock_atm_for_day(lock_ts, atm_price, expiry_day_override=expiry_day)
         ce_sym = engine.state.ce_symbol
         pe_sym = engine.state.pe_symbol
         assert ce_sym and pe_sym
@@ -1059,17 +1216,24 @@ def run_multi_historical_replay(
             continue
 
         lock_ts = datetime.combine(day, cfg.atm_lock_time)
-        atm_strike = get_atm_strike(atm_price, cfg.strike_step)
-        expiry_day = history_broker.resolve_nearest_expiry(
-            cfg.option_index_symbol,
-            day,
-            atm_strike,
-            cfg.strike_step,
-            preferred_weekday=cfg.weekly_expiry_weekday,
-        )
         for _, engine, _ in engines:
             engine.reset_for_new_day(day)
-            engine.lock_atm_for_day(lock_ts, atm_price, expiry_day_override=expiry_day)
+        if not _restore_atm_lock_from_alerts(engines[0][1], day):
+            atm_strike = get_atm_strike(atm_price, cfg.strike_step)
+            expiry_day = history_broker.resolve_nearest_expiry(
+                cfg.option_index_symbol,
+                day,
+                atm_strike,
+                cfg.strike_step,
+                preferred_weekday=cfg.weekly_expiry_weekday,
+            )
+            engines[0][1].lock_atm_for_day(lock_ts, atm_price, expiry_day_override=expiry_day)
+        for _, engine, _ in engines[1:]:
+            engine.state.ce_symbol = engines[0][1].state.ce_symbol
+            engine.state.pe_symbol = engines[0][1].state.pe_symbol
+            engine.state.ce.option_symbol = engine.state.ce_symbol
+            engine.state.pe.option_symbol = engine.state.pe_symbol
+            engine.state.atm_locked = True
 
         # All engines share the same ATM symbols
         ce_sym = engines[0][1].state.ce_symbol

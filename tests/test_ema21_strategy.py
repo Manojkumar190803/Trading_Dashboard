@@ -79,7 +79,7 @@ def test_provider_cancels_setup_when_confirmation_closes_on_ema():
 def test_engine_places_ema21_stop_entry_at_red_high():
     provider = EMA21SignalProvider()
     engine = BaseStrategyEngine(
-        StrategyConfig(max_option_risk_points=25.0),
+        StrategyConfig(max_option_risk_points=20.0),
         RiskConfig(max_sl_per_day=3),
         ConsoleBroker(ltp_fallback=107.0),
         provider,
@@ -119,7 +119,7 @@ def test_engine_places_ema21_stop_entry_at_red_high():
 def test_engine_does_not_create_order_when_entry_stop_gap_exceeds_25_points():
     provider = EMA21SignalProvider()
     engine = BaseStrategyEngine(
-        StrategyConfig(max_option_risk_points=25.0),
+        StrategyConfig(max_option_risk_points=20.0),
         RiskConfig(max_sl_per_day=3),
         ConsoleBroker(ltp_fallback=150.0),
         provider,
@@ -146,7 +146,7 @@ def test_engine_does_not_create_order_when_entry_stop_gap_exceeds_25_points():
 def test_engine_ema21_one_lot_trails_after_one_and_half_rr():
     provider = EMA21SignalProvider()
     engine = BaseStrategyEngine(
-        StrategyConfig(max_option_risk_points=25.0),
+        StrategyConfig(max_option_risk_points=20.0),
         RiskConfig(max_sl_per_day=3),
         ConsoleBroker(ltp_fallback=150.0),
         provider,
@@ -324,7 +324,7 @@ def test_replay_stop_limit_fill_is_rejected_when_limit_is_exceeded():
 def test_ema21_stop_entry_does_not_repeat_signal():
     provider = EMA21SignalProvider()
     engine = BaseStrategyEngine(
-        StrategyConfig(max_option_risk_points=25.0),
+        StrategyConfig(max_option_risk_points=20.0),
         RiskConfig(max_sl_per_day=3),
         HistoricalReplayBroker(),
         provider,

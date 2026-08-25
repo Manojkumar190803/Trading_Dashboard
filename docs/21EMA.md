@@ -38,7 +38,7 @@ first, second, or third confirmation candle. A position is created only after
 the broker confirms that the stop-limit order has filled. If a later confirmation candle
 closes at or below the EMA, any pending order is cancelled and any already-filled
 position is exited. The setup is discarded when the resulting initial risk
-exceeds 25 option-premium points.
+exceeds 20 option-premium points.
 
 After entry, the position remains open through the first 1R milestone. At 1R,
 the stop moves to entry price. Thereafter, the stop advances by 0.5R for every
@@ -89,7 +89,7 @@ ticks.
 | `entry_buffer_points` | 0.0 | No EMA21 entry buffer; retained for legacy strategies |
 | `stop_buffer_points` | 0.0 | EMA21 uses the setup candle low directly; legacy strategies may configure a buffer |
 | `entry_limit_buffer_points` | 0.5 | Retained for legacy stop-limit strategies |
-| `max_initial_risk_points` | 25.0 | Discard setup when initial risk is greater than this value |
+| `max_initial_risk_points` | 20.0 | Discard setup when initial risk is greater than this value |
 | `breakeven_rr` | 1.0 | Move stop to cost at 1R |
 | `trail_step_rr` | 0.5 | Advance stop at each additional 0.5R |
 | `max_trades_per_day` | 3 | Maximum filled entries per trading day |
@@ -122,7 +122,7 @@ ticks.
 | FR-12 | The first red confirmation candle shall define the exact stop-limit trigger as `red_candle_high`, without a trigger buffer; the red candle may be any of the next three confirmations. | Must |
 | FR-13 | The setup shall be cancelled if no red candle occurs in the three-candle window. | Must |
 | FR-14 | The system shall place one pending stop-limit entry at the first valid red candle high and activate the position only after broker fill confirmation. | Must |
-| FR-15 | The system shall discard the setup when `entry_trigger - initial_stop > 25.0` option-premium points, where `initial_stop` is the low of the setup candle. | Must |
+| FR-15 | The system shall discard the setup when `entry_trigger - initial_stop > 20.0` option-premium points, where `initial_stop` is the low of the setup candle. | Must |
 | FR-16 | A setup or pending entry shall be cancelled when its entry window reaches 14:45 IST without a confirmed fill. | Must |
 
 ### 5.3 Entry Execution
@@ -161,7 +161,7 @@ ticks.
 | FR-36 | The system shall persist the final option-premium exit price, exit timestamp, exit reason, realized P&L, order IDs, and cleanup result. | Must |
 | FR-37 | The system shall record the broker-confirmed stop-limit fill price for execution audit and use that price for EMA21 P&L calculations. | Must |
 | FR-38 | If an entry or exit order fails, the system shall record the failure and reconcile broker state before retrying. | Must |
-| FR-39 | If actual fill risk, calculated as `actual_entry_price - initial_stop`, is greater than 25 option-premium points, the system shall exit the filled quantity immediately and record the risk breach. | Must |
+| FR-39 | If actual fill risk, calculated as `actual_entry_price - initial_stop`, is greater than 20 option-premium points, the system shall exit the filled quantity immediately and record the risk breach. | Must |
 | FR-40 | The system shall lock new trading for the day after three filled trades exit at their initial or active stop-loss, regardless of the remaining filled-entry allowance. | Must |
 
 ## 6. State Machine
@@ -188,7 +188,7 @@ The strategy shall track one global session state and one setup/position state:
 | Setup candle does not close above EMA-21 | No setup is created |
 | A confirmation candle closes at or below EMA-21 | Cancel the setup |
 | No red candle in three confirmations | Cancel the setup |
-| More than 25 points initial risk | Discard the setup without placing an entry |
+| More than 20 points initial risk | Discard the setup without placing an entry |
 | EMA21 alert is generated | Submit a BUY stop-limit entry at the red candle high and retain pending state |
 | Entry or exit fails | Record the failure and reconcile broker state before retrying |
 | Entry cutoff reached before alert | Cancel the setup |
@@ -198,7 +198,7 @@ The strategy shall track one global session state and one setup/position state:
 | Process restarts with an open position | Reconcile broker position and stop orders before accepting any new setup |
 | Three filled entries reached | Cancel pending entries and lock new entries for the day |
 | Three trades exit at their stop-loss | Cancel pending entries and lock new entries for the day |
-| Actual fill risk exceeds 25 points | Exit the filled quantity immediately and record the risk breach |
+| Actual fill risk exceeds 20 points | Exit the filled quantity immediately and record the risk breach |
 | Later confirmation candle closes at or below EMA | Cancel setup; exit any already-filled position |
 | Exit order fails at 15:10 | Retry and alert until the broker confirms zero remaining quantity |
 
@@ -210,7 +210,7 @@ The system shall record:
 - Every completed candle's close, EMA-21, and signal-evaluation result.
 - Setup candle OHLC, EMA-21, initial stop, confirmation candles, and cancellation reason.
 - Red reference candle OHLC and calculated entry trigger.
-- Initial risk in points and the reason for any 25-point risk rejection.
+- Initial risk in points and the reason for any 20-point risk rejection.
 - Entry order request, acknowledgement, fill quantity, average fill price, and slippage.
 - Every 1R and 0.5R milestone, including the resulting stop level.
 - Stop modifications, EMA-close exits, force exits, order IDs, and final P&L.
@@ -225,8 +225,8 @@ The system shall record:
 | TC-02 | First confirmation candle is red and closes above EMA-21 | Stop-limit entry is placed at the red candle high; position waits for fill confirmation |
 | TC-03 | All three confirmation candles close above EMA-21 and none is red | Setup is cancelled |
 | TC-04 | A confirmation candle closes at EMA-21 | Setup is cancelled |
-| TC-05 | Tick-rounded entry trigger minus tick-rounded initial stop is 25 points | Setup remains eligible |
-| TC-06 | Initial risk is 25.01 points | Setup is discarded |
+| TC-05 | Tick-rounded entry trigger minus tick-rounded initial stop is 20 points | Setup remains eligible |
+| TC-06 | Initial risk is 20.01 points | Setup is discarded |
 | TC-07 | Entry fills at 100 and initial stop is 80 | R is 20; 1R is 120 and initial stop remains 80 before milestone |
 | TC-08 | Price reaches 1R | Stop moves to 100 |
 | TC-09 | Price reaches 1.5R | Stop moves to 110 for the TC-07 example |
@@ -240,7 +240,7 @@ The system shall record:
 | TC-17 | PE position is active and a CE signal is generated | CE signal/order is rejected and PE remains the only active position |
 | TC-18 | EMA21 alert is generated | BUY stop-limit order is submitted at the red candle high |
 | TC-19 | Entry or exit fails | Failure is recorded and broker state is reconciled |
-| TC-20 | Actual fill risk is greater than 25 points | Filled quantity is exited immediately |
+| TC-20 | Actual fill risk is greater than 20 points | Filled quantity is exited immediately |
 | TC-21 | Later confirmation candle closes at or below EMA | Pending order is cancelled; any filled position is exited |
 | TC-22 | Three filled trades exit at their stop-loss | All pending entries are cancelled and trading is locked for the day |
 
@@ -271,7 +271,7 @@ The intended inverse is:
 3. Within the next three candles, every close must remain below EMA-21 and at
    least one candle must be green (`close > open`).
 4. Entry is triggered 1 point below the first qualifying green candle's low.
-5. Discard the setup when initial risk exceeds 25 points.
+5. Discard the setup when initial risk exceeds 20 points.
 6. Apply the same 1R breakeven, 0.5R step-trailing, three-trade daily cap,
    entry window, EMA-close exit, and 15:10 force-exit rules in the inverse
    direction.

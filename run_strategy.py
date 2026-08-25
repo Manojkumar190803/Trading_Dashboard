@@ -343,7 +343,7 @@ def main(argv: Optional[list[str]] = None) -> None:
         cfg.entry_cutoff = time(14, 45)
         cfg.market_close = time(15, 10)
         cfg.force_square_off = time(15, 10)
-        cfg.max_option_risk_points = 25.0 if args.max_risk is None else args.max_risk
+        cfg.max_option_risk_points = 20.0 if args.max_risk is None else args.max_risk
         cfg.max_trades_per_day = 3
 
     risk = RiskConfig()
