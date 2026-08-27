@@ -33,6 +33,25 @@ class StubSignalProvider(SignalProvider):
         pass
 
 
+class TimeoutBroker(ConsoleBroker):
+    def place_stop_limit_order(self, *args, **kwargs):
+        raise TimeoutError("broker read timeout")
+
+
+class RecordingBroker(ConsoleBroker):
+    def __init__(self):
+        super().__init__()
+        self.stop_orders = []
+
+    def place_stop_limit_order(self, symbol, side, quantity, trigger_price, limit_price):
+        self.stop_orders.append((symbol, side, quantity, trigger_price, limit_price))
+        return f"OID-{len(self.stop_orders)}"
+
+
+class EMA21StubSignalProvider(StubSignalProvider):
+    strategy_key = "ema21"
+
+
 def _make_engine() -> BaseStrategyEngine:
     return BaseStrategyEngine(
         cfg=StrategyConfig(option_lot_size=65, pending_entry_expiry_candles=3),
@@ -73,6 +92,81 @@ def _attach_position(engine: BaseStrategyEngine, side: str = "CE") -> None:
         option_entry_trigger=100.0,
         option_risk_points=10.0,
     )
+
+
+def test_uncertain_entry_submission_blocks_duplicate_order_attempt():
+    engine = BaseStrategyEngine(
+        cfg=StrategyConfig(option_lot_size=65),
+        risk=RiskConfig(max_sl_per_day=3),
+        broker=TimeoutBroker(),
+        signal_provider=EMA21StubSignalProvider(),
+    )
+    side_state = engine.state.ce
+    side_state.option_symbol = "NIFTY01SEP2624250PE"
+    side_state.first_red_high = 88.0  # type: ignore[attr-defined]
+    row = _row(datetime(2026, 8, 27, 12, 6), high=87.8, low=86.8)
+
+    engine.place_pending_entry("CE", side_state, row["datetime"], row)
+    engine.place_pending_entry("CE", side_state, row["datetime"], row)
+
+    assert side_state.order_submission_uncertain is True
+    assert side_state.pending_entry is None
+    assert sum("submission uncertain" in alert.message for alert in engine.alerts) == 1
+
+
+def test_live_entry_places_separate_protective_sell_stop():
+    broker = RecordingBroker()
+    engine = BaseStrategyEngine(
+        cfg=StrategyConfig(option_tick_size=0.05, stop_buffer_points=1.0),
+        risk=RiskConfig(),
+        broker=broker,
+        signal_provider=EMA21StubSignalProvider(),
+    )
+    position = Position(
+        option_symbol="NIFTY01SEP2624250PE",
+        option_type="PE",
+        quantity=130,
+        initial_quantity=130,
+        entry_price=94.05,
+        entry_time=datetime(2026, 8, 27, 12, 6),
+        option_stop_level=90.0,
+        option_entry_trigger=94.0,
+        option_risk_points=4.0,
+    )
+
+    engine._place_protective_stop("PE", position, position.entry_time)
+
+    assert position.protective_stop_order_id == "OID-1"
+    assert broker.stop_orders == [
+        ("NIFTY01SEP2624250PE", "SELL", 130, 90.0, 89.0)
+    ]
+    assert any(alert.category == "PROTECTIVE_SL" for alert in engine.alerts)
+
+
+def test_candle_low_hits_trailing_stop_after_same_candle_trail_update():
+    engine = _make_engine()
+    side_state = engine.state.ce
+    side_state.position = Position(
+        option_symbol="NIFTY01SEP2624250PE",
+        option_type="PE",
+        quantity=65,
+        initial_quantity=65,
+        entry_price=80.0,
+        entry_time=datetime(2026, 8, 27, 12, 0),
+        option_stop_level=70.0,
+        option_entry_trigger=80.0,
+        option_risk_points=10.0,
+        breakeven_armed=True,
+        t1_done=True,
+        trailing_sl_level=80.0,
+        highest_rr_step=1.5,
+    )
+    row = _row(datetime(2026, 8, 27, 12, 6), high=110.0, low=84.0)
+
+    engine.monitor_open_position(side_state, row)
+
+    assert side_state.position is None
+    assert any("candle low" in alert.message for alert in engine.alerts)
 
 
 def test_process_tick_no_position_is_noop():

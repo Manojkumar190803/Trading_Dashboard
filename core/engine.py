@@ -252,6 +252,41 @@ class BaseStrategyEngine:
     def _pnl_entry_price(self, pos: Position) -> float:
         return pos.entry_price
 
+    def _place_protective_stop(self, side: str, position: Position, ts: datetime) -> None:
+        if self.broker.is_replay:
+            return
+        stop_level = self._round_option_price(position.option_stop_level)
+        limit_level = self._round_option_price(
+            max(self.cfg.option_tick_size, stop_level - self.cfg.stop_buffer_points)
+        )
+        print(
+            f"[TRADE PROTECTION] ABOUT TO PLACE SL ORDER side={side} "
+            f"symbol={position.option_symbol} qty={position.quantity} "
+            f"type=SL trigger={stop_level:.2f} limit={limit_level:.2f} time={ts}"
+        )
+        try:
+            position.protective_stop_order_id = self.broker.place_stop_limit_order(
+                position.option_symbol,
+                OrderSide.SELL,
+                position.quantity,
+                trigger_price=stop_level,
+                limit_price=limit_level,
+            )
+            self._record_alert(
+                ts,
+                "PROTECTIVE_SL",
+                f"{side} protective SL placed for {position.option_symbol} "
+                f"qty={position.quantity} trigger={stop_level:.2f} limit={limit_level:.2f} "
+                f"order_id={position.protective_stop_order_id}",
+            )
+        except Exception as exc:
+            self._record_alert(
+                ts,
+                "RISK",
+                f"{side} protective SL submission failed for {position.option_symbol}; "
+                f"manual protection required: {exc}",
+            )
+
     def _get_unrealized_pnl(self) -> float:
         pnl = 0.0
         for side_state in (self.state.ce, self.state.pe):
@@ -441,7 +476,16 @@ class BaseStrategyEngine:
         ts: datetime,
         row: pd.Series,
     ) -> None:
-        if side_state.position is not None or side_state.pending_entry is not None:
+        if (
+            side_state.position is not None
+            or side_state.pending_entry is not None
+            or side_state.order_submission_uncertain
+        ):
+            if side_state.order_submission_uncertain:
+                print(
+                    f"[TRADE BLOCKED] {side} entry is uncertain for "
+                    f"{side_state.option_symbol}; reconcile OpenAlgo before retry"
+                )
             return
 
         if not self.broker.is_replay and side_state.option_symbol:
@@ -565,13 +609,32 @@ class BaseStrategyEngine:
         trigger_level = entry_level
 
         if self._is_ema21_strategy():
-            order_id = self.broker.place_stop_limit_order(
-                side_state.option_symbol,
-                OrderSide.BUY,
-                quantity,
-                trigger_price=trigger_level,
-                limit_price=trigger_level + self.cfg.entry_limit_buffer_points,
+            limit_level = trigger_level + self.cfg.entry_limit_buffer_points
+            print(
+                f"[TRADE PREVIEW] ABOUT TO PLACE ENTRY ORDER "
+                f"side={side} symbol={side_state.option_symbol} qty={quantity} "
+                f"type=SL trigger={trigger_level:.2f} limit={limit_level:.2f} "
+                f"stop={stop_level:.2f} time={ts}"
             )
+            try:
+                order_id = self.broker.place_stop_limit_order(
+                    side_state.option_symbol,
+                    OrderSide.BUY,
+                    quantity,
+                    trigger_price=trigger_level,
+                    limit_price=limit_level,
+                )
+            except Exception as exc:
+                # A timeout is ambiguous: the broker may have accepted the order.
+                # Block this side rather than submitting a duplicate.
+                side_state.order_submission_uncertain = True
+                self._record_alert(
+                    ts,
+                    "RISK",
+                    f"{side} entry submission uncertain for {side_state.option_symbol}; "
+                    f"manual broker reconciliation required: {exc}",
+                )
+                return
         else:
             order_id = None
 
@@ -623,6 +686,8 @@ class BaseStrategyEngine:
         ts: datetime,
         row: pd.Series,
     ) -> None:
+        if side_state.order_submission_uncertain:
+            return
         pending = side_state.pending_entry
         if pending is None:
             return
@@ -648,6 +713,7 @@ class BaseStrategyEngine:
                     option_entry_trigger=pending.option_trigger_level,
                     option_risk_points=abs(pending.option_trigger_level - pending.option_stop_level),
                 )
+                self._place_protective_stop(side, side_state.position, ts)
                 side_state.pending_entry = None
                 self.total_entries += 1
                 self.signal_provider.reset_after_entry(side_state)
@@ -711,11 +777,28 @@ class BaseStrategyEngine:
                     self.signal_provider.reset_after_entry(side_state)
                 return
 
-        self.broker.place_stop_limit_order(
-            option_symbol, OrderSide.BUY, pending.quantity,
-            trigger_price=pending.option_trigger_level,
-            limit_price=limit_price,
-        )
+        try:
+            print(
+                f"[TRADE PREVIEW] ABOUT TO PLACE ENTRY ORDER "
+                f"side={side} symbol={option_symbol} qty={pending.quantity} "
+                f"type=SL trigger={pending.option_trigger_level:.2f} "
+                f"limit={limit_price:.2f} stop={pending.option_stop_level:.2f} time={ts}"
+            )
+            self.broker.place_stop_limit_order(
+                option_symbol, OrderSide.BUY, pending.quantity,
+                trigger_price=pending.option_trigger_level,
+                limit_price=limit_price,
+            )
+        except Exception as exc:
+            # The request may have reached the broker even without a response.
+            side_state.order_submission_uncertain = True
+            self._record_alert(
+                ts,
+                "RISK",
+                f"{side} entry submission uncertain for {option_symbol}; "
+                f"manual broker reconciliation required: {exc}",
+            )
+            return
 
         side_state.position = Position(
             option_symbol=option_symbol,
@@ -728,6 +811,7 @@ class BaseStrategyEngine:
             option_entry_trigger=pending.option_trigger_level,
             option_risk_points=risk_points,
         )
+        self._place_protective_stop(side, side_state.position, ts)
         side_state.pending_entry = None
         self.total_entries += 1
         self.signal_provider.reset_after_entry(side_state)
@@ -825,20 +909,27 @@ class BaseStrategyEngine:
                     )
 
     def check_trailing_stop(self, side_state: BaseSideState, row: Optional[pd.Series] = None) -> None:
-        """Exit if LTP drops to or below the trailing SL level."""
+        """Exit if the candle low or live LTP drops to the trailing SL level."""
         pos = side_state.position
         if pos is None or not pos.breakeven_armed:
             return
         sl_level = pos.trailing_sl_level if pos.trailing_sl_level is not None else pos.entry_price
-        option_ltp = self.broker.get_ltp(pos.option_symbol)
-        if option_ltp <= 0:
-            return
-        if option_ltp <= sl_level:
+        if row is not None:
+            observed_price = float(row["low"])
+            if observed_price > sl_level:
+                return
+            reason = f"Trailing stop hit: candle low {observed_price:.2f} <= TSL {sl_level:.2f}"
+        else:
+            observed_price = self.broker.get_ltp(pos.option_symbol)
+            if observed_price <= 0 or observed_price > sl_level:
+                return
+            reason = f"Trailing stop hit: LTP {observed_price:.2f} <= TSL {sl_level:.2f}"
+        if observed_price <= sl_level:
             self._exit_position(
                 side_state,
                 self.last_processed_candle_time or pos.entry_time,
                 pos.quantity,
-                f"Trailing stop hit: LTP {option_ltp:.2f} <= TSL {sl_level:.2f}",
+                reason,
                 is_hard_sl=False,
                 row=row,
             )

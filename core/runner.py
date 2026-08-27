@@ -164,11 +164,11 @@ def _print_persisted_trade_alerts(strategy_name: str, trading_day: date) -> None
 def _restore_open_positions(engine: BaseStrategyEngine, broker: OpenAlgoBroker, trading_day: date) -> None:
     """Restore matching OpenAlgo positions without replaying historical candles."""
     path = Path("logs") / f"trade_alerts_{trading_day:%Y%m%d}.csv"
-    if not path.exists():
-        return
     try:
-        with path.open(newline="", encoding="utf-8") as handle:
-            alerts = [row for row in csv.DictReader(handle) if row.get("strategy") == engine.strategy_name]
+        alerts = []
+        if path.exists():
+            with path.open(newline="", encoding="utf-8") as handle:
+                alerts = [row for row in csv.DictReader(handle) if row.get("strategy") == engine.strategy_name]
         broker_positions = broker.get_position_book()
     except (OSError, ValueError) as exc:
         logger.warning("could not restore persisted positions: %s", exc)
@@ -184,24 +184,49 @@ def _restore_open_positions(engine: BaseStrategyEngine, broker: OpenAlgoBroker, 
         if not symbol or quantity <= 0:
             continue
         matching = [row for row in alerts if row.get("category") == "ENTRY" and symbol in str(row.get("message") or "")]
-        if not matching:
-            continue
-        match = entry_pattern.search(str(matching[-1].get("message") or ""))
-        if match is None:
-            logger.warning("could not parse persisted entry for open position %s", symbol)
-            continue
-        side, _, _, _, trigger, stop, risk = match.groups()
-        entry_alert = matching[-1]
+        if matching:
+            match = entry_pattern.search(str(matching[-1].get("message") or ""))
+            if match is None:
+                logger.warning("could not parse persisted entry for open position %s", symbol)
+                continue
+            side, _, _, _, trigger, stop, risk = match.groups()
+            entry_alert = matching[-1]
+            entry_price = float(position.get("average_price") or trigger)
+            entry_time = datetime.fromisoformat(str(entry_alert["timestamp"]))
+        else:
+            try:
+                _, _, _, side = _parse_option_symbol(symbol)
+            except ValueError:
+                continue
+            entry_price = float(position.get("average_price") or 0)
+            if entry_price <= 0:
+                logger.warning("cannot restore open position %s without average price", symbol)
+                continue
+            risk_points = max(float(engine.cfg.max_option_risk_points), engine.cfg.option_tick_size)
+            trigger = str(entry_price)
+            stop = str(entry_price - risk_points)
+            risk = str(risk_points)
+            entry_time = datetime.now()
+            logger.warning(
+                "restoring broker-held %s without ENTRY alert; using fallback SL=%.2f "
+                "from max risk %.2f; verify the original strategy stop manually",
+                symbol, entry_price - risk_points, risk_points,
+            )
         engine.restore_open_position(
             side,
             quantity,
-            float(position.get("average_price") or 0),
-            datetime.fromisoformat(str(entry_alert["timestamp"])),
+            entry_price,
+            entry_time,
             float(stop),
             float(trigger),
             float(risk),
         )
-        engine.total_entries = sum(row.get("category") == "ENTRY" for row in alerts)
+        engine.total_entries = max(
+            engine.total_entries,
+            sum(row.get("category") == "ENTRY" for row in alerts),
+        )
+        if not matching:
+            engine.total_entries += 1
         logger.info("restored open %s position from OpenAlgo: %s qty=%s", side, symbol, quantity)
 
 
@@ -495,7 +520,13 @@ class LiveFeedRunner:
                 logger.warning("tick quote failed for %s: %s", side_state.position.option_symbol, exc)
                 continue
             if ltp > 0:
-                self.engine.process_tick(side, float(ltp), datetime.now())
+                tick_time = datetime.now()
+                print(
+                    f"[TICK] {tick_time} side={side} "
+                    f"symbol={side_state.position.option_symbol} "
+                    f"ltp={float(ltp):.2f} sl={side_state.position.option_stop_level:.2f}"
+                )
+                self.engine.process_tick(side, float(ltp), tick_time)
 
     def run_forever(self) -> None:
         logger.info(
@@ -578,6 +609,8 @@ class LiveFeedRunner:
                     f"│     Trade: PENDING trigger={pending.option_trigger_level:.2f} "
                     f"SL={pending.option_stop_level:.2f} qty={pending.quantity}"
                 )
+            elif side_state.order_submission_uncertain:
+                lines.append("│     Trade: ORDER UNCERTAIN - reconcile OpenAlgo before retry")
             else:
                 lines.append("│     Trade: FLAT")
             return "\n".join(lines)
@@ -867,6 +900,10 @@ class MultiEngineLiveFeedRunner:
                     logger.warning("tick quote failed for %s: %s", position.option_symbol, exc)
                     continue
                 if ltp > 0:
+                    print(
+                        f"[TICK] {now} symbol={position.option_symbol} "
+                        f"ltp={float(ltp):.2f} sl={position.option_stop_level:.2f}"
+                    )
                     for _, active_engine in self.engines:
                         for active_side in ("CE", "PE"):
                             active_position = active_engine._side_state(active_side).position

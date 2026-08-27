@@ -80,6 +80,7 @@ class Position:
     option_stop_level: float
     option_entry_trigger: float
     option_risk_points: float
+    protective_stop_order_id: Optional[str] = None
     t1_done: bool = False
     t2_done: bool = False
     breakeven_armed: bool = False
@@ -115,6 +116,7 @@ class BaseSideState:
     option_symbol: Optional[str] = None
     position: Optional[Position] = None
     pending_entry: Optional[PendingEntry] = None
+    order_submission_uncertain: bool = False
     last_close: Optional[float] = None
     last_ema21: Optional[float] = None
     last_rsi: Optional[float] = None
