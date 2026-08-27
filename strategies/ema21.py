@@ -16,6 +16,7 @@ class EMA21SideState(BaseSideState):
     setup_candle_low: Optional[float] = None
     setup_candle_time: Optional[datetime] = None
     confirmation_count: int = 0
+    green_confirmation_count: int = 0
     first_red_high: Optional[float] = None
     first_red_low: Optional[float] = None
     first_red_time: Optional[datetime] = None
@@ -48,7 +49,9 @@ class EMA21SignalProvider(SignalProvider):
                 return
 
             side_state.confirmation_count += 1
-            if side_state.first_red_high is None and float(row["close"]) < float(row["open"]):
+            if float(row["close"]) > float(row["open"]):
+                side_state.green_confirmation_count += 1
+            elif side_state.first_red_high is None:
                 side_state.first_red_high = float(row["high"])
                 side_state.first_red_low = float(row["low"])
                 side_state.first_red_time = row.get("datetime")
@@ -69,6 +72,7 @@ class EMA21SignalProvider(SignalProvider):
             side_state.setup_candle_low = float(row["low"])
             side_state.setup_candle_time = row.get("datetime")
             side_state.confirmation_count = 0
+            side_state.green_confirmation_count = 0
             side_state.first_red_high = None
             side_state.first_red_low = None
             side_state.first_red_time = None
@@ -113,6 +117,7 @@ class EMA21SignalProvider(SignalProvider):
         side_state.setup_candle_low = None
         side_state.setup_candle_time = None
         side_state.confirmation_count = 0
+        side_state.green_confirmation_count = 0
         side_state.first_red_high = None
         side_state.first_red_low = None
         side_state.first_red_time = None
@@ -124,7 +129,7 @@ class EMA21SignalProvider(SignalProvider):
             return f"ENTRY_READY confirmations={side_state.confirmation_count}"
         if side_state.setup_active:
             red = "red-found" if side_state.first_red_high is not None else "waiting-red"
-            return f"CONFIRMING {side_state.confirmation_count}/3 {red}"
+            return f"CONFIRMING candles={side_state.confirmation_count}/3 {red}"
         return "WAITING"
 
     def diagnose_no_signal(

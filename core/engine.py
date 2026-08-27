@@ -444,6 +444,49 @@ class BaseStrategyEngine:
         if side_state.position is not None or side_state.pending_entry is not None:
             return
 
+        if not self.broker.is_replay and side_state.option_symbol:
+            try:
+                open_orders = self.broker.get_open_orders()
+            except Exception as exc:
+                self._record_alert(ts, "RISK", f"{side} entry blocked: order check failed: {exc}")
+                return
+            if open_orders is None:
+                self._record_alert(ts, "RISK", f"{side} entry blocked: order check unavailable")
+                return
+            matching_orders = [
+                order for order in open_orders
+                if str(order.get("symbol") or "") == side_state.option_symbol
+                and str(order.get("action") or order.get("side") or "BUY").upper() == "BUY"
+            ]
+            for duplicate_order in matching_orders[1:]:
+                order_id = str(duplicate_order.get("orderid") or duplicate_order.get("order_id") or "")
+                if order_id:
+                    self.broker.cancel_order(order_id)
+            if matching_orders:
+                    self._record_alert(
+                        ts,
+                        "RISK",
+                        f"{side} entry skipped: active broker order exists "
+                        f"for {side_state.option_symbol}",
+                    )
+                    return
+            try:
+                broker_positions = self.broker.get_position_book()
+            except Exception as exc:
+                self._record_alert(ts, "RISK", f"{side} entry blocked: position check failed: {exc}")
+                return
+            for broker_position in broker_positions:
+                symbol = str(broker_position.get("symbol") or "")
+                quantity = int(float(broker_position.get("quantity") or 0))
+                if symbol == side_state.option_symbol and quantity > 0:
+                    self._record_alert(
+                        ts,
+                        "RISK",
+                        f"{side} entry skipped: broker position already exists "
+                        f"for {symbol} qty={quantity}",
+                    )
+                    return
+
         if self._is_ema21_strategy():
             if ts.time() < self.cfg.entry_start or ts.time() >= self.cfg.entry_cutoff:
                 return

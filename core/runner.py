@@ -175,8 +175,8 @@ def _restore_open_positions(engine: BaseStrategyEngine, broker: OpenAlgoBroker, 
         return
 
     entry_pattern = re.compile(
-        r"Entered (CE|PE) (\S+) @ ([\d.]+), qty=(\d+), alert_trigger=([\d.]+), "
-        r"SL=([\d.]+), option_risk=([\d.]+)"
+        r"Entered (CE|PE) (\S+) @ ([\d.]+), qty=(\d+), "
+        r"(?:alert_trigger|trigger)=([\d.]+), SL=([\d.]+), option_risk=([\d.]+)"
     )
     for position in broker_positions:
         symbol = str(position.get("symbol") or "")
@@ -472,6 +472,7 @@ class LiveFeedRunner:
             remaining = (deadline - datetime.now()).total_seconds()
             if remaining <= 0:
                 break
+            self._poll_active_ticks()
             mins, secs = divmod(int(remaining), 60)
             sys.stdout.write(f"\r⏳ Next candle in {mins:02d}:{secs:02d} ")
             sys.stdout.flush()
@@ -482,6 +483,19 @@ class LiveFeedRunner:
         sys.stdout.write("\r" + " " * 30 + "\r")
         sys.stdout.flush()
         return False
+
+    def _poll_active_ticks(self) -> None:
+        for side in ("CE", "PE"):
+            side_state = self.engine._side_state(side)
+            if side_state.position is None:
+                continue
+            try:
+                ltp = self.broker.get_ltp(side_state.position.option_symbol)
+            except Exception as exc:
+                logger.warning("tick quote failed for %s: %s", side_state.position.option_symbol, exc)
+                continue
+            if ltp > 0:
+                self.engine.process_tick(side, float(ltp), datetime.now())
 
     def run_forever(self) -> None:
         logger.info(
@@ -826,6 +840,7 @@ class MultiEngineLiveFeedRunner:
             remaining = (deadline - datetime.now()).total_seconds()
             if remaining <= 0:
                 break
+            self._poll_active_ticks()
             mins, secs = divmod(int(remaining), 60)
             sys.stdout.write(f"\r⏳ Next candle in {mins:02d}:{secs:02d} ")
             sys.stdout.flush()
@@ -836,6 +851,27 @@ class MultiEngineLiveFeedRunner:
         sys.stdout.write("\r" + " " * 30 + "\r")
         sys.stdout.flush()
         return False
+
+    def _poll_active_ticks(self) -> None:
+        now = datetime.now()
+        seen_symbols: set[str] = set()
+        for _, engine in self.engines:
+            for side in ("CE", "PE"):
+                position = engine._side_state(side).position
+                if position is None or position.option_symbol in seen_symbols:
+                    continue
+                seen_symbols.add(position.option_symbol)
+                try:
+                    ltp = self.broker.get_ltp(position.option_symbol)
+                except Exception as exc:
+                    logger.warning("tick quote failed for %s: %s", position.option_symbol, exc)
+                    continue
+                if ltp > 0:
+                    for _, active_engine in self.engines:
+                        for active_side in ("CE", "PE"):
+                            active_position = active_engine._side_state(active_side).position
+                            if active_position is not None and active_position.option_symbol == position.option_symbol:
+                                active_engine.process_tick(active_side, float(ltp), now)
 
     def run_forever(self) -> None:
         names = ", ".join(n for n, _ in self.engines)

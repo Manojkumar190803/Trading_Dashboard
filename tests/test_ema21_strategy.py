@@ -23,7 +23,7 @@ def _row(offset: int, *, open_: float, high: float, low: float, close: float, em
     )
 
 
-def test_provider_captures_setup_and_first_red_confirmation():
+def test_provider_captures_first_red_within_three_candles():
     provider = EMA21SignalProvider()
     state = provider.create_side_state()
     assert isinstance(state, EMA21SideState)
@@ -36,29 +36,52 @@ def test_provider_captures_setup_and_first_red_confirmation():
     assert state.setup_candle_low == 95.0
     assert state.confirmation_count == 0
 
-    first_confirmation = _row(2, open_=105, high=106, low=100, close=102, ema=101)
-    provider.update_state(state, first_confirmation, setup)
+    first_green = _row(2, open_=101, high=106, low=100, close=102, ema=101)
+    first_red = _row(3, open_=105, high=108, low=100, close=102, ema=101)
+    provider.update_state(state, first_green, setup)
+    provider.update_state(state, first_red, first_green)
 
-    assert state.confirmation_count == 1
-    assert state.first_red_high == 106.0
+    assert state.confirmation_count == 2
+    assert state.green_confirmation_count == 1
+    assert state.first_red_high == 108.0
     assert state.first_red_low == 100.0
-    assert provider.generate_signal("CE", state, first_confirmation, setup) == Signal.BUY_CE
+    assert provider.generate_signal("CE", state, first_red, first_green) == Signal.BUY_CE
 
 
-def test_provider_emits_signal_on_first_red_confirmation():
+def test_provider_emits_signal_on_red_within_three_candles():
     provider = EMA21SignalProvider()
     state = provider.create_side_state()
     previous = _row(0, open_=100, high=101, low=98, close=99, ema=100)
     setup = _row(1, open_=99, high=103, low=95, close=101, ema=100)
     provider.update_state(state, setup, previous)
 
-    first_red = _row(2, open_=105, high=106, low=100, close=102, ema=101)
-    provider.update_state(state, first_red, setup)
+    first_green = _row(2, open_=101, high=106, low=100, close=102, ema=101)
+    second_green = _row(3, open_=102, high=107, low=101, close=104, ema=102)
+    first_red = _row(4, open_=105, high=106, low=100, close=102, ema=101)
+    provider.update_state(state, first_green, setup)
+    provider.update_state(state, second_green, first_green)
+    provider.update_state(state, first_red, second_green)
 
     assert state.entry_ready is True
     assert provider.generate_signal("CE", state, first_red, setup) == Signal.BUY_CE
     assert provider.compute_risk_points(state, first_red) == 11.0
     assert provider.compute_stop_level(state, first_red) == 95.0
+
+
+def test_provider_rejects_setup_without_red_within_three_candles():
+    provider = EMA21SignalProvider()
+    state = provider.create_side_state()
+    previous = _row(0, open_=100, high=101, low=98, close=99, ema=100)
+    setup = _row(1, open_=99, high=103, low=95, close=101, ema=100)
+    provider.update_state(state, setup, previous)
+
+    for offset in (2, 3, 4):
+        green = _row(offset, open_=101, high=106, low=100, close=102, ema=101)
+        provider.update_state(state, green, setup)
+
+    assert state.setup_active is False
+    assert state.entry_ready is False
+    assert provider.generate_signal("CE", state, green, setup) == Signal.NONE
 
 
 def test_provider_cancels_setup_when_confirmation_closes_on_ema():
@@ -92,19 +115,21 @@ def test_engine_places_ema21_stop_entry_at_red_high():
 
     previous = _row(0, open_=100, high=101, low=98, close=99, ema=100)
     setup = _row(1, open_=99, high=103, low=95, close=101, ema=100)
-    first_red = _row(2, open_=105, high=106, low=100, close=102, ema=101)
-    second = _row(3, open_=101, high=104, low=100, close=103, ema=102)
-    third = _row(4, open_=102, high=105, low=101, close=104, ema=103)
+    first_green = _row(2, open_=101, high=106, low=100, close=102, ema=101)
+    second_green = _row(3, open_=102, high=107, low=101, close=104, ema=102)
+    first_red = _row(4, open_=105, high=106, low=100, close=102, ema=101)
 
     engine.process_option_candle("CE", setup, previous)
-    engine.process_option_candle("CE", first_red, setup)
+    engine.process_option_candle("CE", first_green, setup)
+    engine.process_option_candle("CE", second_green, first_green)
+    engine.process_option_candle("CE", first_red, second_green)
 
     assert engine.state.ce.position is None
     assert engine.state.ce.pending_entry is not None
     assert engine.state.ce.pending_entry.option_trigger_level == 106.0
     assert engine.state.ce.pending_entry.option_stop_level == 95.0
 
-    engine.process_option_candle("CE", second, first_red)
+    engine.process_option_candle("CE", _row(5, open_=101, high=104, low=100, close=103, ema=102), first_red)
     position = engine.state.ce.position
     assert position is not None
     assert position.entry_price == 107.0
@@ -141,6 +166,33 @@ def test_engine_does_not_create_order_when_entry_stop_gap_exceeds_25_points():
     assert state.pending_entry is None
     assert engine.total_entries == 0
     assert any("before order" in alert.message and "gap" in alert.message for alert in engine.alerts)
+
+
+def test_engine_skips_live_entry_when_broker_position_already_exists():
+    class PositionBroker(ConsoleBroker):
+        def get_position_book(self):
+            return [{"symbol": "NIFTY12AUG2625000CE", "quantity": 130}]
+
+    provider = EMA21SignalProvider()
+    engine = BaseStrategyEngine(
+        StrategyConfig(max_option_risk_points=20.0),
+        RiskConfig(max_sl_per_day=3),
+        PositionBroker(ltp_fallback=107.0),
+        provider,
+    )
+    engine.state.trading_day = datetime(2026, 8, 10).date()
+    engine.state.atm_locked = True
+    engine.state.ce.option_symbol = "NIFTY12AUG2625000CE"
+    state = engine.state.ce
+    state.setup_candle_low = 95.0
+    state.first_red_high = 106.0
+    row = _row(2, open_=105, high=106, low=100, close=102, ema=101)
+
+    engine.place_pending_entry("CE", state, row["datetime"], row)
+
+    assert state.pending_entry is None
+    assert state.position is None
+    assert any("broker position already exists" in alert.message for alert in engine.alerts)
 
 
 def test_engine_ema21_one_lot_trails_after_one_and_half_rr():
@@ -338,9 +390,9 @@ def test_ema21_stop_entry_does_not_repeat_signal():
     previous = _row(0, open_=100, high=101, low=98, close=99, ema=100)
     setup = _row(1, open_=99, high=103, low=95, close=101, ema=100)
     confirmations = [
-        _row(2, open_=105, high=106, low=100, close=102, ema=101),
-        _row(3, open_=101, high=104, low=101, close=103, ema=102),
-        _row(4, open_=102, high=105, low=101, close=104, ema=103),
+        _row(2, open_=101, high=106, low=100, close=102, ema=101),
+        _row(3, open_=102, high=104, low=101, close=103, ema=102),
+        _row(4, open_=105, high=106, low=101, close=103, ema=102),
     ]
     engine.process_option_candle("CE", setup, previous)
     for row, prior in zip(confirmations, [setup, *confirmations[:-1]]):

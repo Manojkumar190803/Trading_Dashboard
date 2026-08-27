@@ -27,6 +27,12 @@ class BrokerInterface:
     def get_order_status(self, order_id: str) -> dict[str, object]:
         raise NotImplementedError
 
+    def get_open_orders(self) -> Optional[list[dict[str, object]]]:
+        raise NotImplementedError
+
+    def cancel_order(self, order_id: str) -> bool:
+        raise NotImplementedError
+
     def place_stop_limit_order(
         self,
         symbol: str,
@@ -76,6 +82,12 @@ class ConsoleBroker(BrokerInterface):
 
     def get_order_status(self, order_id: str) -> dict[str, object]:
         return {"order_status": "complete", "orderid": order_id, "price": self.ltp_fallback}
+
+    def get_open_orders(self) -> Optional[list[dict[str, object]]]:
+        return []
+
+    def cancel_order(self, order_id: str) -> bool:
+        return True
 
     def place_stop_limit_order(
         self,
@@ -283,6 +295,34 @@ class OpenAlgoBroker(BrokerInterface):
             return {}
         data = response.get("data")
         return data if isinstance(data, dict) else {}
+
+    def get_open_orders(self) -> Optional[list[dict[str, object]]]:
+        try:
+            response = self.client.orderbook()
+        except Exception as exc:
+            logger.warning("orderbook error: %s", exc)
+            return None
+        if not isinstance(response, dict) or response.get("status") != "success":
+            logger.warning("orderbook unexpected response: %s", response)
+            return None
+        data = response.get("data")
+        orders = data.get("orders") if isinstance(data, dict) else data
+        if not isinstance(orders, list):
+            return None
+        closed = {"complete", "filled", "executed", "cancelled", "rejected", "failed"}
+        return [
+            row for row in orders
+            if isinstance(row, dict)
+            and str(row.get("order_status") or row.get("status") or "").lower() not in closed
+        ]
+
+    def cancel_order(self, order_id: str) -> bool:
+        try:
+            response = self.client.cancelorder(order_id=order_id, strategy=self.strategy_tag)
+        except Exception as exc:
+            logger.warning("cancel order %s error: %s", order_id, exc)
+            return False
+        return isinstance(response, dict) and response.get("status") == "success"
 
     def place_stop_limit_order(
         self,
