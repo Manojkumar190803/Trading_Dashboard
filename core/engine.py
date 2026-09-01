@@ -45,6 +45,21 @@ def choose_weekly_expiry_for_entry(trade_day: date, expiry_weekday: int) -> date
     return current_weekly_expiry
 
 
+def choose_monthly_expiry_for_entry(trade_day: date, expiry_weekday: int) -> date:
+    """Choose the last configured weekday in the current or next month."""
+    month_end = trade_day.replace(day=28) + timedelta(days=4)
+    month_end = month_end - timedelta(days=month_end.day)
+    while month_end.weekday() != expiry_weekday:
+        month_end -= timedelta(days=1)
+    if month_end <= trade_day:
+        next_month = month_end.replace(day=28) + timedelta(days=4)
+        next_month_end = next_month - timedelta(days=next_month.day)
+        while next_month_end.weekday() != expiry_weekday:
+            next_month_end -= timedelta(days=1)
+        return next_month_end
+    return month_end
+
+
 def format_expiry_code(expiry_day: date) -> str:
     return expiry_day.strftime("%d%b%y").upper()
 
@@ -177,7 +192,7 @@ class BaseStrategyEngine:
         self.alerts.append(StrategyAlert(timestamp=ts, category=category, message=message))
         if len(self.alerts) > 500:
             self.alerts = self.alerts[-500:]
-        if self.persist_alerts and category in ("ENTRY", "EXIT"):
+        if self.persist_alerts and category in ("ENTRY", "EXIT", "UNCERTAIN_ENTRY"):
             self._persist_trade_alert(ts, category, message)
         print(f"[ENGINE][{category}] {message}")
 
@@ -208,7 +223,8 @@ class BaseStrategyEngine:
         )
 
     def _persist_trade_alert(self, ts: datetime, category: str, message: str) -> None:
-        path = Path("logs") / f"trade_alerts_{ts:%Y%m%d}.csv"
+        script = self.cfg.option_index_symbol or self.cfg.spot_symbol or "UNKNOWN"
+        path = Path("logs") / f"trade_alerts_{script}_{ts:%Y%m%d}.csv"
         path.parent.mkdir(parents=True, exist_ok=True)
         needs_header = not path.exists()
         with path.open("a", newline="", encoding="utf-8") as handle:
@@ -287,6 +303,19 @@ class BaseStrategyEngine:
                 f"manual protection required: {exc}",
             )
 
+    def _refresh_protective_stop(self, side: str, position: Position, ts: datetime) -> None:
+        """Replace the broker stop after its level or quantity changes."""
+        order_id = position.protective_stop_order_id
+        if order_id:
+            if not self.broker.cancel_order(order_id):
+                self._record_alert(
+                    ts, "RISK",
+                    f"{side} protective SL update failed: could not cancel {order_id}",
+                )
+                return
+            position.protective_stop_order_id = None
+        self._place_protective_stop(side, position, ts)
+
     def _get_unrealized_pnl(self) -> float:
         pnl = 0.0
         for side_state in (self.state.ce, self.state.pe):
@@ -333,7 +362,11 @@ class BaseStrategyEngine:
             print(self._fmt_candle_context(row, pos.option_symbol, self._is_ema21_strategy()))
 
         if pos.quantity <= 0:
+            if pos.protective_stop_order_id:
+                self.broker.cancel_order(pos.protective_stop_order_id)
             side_state.position = None
+        elif pos.protective_stop_order_id:
+            self._refresh_protective_stop(pos.option_type, pos, ts)
 
         if is_hard_sl:
             self.state.sl_hits_today += 1
@@ -347,7 +380,6 @@ class BaseStrategyEngine:
                 )
 
     def get_status_snapshot(self) -> dict:
-        unrealized_pnl = self._get_unrealized_pnl()
         total_pnl = self.realized_pnl + unrealized_pnl
 
         def _side_payload(side_state: BaseSideState) -> dict:
@@ -439,9 +471,13 @@ class BaseStrategyEngine:
                 strike,
                 self.cfg.strike_step,
                 preferred_weekday=self.cfg.weekly_expiry_weekday,
+                expiry_policy=self.cfg.expiry_policy,
             )
         if expiry_day is None:
-            expiry_day = choose_weekly_expiry_for_entry(ts.date(), self.cfg.weekly_expiry_weekday)
+            if self.cfg.expiry_policy == "monthly":
+                expiry_day = choose_monthly_expiry_for_entry(ts.date(), self.cfg.weekly_expiry_weekday)
+            else:
+                expiry_day = choose_weekly_expiry_for_entry(ts.date(), self.cfg.weekly_expiry_weekday)
         expiry_code = format_expiry_code(expiry_day)
 
         ce_symbol = build_option_symbol(self.cfg.option_index_symbol, expiry_code, strike, "CE")
@@ -634,6 +670,12 @@ class BaseStrategyEngine:
                     f"{side} entry submission uncertain for {side_state.option_symbol}; "
                     f"manual broker reconciliation required: {exc}",
                 )
+                self._record_alert(
+                    ts,
+                    "UNCERTAIN_ENTRY",
+                    f"Uncertain {side} {side_state.option_symbol} qty={quantity} "
+                    f"trigger={trigger_level:.2f} SL={stop_level:.2f}",
+                )
                 return
         else:
             order_id = None
@@ -798,6 +840,12 @@ class BaseStrategyEngine:
                 f"{side} entry submission uncertain for {option_symbol}; "
                 f"manual broker reconciliation required: {exc}",
             )
+            self._record_alert(
+                ts,
+                "UNCERTAIN_ENTRY",
+                f"Uncertain {side} {option_symbol} qty={pending.quantity} "
+                f"trigger={pending.option_trigger_level:.2f} SL={pending.option_stop_level:.2f}",
+            )
             return
 
         side_state.position = Position(
@@ -876,6 +924,7 @@ class BaseStrategyEngine:
             pos.trailing_sl_level = pos.entry_price
             pos.option_stop_level = pos.entry_price
             pos.highest_rr_step = 1.5
+            self._refresh_protective_stop(pos.option_type, pos, self.last_processed_candle_time or pos.entry_time)
             self._record_alert(
                 self.last_processed_candle_time or pos.entry_time,
                 "TARGET",
@@ -902,6 +951,7 @@ class BaseStrategyEngine:
                     pos.trailing_sl_level = new_sl
                     pos.option_stop_level = new_sl
                     pos.highest_rr_step = current_step
+                    self._refresh_protective_stop(pos.option_type, pos, self.last_processed_candle_time or pos.entry_time)
                     self._record_alert(
                         self.last_processed_candle_time or pos.entry_time,
                         "TSL",
@@ -1008,6 +1058,7 @@ class BaseStrategyEngine:
             pos.trailing_sl_level = pos.entry_price
             pos.option_stop_level = pos.entry_price
             pos.highest_rr_step = 1.5
+            self._refresh_protective_stop(pos.option_type, pos, ts)
             self._record_alert(ts, "TSL", f"{pos.option_type} 1.5 RR (tick) — SL to entry")
 
         # Phase 3: 2.0 RR — partial exit.
@@ -1027,6 +1078,7 @@ class BaseStrategyEngine:
                     pos.trailing_sl_level = new_sl
                     pos.option_stop_level = new_sl
                     pos.highest_rr_step = current_step
+                    self._refresh_protective_stop(pos.option_type, pos, ts)
                     self._record_alert(ts, "TSL", f"{pos.option_type} {current_step:.1f} RR (tick) — TSL={new_sl:.2f}")
 
         # Check trailing stop on this tick.

@@ -4,12 +4,14 @@ x-live-defaults: &live-defaults
   env_file: .env
   environment:
     TZ: Asia/Kolkata
-    STRATEGY: hd,cd,tc
+    STRATEGY: ema21
     MODE: live
-    OPENALGO_HOST: http://host.docker.internal:5001
-    OPENALGO_WS_URL: ws://host.docker.internal:8765
+    OPENALGO_HOST: http://host.docker.internal:5002
+    OPENALGO_WS_URL: ws://host.docker.internal:8766
     WEBSOCKET_HOST: host.docker.internal
-    WEBSOCKET_PORT: "8765"
+    WEBSOCKET_PORT: "8766"
+  volumes:
+    - ./logs:/app/logs
 
 services:
   live_nifty:
@@ -17,36 +19,27 @@ services:
     container_name: openalgo_live_nifty
     environment:
       TZ: Asia/Kolkata
-      STRATEGY: hd,cd,tc
+      STRATEGY: ema21
       MODE: live
       SCRIPT: NIFTY
-      OPENALGO_HOST: http://host.docker.internal:5001
-      OPENALGO_WS_URL: ws://host.docker.internal:8765
+      OPENALGO_HOST: http://host.docker.internal:5002
+      OPENALGO_WS_URL: ws://host.docker.internal:8766
       WEBSOCKET_HOST: host.docker.internal
-      WEBSOCKET_PORT: "8765"
-
+      WEBSOCKET_PORT: "8766"
+    volumes:
+      - ./logs:/app/logs
   live_banknifty:
     <<: *live-defaults
     container_name: openalgo_live_banknifty
     environment:
       TZ: Asia/Kolkata
-      STRATEGY: hd,cd,tc
+      STRATEGY: ema21
       MODE: live
       SCRIPT: BANKNIFTY
-      OPENALGO_HOST: http://host.docker.internal:5001
-      OPENALGO_WS_URL: ws://host.docker.internal:8765
+      OPENALGO_HOST: http://host.docker.internal:5002
+      OPENALGO_WS_URL: ws://host.docker.internal:8766
       WEBSOCKET_HOST: host.docker.internal
-      WEBSOCKET_PORT: "8765"
+      WEBSOCKET_PORT: "8766"
+    volumes:
+      - ./logs:/app/logs
 
-  live_sensex:
-    <<: *live-defaults
-    container_name: openalgo_live_sensex
-    environment:
-      TZ: Asia/Kolkata
-      STRATEGY: hd,cd,tc
-      MODE: live
-      SCRIPT: SENSEX
-      OPENALGO_HOST: http://host.docker.internal:5001
-      OPENALGO_WS_URL: ws://host.docker.internal:8765
-      WEBSOCKET_HOST: host.docker.internal
-      WEBSOCKET_PORT: "8765"

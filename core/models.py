@@ -30,6 +30,7 @@ class StrategyConfig:
     option_lot_size: int = 65
     full_size_lots: int = 2
     half_size_lots: int = 1
+    expiry_policy: str = "weekly"
     weekly_expiry_weekday: int = 1  # Monday=0 ... Tuesday=1
 
     # ── Timing (all in IST) ──────────────────────────────────────────

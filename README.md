@@ -164,6 +164,18 @@ OPENALGO_HOST=http://127.0.0.1:5002
 OPENALGO_WS_URL=ws://127.0.0.1:8765
 STRATEGY_NAME=Strategy
 PRODUCT=MIS
+
+# EMA21 policy
+EMA21_TIMEFRAME_MINUTES=3
+EMA21_MARKET_OPEN=09:20
+EMA21_ATM_LOCK_TIME=09:20
+EMA21_ENTRY_START=09:20
+EMA21_SIGNAL_CUTOFF=14:45
+EMA21_ENTRY_CUTOFF=14:45
+EMA21_MARKET_CLOSE=15:10
+EMA21_FORCE_SQUARE_OFF=15:10
+EMA21_MAX_OPTION_RISK_POINTS=20.0
+EMA21_MAX_TRADES_PER_DAY=3
 ```
 
 ---
@@ -179,10 +191,9 @@ python3 -m pytest tests/ -v
 ## Docker
 
 ```bash
-# Run intraday live for all scripts in parallel:
-# - NIFTY (HD+CD)
-# - BANKNIFTY (HD+CD)
-# - SENSEX (HD+CD)
+# Run intraday live for NIFTY and BANKNIFTY in parallel:
+# - NIFTY (EMA21)
+# - BANKNIFTY (EMA21)
 docker compose up -d
 
 # Follow logs for all live services
@@ -191,7 +202,6 @@ docker compose logs -f
 # Follow logs for one script
 docker compose logs -f live_nifty
 docker compose logs -f live_banknifty
-docker compose logs -f live_sensex
 
 # Restart only one script service
 docker compose restart live_nifty
@@ -203,7 +213,7 @@ docker compose up -d live_nifty
 docker compose down
 ```
 
-Each service runs in IST timezone, auto-restarts on crash, and injects script-specific `SCRIPT` value into `run_strategy.py --mode live --strategy hd,cd,tc`.
+Each service runs the EMA21 strategy in IST timezone, auto-restarts on crash, and injects a script-specific `SCRIPT` value into `run_strategy.py --mode live --strategy ema21`. The Docker image includes only the shared runtime files and EMA21 strategy implementation.
 
 ---
 

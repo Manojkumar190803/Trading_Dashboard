@@ -15,20 +15,24 @@ import pandas as pd
 from core.broker import HistoricalReplayBroker, OpenAlgoBroker
 from core.engine import BaseStrategyEngine, get_atm_strike
 from core.indicators import add_indicators
-from core.models import RiskConfig, StrategyConfig
+from core.models import PendingEntry, RiskConfig, Signal, StrategyAlert, StrategyConfig
 from strategies.base import SignalProvider
 
 logger = logging.getLogger("core.runner")
 
 
-def _atm_lock_path(trading_day: date) -> Path:
-    return Path("logs") / f"atm_lock_{trading_day:%Y%m%d}.json"
+def _atm_lock_path(trading_day: date, script: str) -> Path:
+    return Path("logs") / f"atm_lock_{script}_{trading_day:%Y%m%d}.json"
+
+
+def _trade_alert_path(trading_day: date, script: str) -> Path:
+    return Path("logs") / f"trade_alerts_{script}_{trading_day:%Y%m%d}.csv"
 
 
 def _persist_atm_lock(engine: BaseStrategyEngine, spot_price: float) -> None:
     if not engine.state.atm_locked or not engine.state.trading_day:
         return
-    path = _atm_lock_path(engine.state.trading_day)
+    path = _atm_lock_path(engine.state.trading_day, engine.cfg.option_index_symbol)
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "trading_day": engine.state.trading_day.isoformat(),
@@ -42,7 +46,7 @@ def _persist_atm_lock(engine: BaseStrategyEngine, spot_price: float) -> None:
 
 
 def _restore_atm_lock(engine: BaseStrategyEngine, trading_day: date) -> bool:
-    path = _atm_lock_path(trading_day)
+    path = _atm_lock_path(trading_day, engine.cfg.option_index_symbol)
     if not path.exists():
         return False
     try:
@@ -106,7 +110,7 @@ def _restore_atm_lock_from_positions(
 
 def _restore_atm_lock_from_alerts(engine: BaseStrategyEngine, trading_day: date) -> bool:
     """Recover the exact live-day strike from persisted entry alerts."""
-    path = Path("logs") / f"trade_alerts_{trading_day:%Y%m%d}.csv"
+    path = _trade_alert_path(trading_day, engine.cfg.option_index_symbol)
     if not path.exists():
         return False
     try:
@@ -144,8 +148,8 @@ def _restore_atm_lock_from_alerts(engine: BaseStrategyEngine, trading_day: date)
     return True
 
 
-def _print_persisted_trade_alerts(strategy_name: str, trading_day: date) -> None:
-    path = Path("logs") / f"trade_alerts_{trading_day:%Y%m%d}.csv"
+def _print_persisted_trade_alerts(strategy_name: str, trading_day: date, script: str) -> None:
+    path = _trade_alert_path(trading_day, script)
     if not path.exists():
         return
     try:
@@ -161,37 +165,76 @@ def _print_persisted_trade_alerts(strategy_name: str, trading_day: date) -> None
         print(f"[HISTORY][{row.get('category', '?')}] {row.get('timestamp', '?')} {row.get('message', '')}")
 
 
+def _load_persisted_trade_alerts(
+    engine: BaseStrategyEngine,
+    trading_day: date,
+) -> None:
+    """Restore today's entry and exit alerts so live status survives restarts."""
+    path = _trade_alert_path(trading_day, engine.cfg.option_index_symbol)
+    if not path.exists():
+        return
+    try:
+        with path.open(newline="", encoding="utf-8") as handle:
+            rows = [
+                row for row in csv.DictReader(handle)
+                if row.get("strategy") == engine.strategy_name
+                and row.get("category") in ("ENTRY", "EXIT")
+            ]
+    except (OSError, ValueError) as exc:
+        logger.warning("could not load persisted trade alerts: %s", exc)
+        return
+
+    for row in rows:
+        try:
+            timestamp = datetime.fromisoformat(str(row["timestamp"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+        engine.alerts.append(
+            StrategyAlert(
+                timestamp=timestamp,
+                category=str(row["category"]),
+                message=str(row.get("message") or ""),
+            )
+        )
+
+
 def _restore_open_positions(engine: BaseStrategyEngine, broker: OpenAlgoBroker, trading_day: date) -> None:
-    """Restore matching OpenAlgo positions without replaying historical candles."""
-    path = Path("logs") / f"trade_alerts_{trading_day:%Y%m%d}.csv"
+    """Restore matching OpenAlgo positions and open entry orders after restart."""
+    path = _trade_alert_path(trading_day, engine.cfg.option_index_symbol)
     try:
         alerts = []
         if path.exists():
             with path.open(newline="", encoding="utf-8") as handle:
                 alerts = [row for row in csv.DictReader(handle) if row.get("strategy") == engine.strategy_name]
         broker_positions = broker.get_position_book()
+        open_orders = broker.get_open_orders()
     except (OSError, ValueError) as exc:
         logger.warning("could not restore persisted positions: %s", exc)
         return
 
     entry_pattern = re.compile(
-        r"Entered (CE|PE) (\S+) @ ([\d.]+), qty=(\d+), "
-        r"(?:alert_trigger|trigger)=([\d.]+), SL=([\d.]+), option_risk=([\d.]+)"
+        r"(?:Entered|Uncertain) (CE|PE) (\S+)(?: @ ([\d.]+),)? qty=(\d+),?\s+"
+        r"(?:alert_trigger|trigger)=([\d.]+) SL=([\d.]+)(?:, option_risk=([\d.]+))?"
     )
     for position in broker_positions:
         symbol = str(position.get("symbol") or "")
         quantity = int(float(position.get("quantity") or 0))
         if not symbol or quantity <= 0:
             continue
-        matching = [row for row in alerts if row.get("category") == "ENTRY" and symbol in str(row.get("message") or "")]
+        matching = [
+            row for row in alerts
+            if row.get("category") in ("ENTRY", "UNCERTAIN_ENTRY")
+            and symbol in str(row.get("message") or "")
+        ]
         if matching:
             match = entry_pattern.search(str(matching[-1].get("message") or ""))
             if match is None:
                 logger.warning("could not parse persisted entry for open position %s", symbol)
                 continue
-            side, _, _, _, trigger, stop, risk = match.groups()
+            side, _, parsed_entry, _, trigger, stop, risk = match.groups()
             entry_alert = matching[-1]
-            entry_price = float(position.get("average_price") or trigger)
+            entry_price = float(position.get("average_price") or parsed_entry or trigger)
+            risk = risk or str(abs(float(trigger) - float(stop)))
             entry_time = datetime.fromisoformat(str(entry_alert["timestamp"]))
         else:
             try:
@@ -202,16 +245,37 @@ def _restore_open_positions(engine: BaseStrategyEngine, broker: OpenAlgoBroker, 
             if entry_price <= 0:
                 logger.warning("cannot restore open position %s without average price", symbol)
                 continue
-            risk_points = max(float(engine.cfg.max_option_risk_points), engine.cfg.option_tick_size)
-            trigger = str(entry_price)
-            stop = str(entry_price - risk_points)
-            risk = str(risk_points)
+            side_state = engine._side_state(side)
+            recovered_trigger = getattr(side_state, "first_red_high", None)
+            recovered_stop = getattr(side_state, "setup_candle_low", None)
+            if (
+                side_state.order_submission_uncertain
+                and side_state.option_symbol == symbol
+                and recovered_trigger is not None
+                and recovered_stop is not None
+                and float(recovered_trigger) > float(recovered_stop)
+            ):
+                trigger = str(recovered_trigger)
+                stop = str(recovered_stop)
+                risk = str(float(recovered_trigger) - float(recovered_stop))
+                logger.info(
+                    "restoring uncertain %s entry intent for %s: trigger=%s stop=%s",
+                    side, symbol, trigger, stop,
+                )
+            else:
+                risk_points = max(float(engine.cfg.max_option_risk_points), engine.cfg.option_tick_size)
+                trigger = str(entry_price)
+                stop = str(entry_price - risk_points)
+                risk = str(risk_points)
             entry_time = datetime.now()
-            logger.warning(
-                "restoring broker-held %s without ENTRY alert; using fallback SL=%.2f "
-                "from max risk %.2f; verify the original strategy stop manually",
-                symbol, entry_price - risk_points, risk_points,
-            )
+            if recovered_trigger is None or recovered_stop is None:
+                logger.warning(
+                    "restoring broker-held %s without ENTRY alert; using fallback SL=%.2f "
+                    "from max risk %.2f; verify the original strategy stop manually",
+                    symbol, entry_price - risk_points, risk_points,
+                )
+        side_state = engine._side_state(side)
+        was_uncertain = side_state.order_submission_uncertain
         engine.restore_open_position(
             side,
             quantity,
@@ -221,13 +285,91 @@ def _restore_open_positions(engine: BaseStrategyEngine, broker: OpenAlgoBroker, 
             float(trigger),
             float(risk),
         )
+        side_state.order_submission_uncertain = False
         engine.total_entries = max(
             engine.total_entries,
-            sum(row.get("category") == "ENTRY" for row in alerts),
+            sum(row.get("category") in ("ENTRY", "UNCERTAIN_ENTRY") for row in alerts),
         )
         if not matching:
             engine.total_entries += 1
+        if open_orders is not None:
+            protective_orders = [
+                order for order in open_orders
+                if str(order.get("symbol") or "") == symbol
+                and str(order.get("action") or order.get("side") or "").upper() == "SELL"
+            ]
+            expected_stop = float(stop)
+            matching_protective_order = any(
+                abs(float(order.get("trigger_price") or order.get("trigger") or 0) - expected_stop)
+                <= engine.cfg.option_tick_size
+                for order in protective_orders
+            )
+            matching_protective = next(
+                (
+                    order for order in protective_orders
+                    if abs(float(order.get("trigger_price") or order.get("trigger") or 0) - expected_stop)
+                    <= engine.cfg.option_tick_size
+                ),
+                None,
+            )
+            if matching_protective is not None:
+                engine._side_state(side).position.protective_stop_order_id = str(
+                    matching_protective.get("orderid") or matching_protective.get("order_id") or ""
+                )
+            if not matching_protective_order and was_uncertain:
+                for order in protective_orders:
+                    order_id = str(order.get("orderid") or order.get("order_id") or "")
+                    if order_id:
+                        engine.broker.cancel_order(order_id)
+            has_protective_order = matching_protective_order
+            if not has_protective_order:
+                engine._place_protective_stop(side, engine._side_state(side).position, entry_time)
         logger.info("restored open %s position from OpenAlgo: %s qty=%s", side, symbol, quantity)
+
+    for order in open_orders or []:
+        symbol = str(order.get("symbol") or "")
+        action = str(order.get("action") or order.get("side") or "").upper()
+        if not symbol or action != "BUY":
+            continue
+        try:
+            _, _, _, side = _parse_option_symbol(symbol)
+        except ValueError:
+            continue
+        side_state = engine._side_state(side)
+        if side_state.position is not None or side_state.pending_entry is not None:
+            continue
+
+        quantity = int(float(order.get("quantity") or order.get("qty") or 0))
+        trigger = float(
+            order.get("trigger_price")
+            or order.get("trigger")
+            or order.get("price")
+            or 0
+        )
+        limit_price = float(order.get("price") or trigger or 0)
+        order_id = str(order.get("orderid") or order.get("order_id") or "")
+        if quantity <= 0 or trigger <= 0 or not order_id:
+            logger.warning("could not restore incomplete open order for %s: %s", symbol, order)
+            continue
+
+        risk_points = max(float(engine.cfg.max_option_risk_points), engine.cfg.option_tick_size)
+        side_state.option_symbol = symbol
+        side_state.order_submission_uncertain = False
+        side_state.pending_entry = PendingEntry(
+            signal=Signal.BUY_CE if side == "CE" else Signal.BUY_PE,
+            created_at=datetime.now(),
+            option_symbol=symbol,
+            quantity=quantity,
+            option_trigger_level=trigger,
+            option_stop_level=trigger - risk_points,
+            trigger_candle_high=trigger,
+            trigger_candle_low=trigger,
+            order_id=order_id,
+        )
+        logger.info(
+            "restored open %s entry order from OpenAlgo: %s qty=%s trigger=%.2f limit=%.2f",
+            side, symbol, quantity, trigger, limit_price,
+        )
 
 
 def _seconds_until_market_open(cfg: StrategyConfig, now: Optional[datetime] = None) -> float:
@@ -476,6 +618,11 @@ class LiveFeedRunner:
         self._try_lock_atm(now)
         if not self.engine.state.atm_locked:
             return
+        if any(
+            self.engine._side_state(side).order_submission_uncertain
+            for side in ("CE", "PE")
+        ):
+            _restore_open_positions(self.engine, self.broker, now.date())
 
         for side, symbol in (
             ("CE", self.engine.state.ce_symbol),
@@ -533,7 +680,12 @@ class LiveFeedRunner:
             "LiveFeedRunner starting (spot=%s exchange=%s tf=%sm)",
             self.cfg.spot_symbol, self.cfg.exchange_spot, self.cfg.timeframe_minutes,
         )
-        _print_persisted_trade_alerts(self.engine.strategy_name, datetime.now().date())
+        _load_persisted_trade_alerts(self.engine, datetime.now().date())
+        _print_persisted_trade_alerts(
+            self.engine.strategy_name,
+            datetime.now().date(),
+            self.engine.cfg.option_index_symbol,
+        )
 
         # ── Market-hours awareness ───────────────────────────────────────
         if not self._is_market_open():
@@ -683,13 +835,14 @@ class LiveFeedRunner:
         for category in ("ENTRY", "EXIT"):
             matching = [alert for alert in today_alerts if alert.category == category]
             latest = matching[-1] if matching else None
-            previous_time = self._shown_alert_times[category]
-            if latest is not None and (previous_time is None or latest.timestamp > previous_time):
-                self._shown_alert_times[category] = latest.timestamp
-                alert = matching[-1]
-                print(f"│ Last {category.lower()}: [{alert.timestamp.strftime('%H:%M:%S')}] {alert.message}")
+            if latest is not None:
+                print(f"│ Last {category.lower()}: [{latest.timestamp.strftime('%H:%M:%S')}] {latest.message}")
             else:
                 print(f"│ Last {category.lower()}: --")
+        if today_alerts:
+            print("│ Trades today:")
+            for alert in today_alerts:
+                print(f"│   [{alert.timestamp.strftime('%H:%M:%S')}] {alert.category}: {alert.message}")
         print(f"├{'─' * 62}┤")
         print(ce_status)
         print(pe_status)
@@ -852,6 +1005,12 @@ class MultiEngineLiveFeedRunner:
         first_engine = self.engines[0][1]
         if not first_engine.state.atm_locked:
             return
+        for _, engine in self.engines:
+            if any(
+                engine._side_state(side).order_submission_uncertain
+                for side in ("CE", "PE")
+            ):
+                _restore_open_positions(engine, self.broker, now.date())
 
         for side, symbol in (
             ("CE", first_engine.state.ce_symbol),
@@ -917,7 +1076,12 @@ class MultiEngineLiveFeedRunner:
             names, self.cfg.spot_symbol, self.cfg.timeframe_minutes,
         )
         for engine in self.engines:
-            _print_persisted_trade_alerts(engine.strategy_name, datetime.now().date())
+            _load_persisted_trade_alerts(engine, datetime.now().date())
+            _print_persisted_trade_alerts(
+                engine.strategy_name,
+                datetime.now().date(),
+                engine.cfg.option_index_symbol,
+            )
 
         # ── Market-hours awareness ───────────────────────────────────────
         if not self._is_market_open():
@@ -996,6 +1160,13 @@ class MultiEngineLiveFeedRunner:
                 else:
                     trade = "FLAT"
                 print(f"│   {side}: {trade}  | {setup}")
+            today_alerts = [
+                alert for alert in engine.alerts
+                if alert.timestamp.date() == state.trading_day
+                and alert.category in ("ENTRY", "EXIT")
+            ]
+            for alert in today_alerts:
+                print(f"│   [{alert.timestamp.strftime('%H:%M:%S')}] {alert.category}: {alert.message}")
         print(f"└{'─' * 62}┘")
 
 
@@ -1124,6 +1295,7 @@ def run_historical_replay(
                 atm_strike,
                 cfg.strike_step,
                 preferred_weekday=cfg.weekly_expiry_weekday,
+                expiry_policy=cfg.expiry_policy,
             )
             engine.lock_atm_for_day(lock_ts, atm_price, expiry_day_override=expiry_day)
         ce_sym = engine.state.ce_symbol
@@ -1299,6 +1471,7 @@ def run_multi_historical_replay(
                 atm_strike,
                 cfg.strike_step,
                 preferred_weekday=cfg.weekly_expiry_weekday,
+                expiry_policy=cfg.expiry_policy,
             )
             engines[0][1].lock_atm_for_day(lock_ts, atm_price, expiry_day_override=expiry_day)
         for _, engine, _ in engines[1:]:

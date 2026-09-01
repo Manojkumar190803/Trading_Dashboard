@@ -161,6 +161,45 @@ def _setup_logging(level: str) -> None:
     logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
+def _env_int(name: str, default: int) -> int:
+    value = os.getenv(name)
+    return default if value is None or not value.strip() else int(value)
+
+
+def _env_float(name: str, default: float) -> float:
+    value = os.getenv(name)
+    return default if value is None or not value.strip() else float(value)
+
+
+def _env_time(name: str, default: str):
+    from datetime import time
+
+    value = os.getenv(name, default)
+    return time.fromisoformat(value)
+
+
+def _apply_ema21_policy(cfg: StrategyConfig) -> None:
+    cfg.timeframe_minutes = _env_int("EMA21_TIMEFRAME_MINUTES", 3)
+    cfg.market_open = _env_time("EMA21_MARKET_OPEN", "09:20")
+    cfg.atm_lock_time = _env_time("EMA21_ATM_LOCK_TIME", "09:20")
+    cfg.entry_start = _env_time("EMA21_ENTRY_START", "09:20")
+    cfg.signal_cutoff = _env_time("EMA21_SIGNAL_CUTOFF", "14:45")
+    cfg.entry_cutoff = _env_time("EMA21_ENTRY_CUTOFF", "14:45")
+    cfg.market_close = _env_time("EMA21_MARKET_CLOSE", "15:10")
+    cfg.force_square_off = _env_time("EMA21_FORCE_SQUARE_OFF", "15:10")
+    cfg.max_option_risk_points = _env_float("EMA21_MAX_OPTION_RISK_POINTS", 20.0)
+    cfg.max_trades_per_day = _env_int("EMA21_MAX_TRADES_PER_DAY", 3)
+
+
+def _apply_ema21_expiry_policy(cfg: StrategyConfig, script: str) -> None:
+    default_policy = "monthly" if script == "BANKNIFTY" else "weekly"
+    cfg.expiry_policy = os.getenv(f"{script}_EXPIRY_POLICY", default_policy).strip().lower()
+    if cfg.expiry_policy not in {"weekly", "monthly"}:
+        raise SystemExit(f"Invalid {script}_EXPIRY_POLICY: use weekly or monthly")
+    if cfg.expiry_policy == "monthly":
+        cfg.weekly_expiry_weekday = _env_int(f"{script}_EXPIRY_WEEKDAY", 3)
+
+
 def _build_broker(cfg: StrategyConfig, dry_run: bool) -> OpenAlgoBroker:
     api_key = os.getenv("OPENALGO_API_KEY")
     if not api_key:
@@ -334,17 +373,13 @@ def main(argv: Optional[list[str]] = None) -> None:
     strategy_names = [s.strip() for s in args.strategy.split(",")]
 
     if "ema21" in strategy_names:
-        from datetime import time
-
-        cfg.timeframe_minutes = 3
-        cfg.market_open = time(9, 20)
-        cfg.entry_start = time(9, 20)
-        cfg.signal_cutoff = time(14, 45)
-        cfg.entry_cutoff = time(14, 45)
-        cfg.market_close = time(15, 10)
-        cfg.force_square_off = time(15, 10)
-        cfg.max_option_risk_points = 20.0 if args.max_risk is None else args.max_risk
-        cfg.max_trades_per_day = 3
+        # EMA21 timing and risk policy is configured through EMA21_* in .env.
+        _apply_ema21_policy(cfg)
+        _apply_ema21_expiry_policy(cfg, script)
+        if args.timeframe:
+            cfg.timeframe_minutes = args.timeframe
+        if args.max_risk is not None:
+            cfg.max_option_risk_points = args.max_risk
 
     risk = RiskConfig()
     if args.max_sl is not None:

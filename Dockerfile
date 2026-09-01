@@ -8,9 +8,12 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY . .
+COPY run_strategy.py .
+COPY core ./core
+RUN mkdir -p strategies
+COPY strategies/base.py strategies/ema21.py ./strategies/
 
-ENV STRATEGY=hd,cd
+ENV STRATEGY=ema21
 ENV MODE=live
 ENV SCRIPT=NIFTY
 

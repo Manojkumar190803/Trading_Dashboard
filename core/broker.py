@@ -62,6 +62,7 @@ class BrokerInterface:
         atm_strike: int,
         strike_step: int,
         preferred_weekday: Optional[int] = None,
+        expiry_policy: str = "weekly",
     ) -> Optional[date]:
         """Return nearest tradable expiry date for an option root, if available."""
         return None
@@ -138,7 +139,7 @@ class OpenAlgoBroker(BrokerInterface):
         self.product = product
         self.exchange_options = exchange_options
         self.dry_run = dry_run
-        self._nearest_expiry_cache: dict[tuple[str, str, int, int, str], Optional[date]] = {}
+        self._nearest_expiry_cache: dict[tuple[str, str, int, int, str, str], Optional[date]] = {}
         logger.info(
             "OpenAlgoBroker initialized host=%s ws_url=%s product=%s dry_run=%s",
             host, ws_url, product, dry_run,
@@ -151,6 +152,7 @@ class OpenAlgoBroker(BrokerInterface):
         atm_strike: int,
         strike_step: int,
         preferred_weekday: Optional[int] = None,
+        expiry_policy: str = "weekly",
     ) -> Optional[date]:
         """Probe option symbols to find the next tradable expiry.
 
@@ -160,6 +162,7 @@ class OpenAlgoBroker(BrokerInterface):
         weekly/monthly expiry metadata.
         """
         root = (index_symbol or "").upper().strip()
+        policy = (expiry_policy or "weekly").strip().lower()
         key = (
             root,
             trade_day.isoformat(),
@@ -167,6 +170,7 @@ class OpenAlgoBroker(BrokerInterface):
             int(strike_step),
             self.exchange_options,
             int(preferred_weekday) if preferred_weekday is not None else -1,
+            policy,
         )
         if key in self._nearest_expiry_cache:
             return self._nearest_expiry_cache[key]
@@ -180,7 +184,8 @@ class OpenAlgoBroker(BrokerInterface):
         if preferred_weekday is not None and 0 <= preferred_weekday <= 6:
             for day_offset in range(1, 70):
                 d = trade_day + timedelta(days=day_offset)
-                if d.weekday() == preferred_weekday:
+                is_month_end = (d + timedelta(days=7)).month != d.month
+                if d.weekday() == preferred_weekday and (policy != "monthly" or is_month_end):
                     candidate_days.append(d)
                 if len(candidate_days) >= 10:
                     break
@@ -192,7 +197,8 @@ class OpenAlgoBroker(BrokerInterface):
             count = 0
             for day_offset in range(1, 35):
                 d = trade_day + timedelta(days=day_offset)
-                if d.weekday() == wd:
+                is_month_end = (d + timedelta(days=7)).month != d.month
+                if d.weekday() == wd and (policy != "monthly" or is_month_end):
                     if d not in candidate_days:
                         candidate_days.append(d)
                     count += 1

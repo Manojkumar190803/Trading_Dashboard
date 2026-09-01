@@ -5,6 +5,10 @@ from datetime import datetime
 import pandas as pd
 
 import core.runner as runner
+from core.broker import ConsoleBroker
+from core.engine import BaseStrategyEngine
+from core.models import RiskConfig, StrategyConfig
+from strategies.ema21 import EMA21SignalProvider
 
 
 def _sample_df() -> pd.DataFrame:
@@ -55,3 +59,116 @@ def test_resolve_option_pair_history_falls_back_to_nearby_strike(monkeypatch):
     assert ce_sym == "NIFTY11AUG2624550CE"
     assert pe_sym == "NIFTY11AUG2624550PE"
     assert off == -1
+
+
+def test_restore_open_position_without_alert_recreates_protection(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+
+    class PositionBroker(ConsoleBroker):
+        def get_position_book(self):
+            return [{
+                "symbol": "NIFTY01SEP2624250CE",
+                "quantity": 130,
+                "average_price": 93.6,
+            }]
+
+        def get_open_orders(self):
+            return []
+
+    broker = PositionBroker()
+    engine = BaseStrategyEngine(
+        StrategyConfig(), RiskConfig(), broker, EMA21SignalProvider()
+    )
+    engine.state.ce.option_symbol = "NIFTY01SEP2624250CE"
+    engine.state.pe.option_symbol = "NIFTY01SEP2624250PE"
+
+    runner._restore_open_positions(engine, broker, datetime(2026, 8, 27).date())
+
+    position = engine.state.ce.position
+    assert position is not None
+    assert position.quantity == 130
+    assert position.entry_price == 93.6
+    assert position.option_stop_level == 73.6
+
+
+def test_restore_open_entry_order_after_restart(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+
+    class EntryOrderBroker(ConsoleBroker):
+        def get_position_book(self):
+            return []
+
+        def get_open_orders(self):
+            return [{
+                "symbol": "NIFTY01SEP2624050CE",
+                "action": "BUY",
+                "quantity": 130,
+                "price": 78.80,
+                "trigger_price": 78.30,
+                "orderid": "26083140021566",
+            }]
+
+    broker = EntryOrderBroker()
+    engine = BaseStrategyEngine(
+        StrategyConfig(), RiskConfig(), broker, EMA21SignalProvider()
+    )
+    engine.state.ce.option_symbol = "NIFTY01SEP2624050CE"
+    engine.state.pe.option_symbol = "NIFTY01SEP2624050PE"
+    engine.state.ce.order_submission_uncertain = True
+
+    runner._restore_open_positions(engine, broker, datetime(2026, 8, 31).date())
+
+    pending = engine.state.ce.pending_entry
+    assert pending is not None
+    assert pending.order_id == "26083140021566"
+    assert pending.quantity == 130
+    assert pending.option_trigger_level == 78.30
+    assert engine.state.ce.order_submission_uncertain is False
+
+
+def test_restore_uncertain_entry_preserves_original_ema21_stop(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+
+    class UncertainEntryBroker(ConsoleBroker):
+        def __init__(self):
+            super().__init__()
+            self.cancelled = []
+
+        def get_position_book(self):
+            return [{
+                "symbol": "NIFTY08SEP2624050PE",
+                "quantity": 130,
+                "average_price": 85.0,
+            }]
+
+        def get_open_orders(self):
+            return [{
+                "symbol": "NIFTY08SEP2624050PE",
+                "action": "SELL",
+                "quantity": 130,
+                "price": 64.0,
+                "trigger_price": 65.0,
+                "orderid": "BAD-SL",
+            }]
+
+        def cancel_order(self, order_id):
+            self.cancelled.append(order_id)
+            return True
+
+    broker = UncertainEntryBroker()
+    engine = BaseStrategyEngine(
+        StrategyConfig(), RiskConfig(), broker, EMA21SignalProvider()
+    )
+    side_state = engine.state.pe
+    side_state.option_symbol = "NIFTY08SEP2624050PE"
+    side_state.order_submission_uncertain = True
+    side_state.first_red_high = 84.80  # type: ignore[attr-defined]
+    side_state.setup_candle_low = 77.75  # type: ignore[attr-defined]
+
+    runner._restore_open_positions(engine, broker, datetime(2026, 9, 1).date())
+
+    assert side_state.position is not None
+    assert side_state.position.entry_price == 85.0
+    assert side_state.position.option_entry_trigger == 84.80
+    assert side_state.position.option_stop_level == 77.75
+    assert broker.cancelled == ["BAD-SL"]
