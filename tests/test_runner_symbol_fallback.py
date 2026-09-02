@@ -1,6 +1,7 @@
 """Tests for replay option symbol fallback helpers in core.runner."""
 
 from datetime import datetime
+from types import SimpleNamespace
 
 import pandas as pd
 
@@ -91,6 +92,46 @@ def test_restore_open_position_without_alert_recreates_protection(tmp_path, monk
     assert position.option_stop_level == 73.6
 
 
+def test_restore_open_position_parses_comma_separated_entry_alert(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    logs_dir = tmp_path / "logs"
+    logs_dir.mkdir()
+    (logs_dir / "trade_alerts_NIFTY_20260902.csv").write_text(
+        "timestamp,strategy,category,message\n"
+        "2026-09-02 14:06:00,EMA21SignalProvider,ENTRY,"
+        '"Entered CE NIFTY08SEP2623850CE @ 180.65, qty=130, trigger=180.35, '
+        'SL=170.30, option_risk=10.05"\n',
+        encoding="utf-8",
+    )
+
+    class PositionBroker(ConsoleBroker):
+        def get_position_book(self):
+            return [{
+                "symbol": "NIFTY08SEP2623850CE",
+                "quantity": 130,
+                "average_price": 180.65,
+            }]
+
+        def get_open_orders(self):
+            return []
+
+    broker = PositionBroker()
+    engine = BaseStrategyEngine(
+        StrategyConfig(), RiskConfig(), broker, EMA21SignalProvider()
+    )
+    engine.state.ce.option_symbol = "NIFTY08SEP2623850CE"
+    engine.state.pe.option_symbol = "NIFTY08SEP2623850PE"
+
+    runner._restore_open_positions(engine, broker, datetime(2026, 9, 2).date())
+
+    position = engine.state.ce.position
+    assert position is not None
+    assert position.quantity == 130
+    assert position.entry_price == 180.65
+    assert position.option_entry_trigger == 180.35
+    assert position.option_stop_level == 170.30
+
+
 def test_restore_open_entry_order_after_restart(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
 
@@ -172,3 +213,30 @@ def test_restore_uncertain_entry_preserves_original_ema21_stop(tmp_path, monkeyp
     assert side_state.position.option_entry_trigger == 84.80
     assert side_state.position.option_stop_level == 77.75
     assert broker.cancelled == ["BAD-SL"]
+
+
+def test_live_tick_poll_includes_pending_entry_symbol():
+    class QuoteBroker(ConsoleBroker):
+        def __init__(self):
+            super().__init__(ltp_fallback=116.5)
+            self.quoted = []
+
+        def get_ltp(self, symbol):
+            self.quoted.append(symbol)
+            return super().get_ltp(symbol)
+
+    side_state = SimpleNamespace(
+        position=None,
+        pending_entry=SimpleNamespace(option_symbol="NIFTY01SEP2624250PE"),
+    )
+    engine = SimpleNamespace(
+        _side_state=lambda side: side_state,
+        process_tick=lambda *args: (_ for _ in ()).throw(AssertionError("pending order cannot process risk ticks")),
+    )
+    live_runner = runner.LiveFeedRunner.__new__(runner.LiveFeedRunner)
+    live_runner.engine = engine
+    live_runner.broker = QuoteBroker()
+
+    live_runner._poll_active_ticks()
+
+    assert live_runner.broker.quoted == ["NIFTY01SEP2624250PE"]

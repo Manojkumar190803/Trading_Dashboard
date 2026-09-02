@@ -268,6 +268,17 @@ class BaseStrategyEngine:
     def _pnl_entry_price(self, pos: Position) -> float:
         return pos.entry_price
 
+    def _broker_quantity(self, symbol: str) -> Optional[int]:
+        if not getattr(self.broker, "requires_position_reconciliation", False):
+            return None
+        try:
+            for position in self.broker.get_position_book():
+                if str(position.get("symbol") or "") == symbol:
+                    return int(float(position.get("quantity") or 0))
+        except Exception as exc:
+            logger.warning("position reconciliation failed for %s: %s", symbol, exc)
+        return 0
+
     def _place_protective_stop(self, side: str, position: Position, ts: datetime) -> None:
         if self.broker.is_replay:
             return
@@ -341,6 +352,17 @@ class BaseStrategyEngine:
 
         qty = min(quantity, pos.quantity)
         if qty <= 0:
+            return
+
+        broker_quantity = self._broker_quantity(pos.option_symbol)
+        if broker_quantity is not None and broker_quantity < qty:
+            side = pos.option_type
+            self._record_alert(
+                ts,
+                "RISK",
+                f"{side} exit blocked: broker quantity for {pos.option_symbol} is "
+                f"{broker_quantity}, local long quantity is {qty}",
+            )
             return
 
         exit_ltp = self.broker.get_ltp(pos.option_symbol)
@@ -505,6 +527,24 @@ class BaseStrategyEngine:
         )
 
     # ── entry placement ────────────────────────────────────────────
+
+    def _cancel_pending_entry_order(
+        self,
+        side: str,
+        pending: PendingEntry,
+        ts: datetime,
+    ) -> bool:
+        order_id = getattr(pending, "order_id", None)
+        if self.broker.is_replay or not order_id:
+            return True
+        if self.broker.cancel_order(order_id):
+            return True
+        self._record_alert(
+            ts,
+            "RISK",
+            f"{side} pending order {order_id} cancellation failed; keeping it tracked",
+        )
+        return False
 
     def place_pending_entry(
         self,
@@ -742,6 +782,16 @@ class BaseStrategyEngine:
                 self._record_alert(ts, "CANCEL", f"{side} EMA21 entry order {order_status}")
                 side_state.pending_entry = None
             elif order_status in {"complete", "filled", "executed"}:
+                broker_quantity = self._broker_quantity(pending.option_symbol)
+                if broker_quantity is not None and broker_quantity < pending.quantity:
+                    side_state.order_submission_uncertain = True
+                    self._record_alert(
+                        ts,
+                        "RISK",
+                        f"{side} entry fill blocked: broker quantity for {pending.option_symbol} "
+                        f"is {broker_quantity}, expected long quantity is {pending.quantity}",
+                    )
+                    return
                 option_ltp = float(
                     status.get("average_price") or status.get("price") or pending.option_trigger_level
                 )
@@ -780,7 +830,8 @@ class BaseStrategyEngine:
                 f"{side} pending cancelled: expired after {candles_elapsed} candles "
                 f"(limit={self.cfg.pending_entry_expiry_candles})",
             )
-            side_state.pending_entry = None
+            if self._cancel_pending_entry_order(side, pending, ts):
+                side_state.pending_entry = None
             return
 
         # Cancel pending if SL level is breached before entry triggers.
@@ -789,7 +840,8 @@ class BaseStrategyEngine:
                 ts, "CANCEL",
                 f"{side} pending cancelled: SL breached (low={row['low']:.2f} <= SL={pending.option_stop_level:.2f})",
             )
-            side_state.pending_entry = None
+            if self._cancel_pending_entry_order(side, pending, ts):
+                side_state.pending_entry = None
             return
 
         if float(row["high"]) < pending.option_trigger_level:
@@ -1007,7 +1059,11 @@ class BaseStrategyEngine:
         self.check_trailing_stop(side_state, row=row)
 
     def force_square_off_side(self, side_state: BaseSideState, ts: datetime) -> None:
-        side_state.pending_entry = None
+        pending = side_state.pending_entry
+        if pending is not None:
+            side = "CE" if side_state is self.state.ce else "PE"
+            if self._cancel_pending_entry_order(side, pending, ts):
+                side_state.pending_entry = None
         pos = side_state.position
         if pos is None:
             return
@@ -1139,8 +1195,10 @@ class BaseStrategyEngine:
 
         if not self.in_signal_window(ts):
             if side_state.pending_entry is not None:
-                side_state.pending_entry = None
-                self._record_alert(ts, "SESSION", f"{side} pending entry cancelled at signal cutoff")
+                pending = side_state.pending_entry
+                if self._cancel_pending_entry_order(side, pending, ts):
+                    side_state.pending_entry = None
+                    self._record_alert(ts, "SESSION", f"{side} pending entry cancelled at signal cutoff")
             self.monitor_open_position(side_state, row)
             remark = "OUTSIDE_SIGNAL_WINDOW"
             self._record_trace_row(side, side_state, row, signal, False, remark)
@@ -1153,8 +1211,10 @@ class BaseStrategyEngine:
         self.signal_provider.update_state(side_state, row, prev_row)
         if self._is_ema21_strategy() and getattr(side_state, "ema_failure", False):
             if side_state.pending_entry is not None:
-                side_state.pending_entry = None
-                self._record_alert(ts, "CANCEL", f"{side} pending entry cancelled: confirmation EMA failure")
+                pending = side_state.pending_entry
+                if self._cancel_pending_entry_order(side, pending, ts):
+                    side_state.pending_entry = None
+                    self._record_alert(ts, "CANCEL", f"{side} pending entry cancelled: confirmation EMA failure")
             if side_state.position is not None:
                 self._exit_position(
                     side_state,

@@ -187,7 +187,7 @@ def _env_time(name: str, default: str):
 
 def _apply_ema21_policy(cfg: StrategyConfig, script: str) -> None:
     cfg.timeframe_minutes = _env_int("EMA21_TIMEFRAME_MINUTES", 3)
-    cfg.market_open = _env_time("EMA21_MARKET_OPEN", "09:20")
+    cfg.market_open = _env_time("EMA21_MARKET_OPEN", "09:15")
     cfg.atm_lock_time = _env_time("EMA21_ATM_LOCK_TIME", "09:20")
     cfg.entry_start = _env_time("EMA21_ENTRY_START", "09:20")
     cfg.signal_cutoff = _env_time("EMA21_SIGNAL_CUTOFF", "14:45")

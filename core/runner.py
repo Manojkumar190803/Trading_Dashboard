@@ -214,7 +214,7 @@ def _restore_open_positions(engine: BaseStrategyEngine, broker: OpenAlgoBroker, 
 
     entry_pattern = re.compile(
         r"(?:Entered|Uncertain) (CE|PE) (\S+)(?: @ ([\d.]+),)? qty=(\d+),?\s+"
-        r"(?:alert_trigger|trigger)=([\d.]+) SL=([\d.]+)(?:, option_risk=([\d.]+))?"
+        r"(?:alert_trigger|trigger)=([\d.]+),?\s+SL=([\d.]+)(?:, option_risk=([\d.]+))?"
     )
     for position in broker_positions:
         symbol = str(position.get("symbol") or "")
@@ -618,11 +618,9 @@ class LiveFeedRunner:
         self._try_lock_atm(now)
         if not self.engine.state.atm_locked:
             return
-        if any(
-            self.engine._side_state(side).order_submission_uncertain
-            for side in ("CE", "PE")
-        ):
-            _restore_open_positions(self.engine, self.broker, now.date())
+        # Reconcile on every startup/poll boundary so a fresh container can
+        # immediately rebuild local positions from the broker before ticking.
+        _restore_open_positions(self.engine, self.broker, now.date())
 
         for side, symbol in (
             ("CE", self.engine.state.ce_symbol),
@@ -637,7 +635,7 @@ class LiveFeedRunner:
                 continue
             self._process_new_bars_for_side(side, data)
 
-    def _wait_with_countdown(self, seconds: float) -> bool:
+    def _wait_with_countdown(self, seconds: float, label: str = "Next candle") -> bool:
         import sys
         deadline = datetime.now() + timedelta(seconds=seconds)
         while not self._stop.is_set():
@@ -646,7 +644,7 @@ class LiveFeedRunner:
                 break
             self._poll_active_ticks()
             mins, secs = divmod(int(remaining), 60)
-            sys.stdout.write(f"\r⏳ Next candle in {mins:02d}:{secs:02d} ")
+            sys.stdout.write(f"\r⏳ {label} in {mins:02d}:{secs:02d} ")
             sys.stdout.flush()
             if self._stop.wait(min(1.0, remaining)):
                 sys.stdout.write("\r" + " " * 30 + "\r")
@@ -657,23 +655,30 @@ class LiveFeedRunner:
         return False
 
     def _poll_active_ticks(self) -> None:
+        active_symbols: dict[str, list[tuple[str, object]]] = {}
         for side in ("CE", "PE"):
             side_state = self.engine._side_state(side)
-            if side_state.position is None:
+            if side_state.position is not None:
+                symbol = side_state.position.option_symbol
+            elif side_state.pending_entry is not None:
+                symbol = side_state.pending_entry.option_symbol
+            else:
                 continue
+            active_symbols.setdefault(symbol, []).append((side, side_state))
+
+        for symbol, subscriptions in active_symbols.items():
             try:
-                ltp = self.broker.get_ltp(side_state.position.option_symbol)
+                ltp = self.broker.get_ltp(symbol)
             except Exception as exc:
-                logger.warning("tick quote failed for %s: %s", side_state.position.option_symbol, exc)
+                logger.warning("tick quote failed for %s: %s", symbol, exc)
                 continue
             if ltp > 0:
                 tick_time = datetime.now()
-                print(
-                    f"[TICK] {tick_time} side={side} "
-                    f"symbol={side_state.position.option_symbol} "
-                    f"ltp={float(ltp):.2f} sl={side_state.position.option_stop_level:.2f}"
-                )
-                self.engine.process_tick(side, float(ltp), tick_time)
+                labels = ",".join(side for side, _ in subscriptions)
+                print(f"[TICK] {tick_time} side={labels} symbol={symbol} ltp={float(ltp):.2f}")
+                for side, side_state in subscriptions:
+                    if side_state.position is not None:
+                        self.engine.process_tick(side, float(ltp), tick_time)
 
     def run_forever(self) -> None:
         logger.info(
@@ -694,7 +699,7 @@ class LiveFeedRunner:
             )
             while not self._is_market_open() and not self._stop.is_set():
                 wait = _seconds_until_market_open(self.cfg)
-                if self._wait_with_countdown(wait):
+                if self._wait_with_countdown(wait, "Market opens"):
                     break
 
         try:
@@ -706,9 +711,9 @@ class LiveFeedRunner:
         while not self._stop.is_set():
             # ── Skip poll if market is closed ────────────────────────────
             if not self._is_market_open():
-                sleep_for = self._seconds_until_next_boundary() + 60.0
+                sleep_for = _seconds_until_market_open(self.cfg)
                 logger.debug("market closed — sleeping %.1fs", sleep_for)
-                if self._wait_with_countdown(sleep_for):
+                if self._wait_with_countdown(sleep_for, "Market opens"):
                     break
                 continue
 
@@ -1006,11 +1011,9 @@ class MultiEngineLiveFeedRunner:
         if not first_engine.state.atm_locked:
             return
         for _, engine in self.engines:
-            if any(
-                engine._side_state(side).order_submission_uncertain
-                for side in ("CE", "PE")
-            ):
-                _restore_open_positions(engine, self.broker, now.date())
+            # Reconcile every startup/poll boundary so restored broker
+            # positions are available to the active tick poller immediately.
+            _restore_open_positions(engine, self.broker, now.date())
 
         for side, symbol in (
             ("CE", first_engine.state.ce_symbol),
@@ -1025,7 +1028,7 @@ class MultiEngineLiveFeedRunner:
                 continue
             self._process_new_bars_for_side(side, data)
 
-    def _wait_with_countdown(self, seconds: float) -> bool:
+    def _wait_with_countdown(self, seconds: float, label: str = "Next candle") -> bool:
         import sys
         deadline = datetime.now() + timedelta(seconds=seconds)
         while not self._stop.is_set():
@@ -1034,7 +1037,7 @@ class MultiEngineLiveFeedRunner:
                 break
             self._poll_active_ticks()
             mins, secs = divmod(int(remaining), 60)
-            sys.stdout.write(f"\r⏳ Next candle in {mins:02d}:{secs:02d} ")
+            sys.stdout.write(f"\r⏳ {label} in {mins:02d}:{secs:02d} ")
             sys.stdout.flush()
             if self._stop.wait(min(1.0, remaining)):
                 sys.stdout.write("\r" + " " * 30 + "\r")
@@ -1046,28 +1049,29 @@ class MultiEngineLiveFeedRunner:
 
     def _poll_active_ticks(self) -> None:
         now = datetime.now()
-        seen_symbols: set[str] = set()
+        active_symbols: dict[str, list[tuple[BaseStrategyEngine, str, object]]] = {}
         for _, engine in self.engines:
             for side in ("CE", "PE"):
-                position = engine._side_state(side).position
-                if position is None or position.option_symbol in seen_symbols:
+                side_state = engine._side_state(side)
+                if side_state.position is not None:
+                    symbol = side_state.position.option_symbol
+                elif side_state.pending_entry is not None:
+                    symbol = side_state.pending_entry.option_symbol
+                else:
                     continue
-                seen_symbols.add(position.option_symbol)
-                try:
-                    ltp = self.broker.get_ltp(position.option_symbol)
-                except Exception as exc:
-                    logger.warning("tick quote failed for %s: %s", position.option_symbol, exc)
-                    continue
-                if ltp > 0:
-                    print(
-                        f"[TICK] {now} symbol={position.option_symbol} "
-                        f"ltp={float(ltp):.2f} sl={position.option_stop_level:.2f}"
-                    )
-                    for _, active_engine in self.engines:
-                        for active_side in ("CE", "PE"):
-                            active_position = active_engine._side_state(active_side).position
-                            if active_position is not None and active_position.option_symbol == position.option_symbol:
-                                active_engine.process_tick(active_side, float(ltp), now)
+                active_symbols.setdefault(symbol, []).append((engine, side, side_state))
+
+        for symbol, subscriptions in active_symbols.items():
+            try:
+                ltp = self.broker.get_ltp(symbol)
+            except Exception as exc:
+                logger.warning("tick quote failed for %s: %s", symbol, exc)
+                continue
+            if ltp > 0:
+                print(f"[TICK] {now} symbol={symbol} ltp={float(ltp):.2f}")
+                for active_engine, active_side, side_state in subscriptions:
+                    if side_state.position is not None:
+                        active_engine.process_tick(active_side, float(ltp), now)
 
     def run_forever(self) -> None:
         names = ", ".join(n for n, _ in self.engines)
@@ -1090,7 +1094,7 @@ class MultiEngineLiveFeedRunner:
             )
             while not self._is_market_open() and not self._stop.is_set():
                 wait = _seconds_until_market_open(self.cfg)
-                if self._wait_with_countdown(wait):
+                if self._wait_with_countdown(wait, "Market opens"):
                     break
 
         try:
@@ -1102,9 +1106,9 @@ class MultiEngineLiveFeedRunner:
         while not self._stop.is_set():
             # ── Skip poll if market is closed ────────────────────────────
             if not self._is_market_open():
-                sleep_for = self._seconds_until_next_boundary() + 60.0
+                sleep_for = _seconds_until_market_open(self.cfg)
                 logger.debug("market closed — sleeping %.1fs", sleep_for)
-                if self._wait_with_countdown(sleep_for):
+                if self._wait_with_countdown(sleep_for, "Market opens"):
                     break
                 continue
 

@@ -141,6 +141,64 @@ def test_engine_places_ema21_stop_entry_at_red_high():
     assert engine.total_entries == 1
 
 
+def test_ema21_cancels_old_order_before_accepting_new_setup():
+    class LiveOrderBroker(ConsoleBroker):
+        def __init__(self):
+            super().__init__(ltp_fallback=107.0)
+            self.order_ids = []
+            self.cancelled = []
+
+        def place_stop_limit_order(self, symbol, side, quantity, trigger_price, limit_price):
+            order_id = f"OID-{len(self.order_ids) + 1}"
+            self.order_ids.append((order_id, trigger_price))
+            return order_id
+
+        def get_order_status(self, order_id):
+            return {"order_status": "open", "orderid": order_id}
+
+        def cancel_order(self, order_id):
+            self.cancelled.append(order_id)
+            return True
+
+    provider = EMA21SignalProvider()
+    broker = LiveOrderBroker()
+    engine = BaseStrategyEngine(
+        StrategyConfig(max_option_risk_points=30.0),
+        RiskConfig(max_sl_per_day=3),
+        broker,
+        provider,
+    )
+    engine.state.trading_day = datetime(2026, 8, 10).date()
+    engine.state.atm_locked = True
+    engine.state.ce = provider.create_side_state()
+    engine.state.ce.option_symbol = "NIFTY12AUG2625000CE"
+
+    previous = _row(0, open_=100, high=101, low=98, close=99, ema=100)
+    first_setup = _row(1, open_=99, high=103, low=95, close=101, ema=100)
+    first_green = _row(2, open_=101, high=110, low=100, close=105, ema=101)
+    first_red = _row(3, open_=120, high=116.25, low=108, close=112, ema=110)
+    failed = _row(4, open_=112, high=114, low=106, close=108, ema=110)
+    second_setup = _row(5, open_=108, high=115, low=100, close=112, ema=110)
+    second_green = _row(6, open_=112, high=120, low=110, close=118, ema=115)
+    second_red = _row(7, open_=124, high=123.40, low=115, close=120, ema=118)
+
+    for row, prior in (
+        (first_setup, previous),
+        (first_green, first_setup),
+        (first_red, first_green),
+        (failed, first_red),
+        (second_setup, failed),
+        (second_green, second_setup),
+        (second_red, second_green),
+    ):
+        engine.process_option_candle("CE", row, prior)
+
+    assert broker.cancelled == ["OID-1"]
+    assert broker.order_ids == [("OID-1", 116.25), ("OID-2", 123.40)]
+    assert engine.state.ce.pending_entry is not None
+    assert engine.state.ce.pending_entry.option_trigger_level == 123.40
+
+
 def test_engine_does_not_create_order_when_entry_stop_gap_exceeds_25_points():
     provider = EMA21SignalProvider()
     engine = BaseStrategyEngine(

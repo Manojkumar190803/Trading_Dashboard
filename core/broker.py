@@ -18,6 +18,7 @@ class BrokerInterface:
     """Abstract broker — subclass and implement for your broker API."""
 
     is_replay = False
+    requires_position_reconciliation = False
 
     def get_ltp(self, symbol: str) -> float:
         raise NotImplementedError
@@ -115,6 +116,8 @@ class ConsoleBroker(BrokerInterface):
 
 class OpenAlgoBroker(BrokerInterface):
     """BrokerInterface backed by the OpenAlgo REST client."""
+
+    requires_position_reconciliation = True
 
     def __init__(
         self,

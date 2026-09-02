@@ -42,10 +42,31 @@ class RecordingBroker(ConsoleBroker):
     def __init__(self):
         super().__init__()
         self.stop_orders = []
+        self.cancelled_orders = []
+
+    def cancel_order(self, order_id):
+        self.cancelled_orders.append(order_id)
+        return True
 
     def place_stop_limit_order(self, symbol, side, quantity, trigger_price, limit_price):
         self.stop_orders.append((symbol, side, quantity, trigger_price, limit_price))
         return f"OID-{len(self.stop_orders)}"
+
+
+class ReconciledBroker(RecordingBroker):
+    requires_position_reconciliation = True
+
+    def __init__(self, quantity):
+        super().__init__()
+        self.quantity = quantity
+        self.market_orders = []
+
+    def get_position_book(self):
+        return [{"symbol": "NIFTY08AUG2625000PE", "quantity": self.quantity}]
+
+    def place_market_order(self, symbol, side, quantity):
+        self.market_orders.append((symbol, side, quantity))
+        return "MKT-1"
 
 
 class EMA21StubSignalProvider(StubSignalProvider):
@@ -143,6 +164,61 @@ def test_live_entry_places_separate_protective_sell_stop():
     assert any(alert.category == "PROTECTIVE_SL" for alert in engine.alerts)
 
 
+def test_live_exit_is_blocked_when_broker_has_short_position():
+    broker = ReconciledBroker(-130)
+    engine = BaseStrategyEngine(
+        cfg=StrategyConfig(),
+        risk=RiskConfig(),
+        broker=broker,
+        signal_provider=StubSignalProvider(),
+    )
+    _attach_position(engine, "PE")
+
+    engine._exit_position(
+        engine.state.pe,
+        datetime(2026, 8, 8, 11, 0),
+        130,
+        "test exit",
+    )
+
+    assert broker.market_orders == []
+    assert engine.state.pe.position is not None
+    assert any("exit blocked" in alert.message for alert in engine.alerts)
+
+
+def test_live_entry_fill_is_blocked_when_broker_reports_short_position():
+    broker = ReconciledBroker(-130)
+    engine = BaseStrategyEngine(
+        cfg=StrategyConfig(),
+        risk=RiskConfig(),
+        broker=broker,
+        signal_provider=EMA21StubSignalProvider(),
+    )
+    side_state = engine.state.pe
+    side_state.pending_entry = PendingEntry(
+        signal=Signal.BUY_PE,
+        created_at=datetime(2026, 8, 8, 10, 0),
+        option_symbol="NIFTY08AUG2625000PE",
+        quantity=130,
+        option_trigger_level=116.25,
+        option_stop_level=108.85,
+        trigger_candle_high=116.25,
+        trigger_candle_low=110.0,
+        order_id="OPEN-1",
+    )
+
+    engine.try_fill_pending_entry(
+        "PE",
+        side_state,
+        datetime(2026, 8, 8, 10, 3),
+        _row(datetime(2026, 8, 8, 10, 3), high=120.0, low=110.0),
+    )
+
+    assert side_state.position is None
+    assert side_state.order_submission_uncertain is True
+    assert any("fill blocked" in alert.message for alert in engine.alerts)
+
+
 def test_candle_low_hits_trailing_stop_after_same_candle_trail_update():
     engine = _make_engine()
     side_state = engine.state.ce
@@ -226,10 +302,35 @@ def test_pending_entry_expires_after_3_candles():
 
     # 4 candles elapsed (12 minutes on 3m TF) -> should expire.
     row = _row(datetime(2026, 8, 8, 10, 12), high=110.0, low=95.0)
-    engine.process_option_candle("CE", row, None)
+    engine.try_fill_pending_entry("CE", row=row, side_state=ss, ts=row["datetime"])
 
     assert ss.pending_entry is None
     assert any("expired after" in a.message for a in engine.alerts)
+
+
+def test_live_pending_entry_cancellation_cancels_broker_order():
+    broker = RecordingBroker()
+    engine = _make_engine()
+    engine.broker = broker
+    engine.state.trading_day = datetime(2026, 8, 8).date()
+    side_state = engine.state.ce
+    side_state.pending_entry = PendingEntry(
+        signal=Signal.BUY_CE,
+        created_at=datetime(2026, 8, 8, 10, 0),
+        option_symbol="NIFTY08AUG2625000CE",
+        quantity=65,
+        option_trigger_level=120.0,
+        option_stop_level=90.0,
+        trigger_candle_high=119.0,
+        trigger_candle_low=95.0,
+        order_id="OPEN-1",
+    )
+
+    row = _row(datetime(2026, 8, 8, 10, 12), high=110.0, low=95.0)
+    engine.try_fill_pending_entry("CE", row=row, side_state=side_state, ts=row["datetime"])
+
+    assert broker.cancelled_orders == ["OPEN-1"]
+    assert side_state.pending_entry is None
 
 
 def test_pending_entry_still_valid_at_3rd_candle():
