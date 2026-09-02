@@ -380,6 +380,7 @@ class BaseStrategyEngine:
                 )
 
     def get_status_snapshot(self) -> dict:
+        unrealized_pnl = self._get_unrealized_pnl()
         total_pnl = self.realized_pnl + unrealized_pnl
 
         def _side_payload(side_state: BaseSideState) -> dict:

@@ -97,7 +97,7 @@ def get_signal_provider(name: str, args: argparse.Namespace) -> SignalProvider:
 def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Unified strategy runner")
     parser.add_argument(
-        "--script", type=str, default="NIFTY",
+        "--script", type=str, nargs="+", default=["NIFTY"],
         help="Underlying script: NIFTY | BANKNIFTY | SENSEX (auto-discovers lot/strike/expiry from OpenAlgo)",
     )
     parser.add_argument(
@@ -139,6 +139,13 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _normalize_scripts(values: list[str]) -> list[str]:
+    scripts: list[str] = []
+    for value in values:
+        scripts.extend(part.strip().upper() for part in value.split(",") if part.strip())
+    return scripts
+
+
 def _load_dotenv_if_present() -> None:
     try:
         from dotenv import load_dotenv  # type: ignore
@@ -178,7 +185,7 @@ def _env_time(name: str, default: str):
     return time.fromisoformat(value)
 
 
-def _apply_ema21_policy(cfg: StrategyConfig) -> None:
+def _apply_ema21_policy(cfg: StrategyConfig, script: str) -> None:
     cfg.timeframe_minutes = _env_int("EMA21_TIMEFRAME_MINUTES", 3)
     cfg.market_open = _env_time("EMA21_MARKET_OPEN", "09:20")
     cfg.atm_lock_time = _env_time("EMA21_ATM_LOCK_TIME", "09:20")
@@ -187,7 +194,13 @@ def _apply_ema21_policy(cfg: StrategyConfig) -> None:
     cfg.entry_cutoff = _env_time("EMA21_ENTRY_CUTOFF", "14:45")
     cfg.market_close = _env_time("EMA21_MARKET_CLOSE", "15:10")
     cfg.force_square_off = _env_time("EMA21_FORCE_SQUARE_OFF", "15:10")
-    cfg.max_option_risk_points = _env_float("EMA21_MAX_OPTION_RISK_POINTS", 20.0)
+    script_max_risk = os.getenv(f"{script}_MAX_OPTION_RISK_POINTS")
+    if script_max_risk and script_max_risk.strip():
+        cfg.max_option_risk_points = float(script_max_risk)
+    elif script == "BANKNIFTY":
+        cfg.max_option_risk_points = 25.0
+    else:
+        cfg.max_option_risk_points = _env_float("EMA21_MAX_OPTION_RISK_POINTS", 20.0)
     cfg.max_trades_per_day = _env_int("EMA21_MAX_TRADES_PER_DAY", 3)
 
 
@@ -346,13 +359,12 @@ def _run_mixed_live(
         opt_thread.join(timeout=5)
 
 
-def main(argv: Optional[list[str]] = None) -> None:
-    args = _parse_args(argv)
+def _run_single_script(args: argparse.Namespace) -> None:
     _setup_logging(args.log_level)
     _load_dotenv_if_present()
 
     cfg = StrategyConfig()
-    script = (args.script or "").upper().replace(" ", "")
+    script = args.script
     if script not in SCRIPT_CHOICES:
         allowed = ", ".join(SCRIPT_CHOICES)
         raise SystemExit(f"Invalid --script '{args.script}'. Allowed: {allowed}")
@@ -374,7 +386,7 @@ def main(argv: Optional[list[str]] = None) -> None:
 
     if "ema21" in strategy_names:
         # EMA21 timing and risk policy is configured through EMA21_* in .env.
-        _apply_ema21_policy(cfg)
+        _apply_ema21_policy(cfg, script)
         _apply_ema21_expiry_policy(cfg, script)
         if args.timeframe:
             cfg.timeframe_minutes = args.timeframe
@@ -459,6 +471,18 @@ def main(argv: Optional[list[str]] = None) -> None:
     else:
         signal_provider = get_signal_provider(strategy_names[0], args)
         _run_live(cfg, risk, signal_provider, dry_run=dry_run, diagnose=args.diagnose, verbose=args.verbose)
+
+
+def main(argv: Optional[list[str]] = None) -> None:
+    args = _parse_args(argv)
+    scripts = _normalize_scripts(args.script)
+    if not scripts:
+        raise SystemExit("--script requires at least one script name")
+
+    for script in scripts:
+        single_args = argparse.Namespace(**vars(args))
+        single_args.script = script
+        _run_single_script(single_args)
 
 
 if __name__ == "__main__":

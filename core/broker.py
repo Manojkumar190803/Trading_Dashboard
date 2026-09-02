@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
 import time as time_module
 from datetime import date, datetime, time, timedelta
@@ -432,6 +433,9 @@ class OpenAlgoBroker(BrokerInterface):
             "SENSEX": {"strike_step": 100, "option_lot_size": 20, "weekly_expiry_weekday": 3},
         }
         spot_exch, opt_exch = default_exchanges.get(canonical, ("NSE_INDEX", self.exchange_options))
+        env_prefix = canonical
+        spot_exch = os.getenv(f"{env_prefix}_EXCHANGE_SPOT", spot_exch).strip() or spot_exch
+        opt_exch = os.getenv(f"{env_prefix}_EXCHANGE_OPTIONS", opt_exch).strip() or opt_exch
 
         payload, discovery_error = self._discover_payload(canonical, spot_exch, opt_exch)
         if payload is None:
@@ -450,6 +454,12 @@ class OpenAlgoBroker(BrokerInterface):
         lot_size = numeric.get("lot_size")
         if lot_size is None:
             lot_size = numeric.get("market_lot")
+        env_strike_step = os.getenv(f"{env_prefix}_STRIKE_STEP")
+        env_lot_size = os.getenv(f"{env_prefix}_OPTION_LOT_SIZE")
+        if env_strike_step and env_strike_step.strip():
+            strike_step = int(env_strike_step)
+        if env_lot_size and env_lot_size.strip():
+            lot_size = int(env_lot_size)
         missing_both = strike_step is None and lot_size is None
         if strike_step is None or lot_size is None:
             fallback = fallback_metadata.get(canonical)
@@ -480,6 +490,9 @@ class OpenAlgoBroker(BrokerInterface):
             discovered_root or symbol_guess or canonical
         )
         weekly_expiry_weekday = self._extract_weekly_expiry_weekday(payload)
+        env_expiry_weekday = os.getenv(f"{env_prefix}_EXPIRY_WEEKDAY")
+        if env_expiry_weekday and env_expiry_weekday.strip():
+            weekly_expiry_weekday = int(env_expiry_weekday)
 
         return {
             "spot_symbol": canonical,

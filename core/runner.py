@@ -1383,24 +1383,29 @@ def run_historical_replay(
 
     entries = [a for a in engine.alerts if a.category == "ENTRY"]
     exits = [a for a in engine.alerts if a.category == "EXIT"]
+    management_events = [a for a in engine.alerts if a.category in {"TARGET", "TSL"}]
 
     print("\n─── Trade Log ─────────────────────────────────────────────")
-    for i, evt in enumerate(entries):
+    trade_events = sorted(
+        [(evt.timestamp, "ENTRY", i + 1, evt) for i, evt in enumerate(entries)]
+        + [(evt.timestamp, "EXIT", i + 1, evt) for i, evt in enumerate(exits)]
+        + [(evt.timestamp, evt.category, None, evt) for evt in management_events],
+        key=lambda event: event[0],
+    )
+    for _, event_type, event_number, evt in trade_events:
         ts = evt.timestamp.strftime("%H:%M:%S") if hasattr(evt.timestamp, "strftime") else str(evt.timestamp)
-        print(f"  [{ts}] ENTRY #{i+1}  {evt.message}")
-    for i, evt in enumerate(exits):
-        ts = evt.timestamp.strftime("%H:%M:%S") if hasattr(evt.timestamp, "strftime") else str(evt.timestamp)
+        number = f" #{event_number}" if event_number is not None else ""
         msg = evt.message or ""
-        lower = msg.lower()
-        if "breakeven" in lower:
-            exit_type = "BE STOP"
-        elif "forced square-off" in lower or "force" in lower:
-            exit_type = "FORCED SQ OFF"
-        elif "stop hit" in lower or "hard sl" in lower:
-            exit_type = "HARD SL"
-        else:
-            exit_type = "EXIT"
-        print(f"  [{ts}] {exit_type} #{i+1}  {msg}")
+        display_type = event_type
+        if event_type == "EXIT":
+            lower = msg.lower()
+            if "breakeven" in lower:
+                display_type = "BE STOP"
+            elif "forced square-off" in lower or "force" in lower:
+                display_type = "FORCED SQ OFF"
+            elif "stop hit" in lower or "hard sl" in lower:
+                display_type = "HARD SL"
+        print(f"  [{ts}] {display_type}{number}  {msg}")
 
     print("\n─── Summary ───────────────────────────────────────────────")
     print(f"Total entries     : {len(entries)}")
@@ -1574,12 +1579,16 @@ def run_multi_historical_replay(
 
         entry_alerts = [a for a in engine.alerts if a.category == "ENTRY"]
         exit_alerts = [a for a in engine.alerts if a.category == "EXIT"]
-        for evt in entry_alerts:
+        management_events = [a for a in engine.alerts if a.category in {"TARGET", "TSL"}]
+        trade_events = sorted(
+            [(evt.timestamp, "ENTRY", evt) for evt in entry_alerts]
+            + [(evt.timestamp, "EXIT", evt) for evt in exit_alerts]
+            + [(evt.timestamp, evt.category, evt) for evt in management_events],
+            key=lambda event: event[0],
+        )
+        for _, event_type, evt in trade_events:
             ts = evt.timestamp.strftime("%H:%M:%S")
-            print(f"      [{ts}] ENTRY  {evt.message}")
-        for evt in exit_alerts:
-            ts = evt.timestamp.strftime("%H:%M:%S")
-            print(f"      [{ts}] EXIT   {evt.message}")
+            print(f"      [{ts}] {event_type:<6} {evt.message}")
 
     print(f"\n{'─' * 72}")
     print(f"  COMBINED PnL    : {combined_pnl:.2f}")
