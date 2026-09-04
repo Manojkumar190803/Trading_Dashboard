@@ -99,7 +99,7 @@ class EMA21SignalProvider(SignalProvider):
         return trigger - stop
 
     def compute_entry_lots(self, row: pd.Series, cfg: StrategyConfig) -> int:
-        return 2
+        return cfg.full_size_lots
 
     def compute_stop_level(self, side_state: BaseSideState, row: pd.Series) -> float:
         assert isinstance(side_state, EMA21SideState)

@@ -92,6 +92,53 @@ def test_restore_open_position_without_alert_recreates_protection(tmp_path, monk
     assert position.option_stop_level == 73.6
 
 
+def test_restore_open_position_does_not_rebind_new_stop_to_stale_order(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+
+    class PositionBroker(ConsoleBroker):
+        def __init__(self):
+            super().__init__()
+            self.place_count = 0
+            self.open_order_reads = 0
+
+        def get_position_book(self):
+            return [{
+                "symbol": "NIFTY01SEP2624250CE",
+                "quantity": 65,
+                "average_price": 100.0,
+            }]
+
+        def get_open_orders(self):
+            self.open_order_reads += 1
+            if self.open_order_reads == 2:
+                return []
+            return [{
+                "symbol": "NIFTY01SEP2624250CE",
+                "action": "SELL",
+                "quantity": 130,
+                "trigger_price": 90.0,
+                "orderid": "STALE-SL",
+            }]
+
+        def cancel_order(self, order_id):
+            return True
+
+        def place_stop_limit_order(self, *args, **kwargs):
+            self.place_count += 1
+            return "NEW-SL"
+
+    broker = PositionBroker()
+    engine = BaseStrategyEngine(StrategyConfig(), RiskConfig(), broker, EMA21SignalProvider())
+    engine.state.ce.option_symbol = "NIFTY01SEP2624250CE"
+
+    runner._restore_open_positions(engine, broker, datetime(2026, 8, 27).date())
+    runner._restore_open_positions(engine, broker, datetime(2026, 8, 27).date())
+
+    assert broker.place_count == 1
+    assert engine.state.ce.position is not None
+    assert engine.state.ce.position.protective_stop_order_id == "NEW-SL"
+
+
 def test_restore_open_position_parses_comma_separated_entry_alert(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     logs_dir = tmp_path / "logs"

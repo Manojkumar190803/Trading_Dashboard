@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import logging
 import csv
+import json
+import os
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from typing import Any, Optional
@@ -23,6 +25,48 @@ from core.models import (
 from strategies.base import SignalProvider
 
 logger = logging.getLogger("core.engine")
+
+
+def _shared_sl_count_path(trading_day: date) -> Path:
+    configured = os.getenv("SHARED_SL_COUNT_FILE", "").strip()
+    if configured:
+        return Path(configured)
+    return Path("logs") / f"sl_hits_{trading_day:%Y%m%d}.json"
+
+
+def _read_shared_sl_count(trading_day: date) -> int:
+    path = _shared_sl_count_path(trading_day)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        return max(0, int(payload.get("count", 0))) if isinstance(payload, dict) else 0
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return 0
+
+
+def _increment_shared_sl_count(trading_day: date) -> int:
+    """Atomically increment the daily SL count shared by live containers."""
+    path = _shared_sl_count_path(trading_day)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        import fcntl
+        with path.open("a+", encoding="utf-8") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            handle.seek(0)
+            try:
+                payload = json.load(handle)
+            except (json.JSONDecodeError, ValueError):
+                payload = {}
+            count = max(0, int(payload.get("count", 0))) + 1 if isinstance(payload, dict) else 1
+            handle.seek(0)
+            handle.truncate()
+            json.dump({"trading_day": trading_day.isoformat(), "count": count}, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            return count
+    except (OSError, TypeError, ValueError):
+        logger.exception("could not update shared SL count at %s", path)
+        return _read_shared_sl_count(trading_day)
 
 
 def get_atm_strike(spot_price: float, strike_step: int) -> int:
@@ -196,6 +240,12 @@ class BaseStrategyEngine:
             self._persist_trade_alert(ts, category, message)
         print(f"[ENGINE][{category}] {message}")
 
+    def _sync_shared_sl_count(self, trading_day: date) -> None:
+        self.state.sl_hits_today = max(
+            self.state.sl_hits_today,
+            _read_shared_sl_count(trading_day),
+        )
+
     def restore_open_position(
         self,
         side: str,
@@ -210,16 +260,27 @@ class BaseStrategyEngine:
         side_state = self._side_state(side)
         if side_state.position is not None or quantity <= 0:
             return
+        configured_initial_quantity = self.cfg.full_size_lots * self.cfg.option_lot_size
+        initial_quantity = max(quantity, configured_initial_quantity)
+        is_partial_position = quantity < initial_quantity
         side_state.position = Position(
             option_symbol=side_state.option_symbol or "",
             option_type=side,
             quantity=quantity,
-            initial_quantity=quantity,
+            initial_quantity=initial_quantity,
             entry_price=entry_price,
             entry_time=entry_time,
             option_stop_level=stop_level,
             option_entry_trigger=entry_trigger,
             option_risk_points=risk_points,
+            t2_done=is_partial_position,
+            next_target_rr=(self.cfg.t2_rr + self.cfg.trailing_step_rr if is_partial_position else None),
+            progress_status=(
+                f"{self.cfg.t2_rr:.1f}R reached - half lot booked; "
+                f"looking for {self.cfg.t2_rr + self.cfg.trailing_step_rr:.1f}R"
+                if is_partial_position
+                else "Monitoring position"
+            ),
         )
 
     def _persist_trade_alert(self, ts: datetime, category: str, message: str) -> None:
@@ -286,6 +347,85 @@ class BaseStrategyEngine:
         limit_level = self._round_option_price(
             max(self.cfg.option_tick_size, stop_level - self.cfg.stop_buffer_points)
         )
+
+        # Reconcile before every submission so a delayed cancel or a restart
+        # cannot leave multiple active protective sells for one position.
+        try:
+            open_orders = self.broker.get_open_orders()
+        except Exception as exc:
+            self._record_alert(
+                ts, "RISK",
+                f"{side} protective SL blocked: order check failed for {position.option_symbol}: {exc}",
+            )
+            return
+        if open_orders is None:
+            self._record_alert(
+                ts, "RISK",
+                f"{side} protective SL blocked: order check unavailable for {position.option_symbol}",
+            )
+            return
+
+        protective_orders = [
+            order for order in open_orders
+            if str(order.get("symbol") or "") == position.option_symbol
+            and str(order.get("action") or order.get("side") or "").upper() == "SELL"
+        ]
+        matching_order = next(
+            (
+                order for order in protective_orders
+                if abs(float(order.get("trigger_price") or order.get("trigger") or 0) - stop_level)
+                <= self.cfg.option_tick_size
+                and int(float(order.get("quantity") or order.get("qty") or 0)) == position.quantity
+            ),
+            None,
+        )
+        if matching_order is not None:
+            position.protective_stop_order_id = str(
+                matching_order.get("orderid") or matching_order.get("order_id") or ""
+            ) or None
+            return
+
+        cancelled_ids: set[str] = set()
+        for existing_order in protective_orders:
+            order_id = str(existing_order.get("orderid") or existing_order.get("order_id") or "")
+            if not order_id or not self.broker.cancel_order(order_id):
+                self._record_alert(
+                    ts, "RISK",
+                    f"{side} protective SL blocked: could not cancel existing order "
+                    f"{order_id or '<unknown>'} for {position.option_symbol}",
+                )
+                return
+            cancelled_ids.add(order_id)
+
+        if cancelled_ids:
+            try:
+                remaining_orders = self.broker.get_open_orders()
+            except Exception as exc:
+                self._record_alert(
+                    ts, "RISK",
+                    f"{side} protective SL blocked: could not verify cancelled orders "
+                    f"for {position.option_symbol}: {exc}",
+                )
+                return
+            if remaining_orders is None:
+                self._record_alert(
+                    ts, "RISK",
+                    f"{side} protective SL blocked: cancelled-order verification unavailable "
+                    f"for {position.option_symbol}",
+                )
+                return
+            still_open = {
+                str(order.get("orderid") or order.get("order_id") or "")
+                for order in remaining_orders
+            }
+            if cancelled_ids & still_open:
+                self._record_alert(
+                    ts, "RISK",
+                    f"{side} protective SL blocked: cancelled order still active for "
+                    f"{position.option_symbol}; will retry after broker confirmation",
+                )
+                return
+
         print(
             f"[TRADE PROTECTION] ABOUT TO PLACE SL ORDER side={side} "
             f"symbol={position.option_symbol} qty={position.quantity} "
@@ -315,17 +455,45 @@ class BaseStrategyEngine:
             )
 
     def _refresh_protective_stop(self, side: str, position: Position, ts: datetime) -> None:
-        """Replace the broker stop after its level or quantity changes."""
+        """Modify the existing broker stop after its level or quantity changes."""
         order_id = position.protective_stop_order_id
-        if order_id:
-            if not self.broker.cancel_order(order_id):
-                self._record_alert(
-                    ts, "RISK",
-                    f"{side} protective SL update failed: could not cancel {order_id}",
-                )
-                return
-            position.protective_stop_order_id = None
-        self._place_protective_stop(side, position, ts)
+        if not order_id:
+            self._record_alert(
+                ts, "RISK",
+                f"{side} protective SL update blocked: existing order ID is missing "
+                f"for {position.option_symbol}",
+            )
+            return
+
+        stop_level = self._round_option_price(position.option_stop_level)
+        limit_level = self._round_option_price(
+            max(self.cfg.option_tick_size, stop_level - self.cfg.stop_buffer_points)
+        )
+        try:
+            modified = self.broker.modify_stop_limit_order(
+                order_id,
+                position.option_symbol,
+                OrderSide.SELL,
+                position.quantity,
+                trigger_price=stop_level,
+                limit_price=limit_level,
+            )
+        except Exception as exc:
+            modified = False
+            logger.warning("%s protective SL modify failed for %s: %s", side, order_id, exc)
+        if not modified:
+            self._record_alert(
+                ts, "RISK",
+                f"{side} protective SL update failed for {position.option_symbol} "
+                f"order_id={order_id}; existing SL was not replaced",
+            )
+            return
+        self._record_alert(
+            ts, "PROTECTIVE_SL",
+            f"{side} protective SL modified for {position.option_symbol} "
+            f"qty={position.quantity} trigger={stop_level:.2f} limit={limit_level:.2f} "
+            f"order_id={order_id}",
+        )
 
     def _get_unrealized_pnl(self) -> float:
         pnl = 0.0
@@ -345,6 +513,7 @@ class BaseStrategyEngine:
         reason: str,
         is_hard_sl: bool = False,
         row: Optional[pd.Series] = None,
+        refresh_protection: bool = True,
     ) -> None:
         pos = side_state.position
         if pos is None:
@@ -387,11 +556,11 @@ class BaseStrategyEngine:
             if pos.protective_stop_order_id:
                 self.broker.cancel_order(pos.protective_stop_order_id)
             side_state.position = None
-        elif pos.protective_stop_order_id:
+        elif pos.protective_stop_order_id and refresh_protection:
             self._refresh_protective_stop(pos.option_type, pos, ts)
 
         if is_hard_sl:
-            self.state.sl_hits_today += 1
+            self.state.sl_hits_today = _increment_shared_sl_count(ts.date())
             self.total_hard_sl_hits += 1
             if self.state.sl_hits_today >= self.risk.max_sl_per_day:
                 self._record_alert(
@@ -402,6 +571,8 @@ class BaseStrategyEngine:
                 )
 
     def get_status_snapshot(self) -> dict:
+        if self.state.trading_day is not None:
+            self._sync_shared_sl_count(self.state.trading_day)
         unrealized_pnl = self._get_unrealized_pnl()
         total_pnl = self.realized_pnl + unrealized_pnl
 
@@ -421,6 +592,9 @@ class BaseStrategyEngine:
                     "option_entry_trigger": pos.option_entry_trigger,
                     "option_risk_points": pos.option_risk_points,
                     "breakeven_armed": pos.breakeven_armed,
+                    "current_price": pos.current_price,
+                    "progress_status": pos.progress_status,
+                    "next_target_rr": pos.next_target_rr,
                 },
                 "pending_entry": None if pending is None else {
                     "signal": pending.signal.value,
@@ -952,6 +1126,7 @@ class BaseStrategyEngine:
             qty,
             reason,
             is_hard_sl=False,
+            refresh_protection=False,
         )
 
     def manage_targets(self, side_state: BaseSideState, row: pd.Series) -> None:
@@ -968,6 +1143,7 @@ class BaseStrategyEngine:
 
         rr = self.compute_rr_progress(pos, row)
         lot_qty = self.cfg.option_lot_size
+        partial_qty = self.cfg.half_size_lots * lot_qty
         ir = pos.option_risk_points
 
         # At 1.5 RR — arm breakeven for both 1-lot and 2-lot positions.
@@ -977,7 +1153,10 @@ class BaseStrategyEngine:
             pos.trailing_sl_level = pos.entry_price
             pos.option_stop_level = pos.entry_price
             pos.highest_rr_step = 1.5
-            self._refresh_protective_stop(pos.option_type, pos, self.last_processed_candle_time or pos.entry_time)
+            pos.next_target_rr = self.cfg.t2_rr
+            pos.progress_status = f"{self.cfg.t1_rr:.1f}R reached - looking for {self.cfg.t2_rr:.1f}R"
+            if rr < self.cfg.t2_rr:
+                self._refresh_protective_stop(pos.option_type, pos, self.last_processed_candle_time or pos.entry_time)
             self._record_alert(
                 self.last_processed_candle_time or pos.entry_time,
                 "TARGET",
@@ -985,26 +1164,37 @@ class BaseStrategyEngine:
             )
 
         # Phase 3: At 2.0 RR — partial exit 1 lot.
-        if pos.initial_quantity > lot_qty and rr >= self.cfg.t2_rr and not pos.t2_done:
+        if pos.initial_quantity > partial_qty and rr >= self.cfg.t2_rr and not pos.t2_done:
             self.execute_partial_exit(
-                side_state, lot_qty,
+                side_state, partial_qty,
                 f"2.0 RR hit — booked 1 lot",
             )
             if side_state.position is None:
                 return
             side_state.position.t2_done = True
+            side_state.position.next_target_rr = self.cfg.t2_rr + self.cfg.trailing_step_rr
+            side_state.position.progress_status = (
+                f"{self.cfg.t2_rr:.1f}R reached - half lot booked; "
+                f"looking for {side_state.position.next_target_rr:.1f}R"
+            )
 
         # Step-trailing: advance SL every 0.5 RR above 1.5.
         if pos.breakeven_armed and ir > 0:
-            current_step = int(rr / 0.5) * 0.5  # floor to nearest 0.5
+            step = max(self.cfg.trailing_step_rr, 0.01)
+            current_step = int(rr / step) * step  # floor to the configured step
             if current_step > pos.highest_rr_step:
                 # SL trails 1.5 RR behind the current step.
-                new_sl = pos.entry_price + (current_step - 1.5) * ir
+                new_sl = pos.entry_price + (current_step - self.cfg.t1_rr) * ir
                 if pos.trailing_sl_level is None or new_sl > pos.trailing_sl_level:
                     pos.trailing_sl_level = new_sl
                     pos.option_stop_level = new_sl
                     pos.highest_rr_step = current_step
                     self._refresh_protective_stop(pos.option_type, pos, self.last_processed_candle_time or pos.entry_time)
+                    pos.next_target_rr = current_step + step
+                    pos.progress_status = (
+                        f"{current_step:.1f}R reached - SL shifted to {new_sl:.2f}; "
+                        f"looking for {pos.next_target_rr:.1f}R"
+                    )
                     self._record_alert(
                         self.last_processed_candle_time or pos.entry_time,
                         "TSL",
@@ -1084,12 +1274,14 @@ class BaseStrategyEngine:
         - Partial exit at 2.0 RR for multi-lot positions
         - Breakeven at 1.5 RR and trailing for every position size
         """
+        self._sync_shared_sl_count(self.state.trading_day or ts.date())
         side_state = self._side_state(side)
         pos = side_state.position
         if pos is None:
             return
 
         self.last_processed_candle_time = ts
+        pos.current_price = float(ltp)
         ir = pos.option_risk_points
         if ir <= 0:
             return
@@ -1115,8 +1307,11 @@ class BaseStrategyEngine:
             pos.trailing_sl_level = pos.entry_price
             pos.option_stop_level = pos.entry_price
             pos.highest_rr_step = 1.5
-            self._refresh_protective_stop(pos.option_type, pos, ts)
-            self._record_alert(ts, "TSL", f"{pos.option_type} 1.5 RR (tick) — SL to entry")
+            pos.next_target_rr = self.cfg.t2_rr
+            pos.progress_status = f"{self.cfg.t1_rr:.1f}R reached - looking for {self.cfg.t2_rr:.1f}R"
+            if rr < self.cfg.t2_rr:
+                self._refresh_protective_stop(pos.option_type, pos, ts)
+                self._record_alert(ts, "TSL", f"{pos.option_type} 1.5 RR (tick) — SL to entry")
 
         # Phase 3: 2.0 RR — partial exit.
         if pos.initial_quantity > lot_qty and rr >= self.cfg.t2_rr and not pos.t2_done:
@@ -1124,18 +1319,29 @@ class BaseStrategyEngine:
             if side_state.position is None:
                 return
             side_state.position.t2_done = True
+            side_state.position.next_target_rr = self.cfg.t2_rr + self.cfg.trailing_step_rr
+            side_state.position.progress_status = (
+                f"{self.cfg.t2_rr:.1f}R reached - half lot booked; "
+                f"looking for {side_state.position.next_target_rr:.1f}R"
+            )
             pos = side_state.position
 
         # Step-trailing SL advancement.
         if pos.breakeven_armed and ir > 0:
-            current_step = int(rr / 0.5) * 0.5
+            step = max(self.cfg.trailing_step_rr, 0.01)
+            current_step = int(rr / step) * step
             if current_step > pos.highest_rr_step:
-                new_sl = pos.entry_price + (current_step - 1.5) * ir
+                new_sl = pos.entry_price + (current_step - self.cfg.t1_rr) * ir
                 if pos.trailing_sl_level is None or new_sl > pos.trailing_sl_level:
                     pos.trailing_sl_level = new_sl
                     pos.option_stop_level = new_sl
                     pos.highest_rr_step = current_step
                     self._refresh_protective_stop(pos.option_type, pos, ts)
+                    pos.next_target_rr = current_step + step
+                    pos.progress_status = (
+                        f"{current_step:.1f}R reached - SL shifted to {new_sl:.2f}; "
+                        f"looking for {pos.next_target_rr:.1f}R"
+                    )
                     self._record_alert(ts, "TSL", f"{pos.option_type} {current_step:.1f} RR (tick) — TSL={new_sl:.2f}")
 
         # Check trailing stop on this tick.
@@ -1159,6 +1365,7 @@ class BaseStrategyEngine:
         ts = row["datetime"]
         self.last_processed_candle_time = ts
         self.on_day_transition_if_needed(ts)
+        self._sync_shared_sl_count(ts.date())
 
         side_state = self._side_state(side)
         signal: Signal = Signal.NONE

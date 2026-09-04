@@ -45,6 +45,17 @@ class BrokerInterface:
     ) -> str:
         raise NotImplementedError
 
+    def modify_stop_limit_order(
+        self,
+        order_id: str,
+        symbol: str,
+        side: OrderSide,
+        quantity: int,
+        trigger_price: float,
+        limit_price: float,
+    ) -> bool:
+        raise NotImplementedError
+
     def place_market_order(self, symbol: str, side: OrderSide, quantity: int) -> str:
         raise NotImplementedError
 
@@ -112,6 +123,21 @@ class ConsoleBroker(BrokerInterface):
         oid = f"MKT-{symbol}-{side}-{quantity}"
         print(f"[BROKER] place_market_order symbol={symbol} side={side} qty={quantity} id={oid}")
         return oid
+
+    def modify_stop_limit_order(
+        self,
+        order_id: str,
+        symbol: str,
+        side: OrderSide,
+        quantity: int,
+        trigger_price: float,
+        limit_price: float,
+    ) -> bool:
+        print(
+            f"[BROKER] modify_stop_limit_order id={order_id} symbol={symbol} "
+            f"side={side} qty={quantity} trigger={trigger_price:.2f} limit={limit_price:.2f}"
+        )
+        return True
 
 
 class OpenAlgoBroker(BrokerInterface):
@@ -331,6 +357,40 @@ class OpenAlgoBroker(BrokerInterface):
             response = self.client.cancelorder(order_id=order_id, strategy=self.strategy_tag)
         except Exception as exc:
             logger.warning("cancel order %s error: %s", order_id, exc)
+            return False
+        return isinstance(response, dict) and response.get("status") == "success"
+
+    def modify_stop_limit_order(
+        self,
+        order_id: str,
+        symbol: str,
+        side: OrderSide,
+        quantity: int,
+        trigger_price: float,
+        limit_price: float,
+    ) -> bool:
+        exchange = self._infer_exchange(symbol)
+        if self.dry_run:
+            logger.info(
+                "[DRY_RUN] modify_stop_limit_order id=%s %s %s qty=%s trigger=%.2f limit=%.2f",
+                order_id, symbol, side.value, quantity, trigger_price, limit_price,
+            )
+            return True
+        try:
+            response = self.client.modifyorder(
+                order_id=order_id,
+                strategy=self.strategy_tag,
+                symbol=symbol,
+                action=side.value,
+                exchange=exchange,
+                price_type="SL",
+                product=self.product,
+                quantity=int(quantity),
+                price=round(float(limit_price), 2),
+                trigger_price=round(float(trigger_price), 2),
+            )
+        except Exception as exc:
+            logger.error("modifyorder SL error for %s (%s): %s", symbol, order_id, exc)
             return False
         return isinstance(response, dict) and response.get("status") == "success"
 

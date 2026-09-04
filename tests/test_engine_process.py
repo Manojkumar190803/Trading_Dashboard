@@ -42,6 +42,7 @@ class RecordingBroker(ConsoleBroker):
     def __init__(self):
         super().__init__()
         self.stop_orders = []
+        self.modified_stop_orders = []
         self.cancelled_orders = []
 
     def cancel_order(self, order_id):
@@ -51,6 +52,40 @@ class RecordingBroker(ConsoleBroker):
     def place_stop_limit_order(self, symbol, side, quantity, trigger_price, limit_price):
         self.stop_orders.append((symbol, side, quantity, trigger_price, limit_price))
         return f"OID-{len(self.stop_orders)}"
+
+    def modify_stop_limit_order(self, order_id, symbol, side, quantity, trigger_price, limit_price):
+        self.modified_stop_orders.append(
+            (order_id, symbol, side, quantity, trigger_price, limit_price)
+        )
+        return True
+
+
+class ExistingStopBroker(RecordingBroker):
+    requires_position_reconciliation = True
+
+    def __init__(self):
+        super().__init__()
+        self.open_orders = [{
+            "symbol": "NIFTY01SEP2624250PE",
+            "action": "SELL",
+            "quantity": 130,
+            "trigger_price": 90.0,
+            "orderid": "EXISTING-SL",
+        }]
+
+    def get_open_orders(self):
+        return self.open_orders
+
+
+class FailedModifyBroker(RecordingBroker):
+    def modify_stop_limit_order(self, *args, **kwargs):
+        return False
+
+
+class StaleCancelBroker(ExistingStopBroker):
+    def cancel_order(self, order_id):
+        self.cancelled_orders.append(order_id)
+        return True
 
 
 class ReconciledBroker(RecordingBroker):
@@ -164,6 +199,153 @@ def test_live_entry_places_separate_protective_sell_stop():
     assert any(alert.category == "PROTECTIVE_SL" for alert in engine.alerts)
 
 
+def test_protective_stop_reuses_existing_matching_order():
+    broker = ExistingStopBroker()
+    engine = BaseStrategyEngine(
+        cfg=StrategyConfig(option_tick_size=0.05, stop_buffer_points=1.0),
+        risk=RiskConfig(),
+        broker=broker,
+        signal_provider=EMA21StubSignalProvider(),
+    )
+    position = Position(
+        option_symbol="NIFTY01SEP2624250PE",
+        option_type="PE",
+        quantity=130,
+        initial_quantity=130,
+        entry_price=94.05,
+        entry_time=datetime(2026, 8, 27, 12, 6),
+        option_stop_level=90.0,
+        option_entry_trigger=94.0,
+        option_risk_points=4.0,
+    )
+
+    engine._place_protective_stop("PE", position, position.entry_time)
+
+    assert position.protective_stop_order_id == "EXISTING-SL"
+    assert broker.stop_orders == []
+
+
+def test_trailing_modifies_existing_protective_stop_without_placing_new_order():
+    broker = RecordingBroker()
+    engine = BaseStrategyEngine(
+        cfg=StrategyConfig(option_tick_size=0.05, stop_buffer_points=1.0),
+        risk=RiskConfig(),
+        broker=broker,
+        signal_provider=EMA21StubSignalProvider(),
+    )
+    position = Position(
+        option_symbol="NIFTY01SEP2624250PE",
+        option_type="PE",
+        quantity=130,
+        initial_quantity=130,
+        entry_price=100.0,
+        entry_time=datetime(2026, 8, 27, 12, 6),
+        option_stop_level=90.0,
+        option_entry_trigger=100.0,
+        option_risk_points=10.0,
+        protective_stop_order_id="OPEN-SL-1",
+    )
+
+    position.option_stop_level = 105.0
+    engine._refresh_protective_stop("PE", position, position.entry_time)
+
+    assert broker.modified_stop_orders == [
+        ("OPEN-SL-1", "NIFTY01SEP2624250PE", "SELL", 130, 105.0, 104.0)
+    ]
+    assert broker.stop_orders == []
+    assert broker.cancelled_orders == []
+
+
+def test_trailing_keeps_existing_order_id_when_modify_fails():
+    broker = FailedModifyBroker()
+    engine = BaseStrategyEngine(
+        cfg=StrategyConfig(),
+        risk=RiskConfig(),
+        broker=broker,
+        signal_provider=EMA21StubSignalProvider(),
+    )
+    position = Position(
+        option_symbol="NIFTY01SEP2624250PE",
+        option_type="PE",
+        quantity=130,
+        initial_quantity=130,
+        entry_price=100.0,
+        entry_time=datetime(2026, 8, 27, 12, 6),
+        option_stop_level=90.0,
+        option_entry_trigger=100.0,
+        option_risk_points=10.0,
+        protective_stop_order_id="OPEN-SL-1",
+    )
+
+    engine._refresh_protective_stop("PE", position, position.entry_time)
+
+    assert position.protective_stop_order_id == "OPEN-SL-1"
+    assert broker.stop_orders == []
+    assert any("existing SL was not replaced" in alert.message for alert in engine.alerts)
+
+
+def test_trailing_status_reports_next_target_after_partial_booking():
+    broker = RecordingBroker()
+    engine = BaseStrategyEngine(
+        cfg=StrategyConfig(),
+        risk=RiskConfig(),
+        broker=broker,
+        signal_provider=EMA21StubSignalProvider(),
+    )
+    position = Position(
+        option_symbol="NIFTY01SEP2624250PE",
+        option_type="PE",
+        quantity=130,
+        initial_quantity=130,
+        entry_price=100.0,
+        entry_time=datetime(2026, 8, 27, 12, 6),
+        option_stop_level=90.0,
+        option_entry_trigger=100.0,
+        option_risk_points=10.0,
+        protective_stop_order_id="OPEN-SL-1",
+    )
+    engine.state.pe.position = position
+
+    engine.process_tick("PE", 120.0, datetime(2026, 8, 27, 12, 10))
+
+    assert position.quantity == 65
+    assert position.next_target_rr == 2.5
+    assert "looking for 2.5R" in position.progress_status
+
+    engine.process_tick("PE", 125.0, datetime(2026, 8, 27, 12, 11))
+
+    assert position.next_target_rr == 3.0
+    assert "2.5R reached" in position.progress_status
+    assert "SL shifted to 110.00" in position.progress_status
+
+
+def test_protective_stop_waits_when_cancelled_order_is_still_open():
+    broker = StaleCancelBroker()
+    engine = BaseStrategyEngine(
+        cfg=StrategyConfig(option_tick_size=0.05, stop_buffer_points=1.0),
+        risk=RiskConfig(),
+        broker=broker,
+        signal_provider=EMA21StubSignalProvider(),
+    )
+    position = Position(
+        option_symbol="NIFTY01SEP2624250PE",
+        option_type="PE",
+        quantity=130,
+        initial_quantity=130,
+        entry_price=94.05,
+        entry_time=datetime(2026, 8, 27, 12, 6),
+        option_stop_level=89.0,
+        option_entry_trigger=94.0,
+        option_risk_points=5.0,
+    )
+
+    engine._place_protective_stop("PE", position, position.entry_time)
+
+    assert broker.cancelled_orders == ["EXISTING-SL"]
+    assert broker.stop_orders == []
+    assert position.protective_stop_order_id is None
+
+
 def test_live_exit_is_blocked_when_broker_has_short_position():
     broker = ReconciledBroker(-130)
     engine = BaseStrategyEngine(
@@ -219,6 +401,23 @@ def test_live_entry_fill_is_blocked_when_broker_reports_short_position():
     assert any("fill blocked" in alert.message for alert in engine.alerts)
 
 
+def test_hard_sl_count_is_shared_between_strategy_engines(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    trade_day = datetime(2026, 8, 8, 10, 0)
+    first = _make_engine()
+    second = _make_engine()
+    first.state.trading_day = trade_day.date()
+    second.state.trading_day = trade_day.date()
+    _attach_position(first, "CE")
+
+    first._exit_position(first.state.ce, trade_day, 130, "hard stop", is_hard_sl=True)
+    second._sync_shared_sl_count(trade_day.date())
+
+    assert first.state.sl_hits_today == 1
+    assert second.state.sl_hits_today == 1
+    assert (tmp_path / "logs" / "sl_hits_20260808.json").exists()
+
+
 def test_candle_low_hits_trailing_stop_after_same_candle_trail_update():
     engine = _make_engine()
     side_state = engine.state.ce
@@ -272,6 +471,24 @@ def test_process_tick_arms_tsl_and_partial_exit_for_two_lot_position():
     engine.process_tick("CE", 120.0, datetime(2026, 8, 8, 10, 4))
     pos = engine.state.ce.position
     assert pos is not None and pos.quantity == 65
+
+
+def test_process_tick_modifies_sl_once_for_high_rr_tick():
+    broker = RecordingBroker()
+    engine = BaseStrategyEngine(
+        cfg=StrategyConfig(option_lot_size=65),
+        risk=RiskConfig(max_sl_per_day=3),
+        broker=broker,
+        signal_provider=EMA21StubSignalProvider(),
+    )
+    _attach_position(engine, "CE")
+    engine.state.ce.position.protective_stop_order_id = "EXISTING-SL"
+
+    engine.process_tick("CE", 125.0, datetime(2026, 8, 8, 10, 5))
+    assert len(broker.modified_stop_orders) == 1
+
+    engine.process_tick("CE", 125.0, datetime(2026, 8, 8, 10, 6))
+    assert len(broker.modified_stop_orders) == 1
 
 
 def test_force_square_off_side_clears_pending_and_position():

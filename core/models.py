@@ -30,6 +30,7 @@ class StrategyConfig:
     option_lot_size: int = 65
     full_size_lots: int = 2
     half_size_lots: int = 1
+    trailing_step_rr: float = 0.5
     expiry_policy: str = "weekly"
     weekly_expiry_weekday: int = 1  # Monday=0 ... Tuesday=1
 
@@ -88,6 +89,9 @@ class Position:
     # Step-trailing: highest RR milestone reached (in 0.5 steps).
     highest_rr_step: float = 0.0
     trailing_sl_level: Optional[float] = None
+    current_price: Optional[float] = None
+    progress_status: str = "Monitoring position"
+    next_target_rr: Optional[float] = None
 
 
 @dataclass

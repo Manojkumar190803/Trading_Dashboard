@@ -315,7 +315,8 @@ def test_engine_ema21_exit_pnl_uses_actual_fill_price():
     assert "pnl_entry=57.10" in engine.alerts[-1].message
 
 
-def test_engine_ema21_candle_low_breach_exits_position():
+def test_engine_ema21_candle_low_breach_exits_position(tmp_path, monkeypatch):
+    monkeypatch.setenv("SHARED_SL_COUNT_FILE", str(tmp_path / "sl_hits.json"))
     provider = EMA21SignalProvider()
     engine = BaseStrategyEngine(
         StrategyConfig(),

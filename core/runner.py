@@ -276,6 +276,7 @@ def _restore_open_positions(engine: BaseStrategyEngine, broker: OpenAlgoBroker, 
                 )
         side_state = engine._side_state(side)
         was_uncertain = side_state.order_submission_uncertain
+        already_restored = side_state.position is not None
         engine.restore_open_position(
             side,
             quantity,
@@ -292,7 +293,7 @@ def _restore_open_positions(engine: BaseStrategyEngine, broker: OpenAlgoBroker, 
         )
         if not matching:
             engine.total_entries += 1
-        if open_orders is not None:
+        if open_orders is not None and not already_restored:
             protective_orders = [
                 order for order in open_orders
                 if str(order.get("symbol") or "") == symbol
@@ -316,11 +317,6 @@ def _restore_open_positions(engine: BaseStrategyEngine, broker: OpenAlgoBroker, 
                 engine._side_state(side).position.protective_stop_order_id = str(
                     matching_protective.get("orderid") or matching_protective.get("order_id") or ""
                 )
-            if not matching_protective_order and was_uncertain:
-                for order in protective_orders:
-                    order_id = str(order.get("orderid") or order.get("order_id") or "")
-                    if order_id:
-                        engine.broker.cancel_order(order_id)
             has_protective_order = matching_protective_order
             if not has_protective_order:
                 engine._place_protective_stop(side, engine._side_state(side).position, entry_time)
@@ -760,6 +756,9 @@ class LiveFeedRunner:
                     f"SL={pos.option_stop_level:.2f} qty={pos.quantity}/{pos.initial_quantity} "
                     f"P&L={unrealized_pnl:+.2f}"
                 )
+                lines.append(f"│     Status: {pos.progress_status}")
+                if pos.next_target_rr is not None:
+                    lines.append(f"│     Next target: {pos.next_target_rr:.1f}R")
             elif side_state.pending_entry is not None:
                 pending = side_state.pending_entry
                 lines.append(
@@ -1157,7 +1156,9 @@ class MultiEngineLiveFeedRunner:
                     pos = ss.position
                     trade = (
                         f"LONG entry={pos.entry_price:.1f} SL={pos.option_stop_level:.1f} "
-                        f"qty={pos.quantity}/{pos.initial_quantity}"
+                        f"qty={pos.quantity}/{pos.initial_quantity} "
+                        f"price={pos.current_price if pos.current_price is not None else '-'} "
+                        f"status={pos.progress_status}"
                     )
                 elif ss.pending_entry:
                     trade = f"PENDING trigger={ss.pending_entry.option_trigger_level:.1f}"
