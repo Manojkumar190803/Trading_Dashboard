@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Runs HD, CD, and TC for NIFTY/BANKNIFTY/SENSEX in parallel,
+# Runs HD, CD, and TC for NIFTY and SENSEX in parallel,
 # and writes both per-symbol logs plus one consolidated tagged log.
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -23,7 +23,7 @@ RUN_DIR="$LOG_BASE_DIR/$RUN_ID"
 mkdir -p "$RUN_DIR"
 COMBINED_LOG="$RUN_DIR/consolidated.log"
 
-SYMBOLS=(NIFTY BANKNIFTY SENSEX)
+SYMBOLS=(NIFTY SENSEX)
 PIDS=()
 
 log_msg() {

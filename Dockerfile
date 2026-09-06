@@ -12,6 +12,7 @@ COPY run_strategy.py .
 COPY core ./core
 RUN mkdir -p strategies
 COPY strategies/base.py strategies/ema21.py ./strategies/
+COPY frontend ./frontend
 
 ENV STRATEGY=ema21
 ENV MODE=live

@@ -14,32 +14,27 @@ x-live-defaults: &live-defaults
     - ./logs:/app/logs
 
 services:
-  live_nifty:
+  streamlit_interface:
     <<: *live-defaults
-    container_name: openalgo_live_nifty
+    build:
+      context: .
+      dockerfile: Dockerfile.streamlit
+    container_name: streamlit_interface
+    labels:
+      com.openalgo.display-name: "Streamlit interface"
+    ports:
+      - "8502:8501"
+    restart: unless-stopped
     environment:
       TZ: Asia/Kolkata
-      STRATEGY: ema21
-      MODE: live
-      SCRIPT: NIFTY
+      STREAMLIT_SERVER_HEADLESS: "true"
+      STREAMLIT_SERVER_ADDRESS: 0.0.0.0
+      STREAMLIT_SERVER_PORT: "8501"
       OPENALGO_HOST: http://host.docker.internal:5002
       OPENALGO_WS_URL: ws://host.docker.internal:8766
       WEBSOCKET_HOST: host.docker.internal
       WEBSOCKET_PORT: "8766"
     volumes:
       - ./logs:/app/logs
-  live_banknifty:
-    <<: *live-defaults
-    container_name: openalgo_live_banknifty
-    environment:
-      TZ: Asia/Kolkata
-      STRATEGY: ema21
-      MODE: live
-      SCRIPT: BANKNIFTY
-      OPENALGO_HOST: http://host.docker.internal:5002
-      OPENALGO_WS_URL: ws://host.docker.internal:8766
-      WEBSOCKET_HOST: host.docker.internal
-      WEBSOCKET_PORT: "8766"
-    volumes:
-      - ./logs:/app/logs
+
 

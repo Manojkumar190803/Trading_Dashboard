@@ -191,9 +191,7 @@ python3 -m pytest tests/ -v
 ## Docker
 
 ```bash
-# Run intraday live for NIFTY and BANKNIFTY in parallel:
-# - NIFTY (EMA21)
-# - BANKNIFTY (EMA21)
+# Run intraday live for NIFTY and SENSEX in parallel.
 docker compose up -d
 
 # Follow logs for all live services
@@ -201,7 +199,6 @@ docker compose logs -f
 
 # Follow logs for one script
 docker compose logs -f live_nifty
-docker compose logs -f live_banknifty
 
 # Restart only one script service
 docker compose restart live_nifty
@@ -209,9 +206,24 @@ docker compose restart live_nifty
 # Run a single script service (if needed)
 docker compose up -d live_nifty
 
+# Start the separate Streamlit interface container
+docker compose up -d --build --force-recreate streamlit_interface
+
+# Open http://localhost:8502 in a browser
+
 # Stop
 docker compose down
 ```
+
+### Streamlit Live Dashboard
+
+From the project root, run:
+
+```bash
+python3 -m streamlit run frontend/strategy_dashboard.py
+```
+
+The dashboard runs in a separate image built from `Dockerfile.streamlit`. It is independent of the strategy containers, so strategy start/stop controls can be added to the interface later. The Docker service is named `streamlit_interface` because Docker names cannot contain spaces; its display label is `Streamlit interface`.
 
 Each service runs the EMA21 strategy in IST timezone, auto-restarts on crash, and injects a script-specific `SCRIPT` value into `run_strategy.py --mode live --strategy ema21`. The Docker image includes only the shared runtime files and EMA21 strategy implementation.
 

@@ -58,7 +58,7 @@ def extract_last_table(log_file: Path) -> Optional[str]:
 
 def display_dashboard(run_dir: str) -> None:
     """Display consolidated dashboard from all instruments."""
-    symbols = ['nifty', 'banknifty', 'sensex']
+    symbols = ['nifty', 'sensex']
     log_files = {
         symbol: Path(run_dir) / f"{symbol}.log"
         for symbol in symbols

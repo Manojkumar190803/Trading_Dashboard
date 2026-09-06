@@ -169,6 +169,7 @@ class OpenAlgoBroker(BrokerInterface):
         self.product = product
         self.exchange_options = exchange_options
         self.dry_run = dry_run
+        self.position_book_available = False
         self._nearest_expiry_cache: dict[tuple[str, str, int, int, str, str], Optional[date]] = {}
         logger.info(
             "OpenAlgoBroker initialized host=%s ws_url=%s product=%s dry_run=%s",
@@ -310,14 +311,18 @@ class OpenAlgoBroker(BrokerInterface):
         try:
             response = self.client.positionbook()
         except Exception as exc:
+            self.position_book_available = False
             logger.warning("positionbook error: %s", exc)
             return []
         if not isinstance(response, dict) or response.get("status") != "success":
+            self.position_book_available = False
             logger.warning("positionbook unexpected response: %s", response)
             return []
         data = response.get("data")
         if not isinstance(data, list):
+            self.position_book_available = False
             return []
+        self.position_book_available = True
         return [row for row in data if isinstance(row, dict)]
 
     def get_order_status(self, order_id: str) -> dict[str, object]:

@@ -8,7 +8,7 @@ import pandas as pd
 import core.runner as runner
 from core.broker import ConsoleBroker
 from core.engine import BaseStrategyEngine
-from core.models import RiskConfig, StrategyConfig
+from core.models import Position, RiskConfig, StrategyConfig
 from strategies.ema21 import EMA21SignalProvider
 
 
@@ -23,6 +23,57 @@ def _sample_df() -> pd.DataFrame:
             "volume": [1000.0],
         }
     )
+
+
+class PositionBookBroker(ConsoleBroker):
+    requires_position_reconciliation = True
+
+    def __init__(self, positions, available=True):
+        super().__init__()
+        self.positions = positions
+        self.position_book_available = available
+
+    def get_position_book(self):
+        return self.positions
+
+
+def _engine_with_position():
+    engine = BaseStrategyEngine(
+        cfg=StrategyConfig(),
+        risk=RiskConfig(),
+        broker=ConsoleBroker(),
+        signal_provider=EMA21SignalProvider(),
+    )
+    engine.state.ce.position = Position(
+        option_symbol="NIFTY08SEP2623950CE",
+        option_type="CE",
+        quantity=130,
+        initial_quantity=130,
+        entry_price=130.75,
+        entry_time=datetime(2026, 9, 4, 11, 26),
+        option_stop_level=120.0,
+        option_entry_trigger=130.0,
+        option_risk_points=10.0,
+    )
+    return engine
+
+
+def test_position_reconciliation_clears_local_position_when_broker_is_flat():
+    engine = _engine_with_position()
+    broker = PositionBookBroker([])
+
+    runner._clear_positions_missing_from_broker([engine], broker)
+
+    assert engine.state.ce.position is None
+
+
+def test_position_reconciliation_preserves_local_position_when_book_unavailable():
+    engine = _engine_with_position()
+    broker = PositionBookBroker([], available=False)
+
+    runner._clear_positions_missing_from_broker([engine], broker)
+
+    assert engine.state.ce.position is not None
 
 
 def test_parse_option_symbol():

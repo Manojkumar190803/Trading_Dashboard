@@ -1,0 +1,17 @@
+FROM python:3.11-slim
+
+ENV TZ=Asia/Kolkata
+RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY frontend ./frontend
+COPY core ./core
+COPY strategies ./strategies
+
+EXPOSE 8501
+
+CMD ["python3", "-m", "streamlit", "run", "frontend/strategy_dashboard.py", "--server.address=0.0.0.0", "--server.port=8501", "--server.headless=true"]

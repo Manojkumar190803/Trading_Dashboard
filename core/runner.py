@@ -368,6 +368,40 @@ def _restore_open_positions(engine: BaseStrategyEngine, broker: OpenAlgoBroker, 
         )
 
 
+def _clear_positions_missing_from_broker(
+    engines: list[BaseStrategyEngine],
+    broker: OpenAlgoBroker,
+) -> None:
+    """Drop local positions only after a successful broker position-book read."""
+    broker_positions = broker.get_position_book()
+    if not getattr(broker, "position_book_available", True):
+        return
+    quantities = {
+        str(position.get("symbol") or ""): int(float(position.get("quantity") or 0))
+        for position in broker_positions
+        if isinstance(position, dict)
+    }
+    for engine in engines:
+        for side in ("CE", "PE"):
+            side_state = engine._side_state(side)
+            position = side_state.position
+            if position is None or quantities.get(position.option_symbol, 0) > 0:
+                continue
+            logger.warning(
+                "clearing stale local %s position; broker quantity for %s is 0",
+                side, position.option_symbol,
+            )
+            if position.protective_stop_order_id:
+                try:
+                    broker.cancel_order(position.protective_stop_order_id)
+                except Exception as exc:
+                    logger.warning(
+                        "could not cancel stale protective stop %s: %s",
+                        position.protective_stop_order_id, exc,
+                    )
+            side_state.position = None
+
+
 def _seconds_until_market_open(cfg: StrategyConfig, now: Optional[datetime] = None) -> float:
     """Return the wait until the next weekday market open."""
     current = now or datetime.now()
@@ -651,6 +685,7 @@ class LiveFeedRunner:
         return False
 
     def _poll_active_ticks(self) -> None:
+        _clear_positions_missing_from_broker([self.engine], self.broker)
         active_symbols: dict[str, list[tuple[str, object]]] = {}
         for side in ("CE", "PE"):
             side_state = self.engine._side_state(side)
@@ -1047,6 +1082,7 @@ class MultiEngineLiveFeedRunner:
         return False
 
     def _poll_active_ticks(self) -> None:
+        _clear_positions_missing_from_broker([engine for _, engine in self.engines], self.broker)
         now = datetime.now()
         active_symbols: dict[str, list[tuple[BaseStrategyEngine, str, object]]] = {}
         for _, engine in self.engines:
