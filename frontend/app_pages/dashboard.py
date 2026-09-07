@@ -2,11 +2,8 @@
 from __future__ import annotations
 
 import streamlit as st
-from streamlit_autorefresh import st_autorefresh
-
 from _shared import (
     inject_theme,
-    process_next_candle,
     refresh_live_account_metrics,
     render_section_heading,
     render_sidebar,
@@ -16,26 +13,7 @@ inject_theme()
 source_params = render_sidebar()
 
 # ── Live account refresh (works in Paper Mode too — read-only) ────────────────
-st_autorefresh(interval=10_000, key="dashboard-live-refresh")
 refresh_live_account_metrics(source_params)
-
-# ── Advance simulation when engine is running ─────────────────────────────────
-if st.session_state.get("running", False):
-    has_engine_state = all(
-        key in st.session_state for key in ("data", "engine", "broker", "index")
-    )
-    if has_engine_state:
-        process_next_candle()
-    else:
-        st.session_state.running = False
-        st.session_state.engine_status = "stopped"
-        st.warning(
-            st.session_state.get(
-                "openalgo_unavailable",
-                "OpenAlgo is not reachable. Please start OpenAlgo to load live market data.",
-            ),
-            icon="⚠️",
-        )
 
 # ── Header + status badge ─────────────────────────────────────────────────────
 net_mtm        = st.session_state.get("net_mtm", 0.0)

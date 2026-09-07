@@ -16,9 +16,11 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 import streamlit as st
+from streamlit_autorefresh import st_autorefresh
 
 FRONTEND_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = FRONTEND_DIR.parent
+LOGS_DIR = PROJECT_ROOT / "logs"
 for import_path in (FRONTEND_DIR, PROJECT_ROOT):
     if str(import_path) not in sys.path:
         sys.path.insert(0, str(import_path))
@@ -757,8 +759,11 @@ def _build_instrument_state(
         "exchange_options",
         "strike_step",
         "weekly_expiry_weekday",
+        "timeframe_minutes",
     ):
         config_value = instrument_config.get(config_name)
+        if config_name == "timeframe_minutes" and config_value is None:
+            config_value = source_params.get("openalgo_resolution")
         if config_value is not None and hasattr(cfg, config_name):
             setattr(cfg, config_name, config_value)
     # Override lot size from sidebar selection so per-instrument NSE contract
@@ -781,13 +786,13 @@ def _build_instrument_state(
             pass
     risk = RiskConfig()
     broker = build_broker(source, source_params)
-    enabled_labels = list(source_params.get("selected_strategy") or ["HD Strategy"])
+    enabled_labels = list(source_params.get("selected_strategy") or ["21EMA Strategy"])
     enabled_keys = [
         definition.key
         for definition in STRATEGY_DEFINITIONS
         if definition.label in enabled_labels
     ]
-    runtime = MultiStrategyRuntime(cfg, risk, broker, enabled_keys=enabled_keys or ["hd"])
+    runtime = MultiStrategyRuntime(cfg, risk, broker, enabled_keys=enabled_keys or ["ema21"])
 
     return {
         "cfg": cfg,
@@ -795,7 +800,7 @@ def _build_instrument_state(
         "broker": broker,
         "runtime": runtime,
         "engines": runtime.engines,
-        "engine": runtime.engines.get(enabled_keys[0] if enabled_keys else "hd"),
+        "engine": runtime.engines.get(enabled_keys[0] if enabled_keys else "ema21"),
         "data": data,
         "source_params": source_params,
         "index": max(len(data) - 1, 0),
@@ -926,6 +931,36 @@ def _apply_lot_config_to_cfg(
     cfg.half_size_lots = max(1, int(lots) // 2)
 
 
+def _next_candle_boundary(candle_ts: pd.Timestamp, resolution_minutes: int) -> tuple[str, int]:
+    """Return the next feed boundary and seconds remaining from the processed candle."""
+    resolution = max(1, int(resolution_minutes))
+    next_minute = ((int(candle_ts.minute) // resolution) + 1) * resolution
+    next_ts = candle_ts.replace(second=0, microsecond=0)
+    if next_minute >= 60:
+        next_ts = next_ts.replace(minute=0) + timedelta(hours=1)
+    else:
+        next_ts = next_ts.replace(minute=next_minute)
+    wait_seconds = resolution * 60
+    return next_ts.strftime("%H:%M:%S"), wait_seconds
+
+
+def _persist_monitoring_log(row: dict[str, Any]) -> None:
+    """Append a monitoring row to the mounted daily CSV and tabular text log."""
+    timestamp = pd.to_datetime(row.get("timestamp"), errors="coerce")
+    if pd.isna(timestamp):
+        return
+    local_ts = timestamp.tz_localize(DISPLAY_TZ) if timestamp.tzinfo is None else timestamp.tz_convert(DISPLAY_TZ)
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    date_key = local_ts.strftime("%Y%m%d")
+    csv_path = LOGS_DIR / f"monitoring_{date_key}.csv"
+    txt_path = LOGS_DIR / f"monitoring_{date_key}.txt"
+    persisted = dict(row)
+    persisted["timestamp"] = local_ts.isoformat()
+    frame = pd.DataFrame([persisted])
+    frame.to_csv(csv_path, mode="a", header=not csv_path.exists(), index=False)
+    frame.to_csv(txt_path, mode="a", sep="\t", header=not txt_path.exists(), index=False)
+
+
 def build_strategy_engine(
     strategy_name: str,
     cfg: StrategyConfig,
@@ -979,7 +1014,7 @@ def _process_single_instrument_candle() -> None:
 
     runtime.process_candle(row, prev_row, option_frames)
     st.session_state.engines = runtime.engines
-    selected_key = runtime.active_keys[0] if runtime.active_keys else "hd"
+    selected_key = runtime.active_keys[0] if runtime.active_keys else "ema21"
     st.session_state.engine = runtime.engines.get(selected_key)
     engine = st.session_state.engine
     snapshot = engine.get_status_snapshot() if engine is not None else {}
@@ -993,55 +1028,54 @@ def _process_single_instrument_candle() -> None:
         }
     )
     market_data_logs = st.session_state.get("market_data_logs") or []
-    processed_side_candle_parts: list[str] = []
-    candle_message = (
-        " | ".join(processed_side_candle_parts)
-        if processed_side_candle_parts
-        else (
-            f"O={float(row['open']):.2f} H={float(row['high']):.2f} "
-            f"L={float(row['low']):.2f} C={float(row['close']):.2f} "
-            f"V={float(row['volume']):.0f}"
-        )
-    )
-
-    market_data_logs.append(
-        {
+    resolution = int(source_params.get("openalgo_resolution") or 1)
+    candle_ts = pd.to_datetime(row["datetime"])
+    ema21 = row.get("ema21")
+    ema_text = "NA" if ema21 is None or pd.isna(ema21) else f"{float(ema21):.2f}"
+    option_parts: list[str] = []
+    active_parts: list[str] = []
+    for strategy_key, active_engine in runtime.engines.items():
+        strategy_snapshot = active_engine.get_status_snapshot()
+        for side in ("CE", "PE"):
+            side_snapshot = strategy_snapshot.get(side.lower(), {}) or {}
+            symbol = side_snapshot.get("watched_symbol") or strategy_snapshot.get(f"{side.lower()}_symbol")
+            option_frame = (option_frames.get(strategy_key) or {}).get(side)
+            option_close = None
+            if isinstance(option_frame, pd.DataFrame) and not option_frame.empty:
+                option_close = option_frame.iloc[-1].get("close")
+            position = side_snapshot.get("position")
+            pending = side_snapshot.get("pending_entry")
+            status = "OPEN" if position else "PENDING" if pending else "FLAT"
+            price_text = "NA" if option_close is None or pd.isna(option_close) else f"{float(option_close):.2f}"
+            option_parts.append(f"{side}={symbol or '-'}@{price_text} {status}")
+            if position:
+                active_parts.append(
+                    f"{side} LTP={float(position.get('current_price') or option_close or 0):.2f} "
+                    f"Entry={float(position.get('entry_price') or 0):.2f} "
+                    f"SL={float(position.get('option_stop_level') or 0):.2f} "
+                    f"P&L={float(strategy_snapshot.get('unrealized_pnl') or 0):.2f} "
+                    f"{position.get('progress_status') or 'ACTIVE'}"
+                )
+    status_text = "ACTIVE TRADE: " + " | ".join(active_parts) if active_parts else "No active trade"
+    next_ts, wait_seconds = _next_candle_boundary(candle_ts, resolution)
+    monitoring_row = {
             "timestamp": processed_now,
             "category": "DATA",
-            "status": "INFO",
+            "status": "ACTIVE" if active_parts else "INFO",
             "symbol": feed_symbol,
             "entry_price": None,
             "exit_price": None,
             "trade_pnl": None,
             "message": (
-                f"3m candle pulled for {feed_symbol} "
-                f"(candle_ts={pd.to_datetime(row['datetime']).strftime('%H:%M:%S')}) "
-                f"{candle_message}"
+                f"{resolution}m candle {candle_ts.strftime('%H:%M:%S')} "
+                f"O={float(row['open']):.2f} H={float(row['high']):.2f} "
+                f"L={float(row['low']):.2f} C={float(row['close']):.2f} "
+                f"EMA21={ema_text} | {' | '.join(option_parts) or 'Options=NA'} | "
+                f"{status_text} | Next candle at {next_ts} (waiting {wait_seconds}s)"
             ),
         }
-    )
-
-    new_alerts = []
-    for active_engine in runtime.engines.values():
-        new_alerts.extend(active_engine.alerts)
-    actionable = {
-        "ENTRY", "EXIT", "PENDING_ENTRY", "RISK", "REJECT", "FAILED", "ERROR", "SL", "ORDER"
-    }
-    if not any(str(a.category).upper() in actionable for a in new_alerts):
-        ce_reason = "No strategy signal"
-        pe_reason = "No strategy signal"
-        market_data_logs.append(
-            {
-                "timestamp": processed_now,
-                "category": "DIAG",
-                "status": "INFO",
-                "symbol": feed_symbol,
-                "entry_price": None,
-                "exit_price": None,
-                "trade_pnl": None,
-                "message": f"No alert on this candle | CE: {ce_reason} | PE: {pe_reason}",
-            }
-        )
+    market_data_logs.append(monitoring_row)
+    _persist_monitoring_log(monitoring_row)
 
     if len(market_data_logs) > 500:
         market_data_logs = market_data_logs[-500:]
@@ -1181,6 +1215,8 @@ def refresh_live_account_metrics(source_params: dict[str, Any] | None = None) ->
 
 def render_sidebar() -> dict[str, Any]:
     """Render sidebar controls and return source_params dict."""
+    # Keep the monitoring loop alive regardless of which page is open.
+    st_autorefresh(interval=60_000, key="shared-monitor-refresh")
     product_type = os.getenv("PRODUCT_TYPE", "INTRADAY").upper()
 
     st.sidebar.markdown(
@@ -1206,7 +1242,7 @@ def render_sidebar() -> dict[str, Any]:
     st.sidebar.markdown("### Strategy Selection")
     if "strategy_enabled" not in st.session_state:
         st.session_state.strategy_enabled = {
-            s: (s == "HD Strategy") for s in STRATEGY_OPTIONS
+            s: (s == "21EMA Strategy") for s in STRATEGY_OPTIONS
         }
 
     for strategy in STRATEGY_OPTIONS:
@@ -1218,7 +1254,7 @@ def render_sidebar() -> dict[str, Any]:
         st.session_state.strategy_enabled[strategy] = is_on
 
     enabled_strategies = [s for s in STRATEGY_OPTIONS if st.session_state.strategy_enabled[s]]
-    active_strategy = enabled_strategies[0] if enabled_strategies else STRATEGY_OPTIONS[0]
+    active_strategy = enabled_strategies[0] if enabled_strategies else "21EMA Strategy"
 
     if not enabled_strategies:
         st.sidebar.warning("No strategy active. Enable at least one.", icon="⚠️")
@@ -1341,7 +1377,7 @@ def render_sidebar() -> dict[str, Any]:
         or os.getenv("OPENALGO_HOST", "http://host.docker.internal:5002")
     )
     openalgo_api_key = os.getenv("OPENALGO_API_KEY", "")
-    openalgo_resolution = 3
+    openalgo_resolution = 1
     openalgo_days = 5
 
     source = selected_source
@@ -1516,6 +1552,16 @@ def render_sidebar() -> dict[str, Any]:
 
     if st.session_state.get("openalgo_unavailable"):
         st.sidebar.error(st.session_state["openalgo_unavailable"], icon="⚠️")
+
+    if st.session_state.get("running"):
+        has_engine_state = all(
+            key in st.session_state for key in ("data", "engine", "broker", "index")
+        )
+        if has_engine_state:
+            process_next_candle()
+        else:
+            st.session_state.running = False
+            st.session_state.engine_status = "stopped"
 
     return source_params
 

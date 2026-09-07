@@ -9,12 +9,10 @@ from urllib.parse import urlparse
 
 import pandas as pd
 import streamlit as st
-from streamlit_autorefresh import st_autorefresh
-
 from _shared import (
     DISPLAY_TZ,
+    LOGS_DIR,
     inject_theme,
-    process_next_candle,
     refresh_live_account_metrics,
     render_section_heading,
     render_sidebar,
@@ -24,17 +22,8 @@ from core.engine import BaseStrategyEngine
 inject_theme()
 source_params = render_sidebar()
 
-# Keep the strategy loop alive even when the user stays on the Logs page.
+# Keep account metrics current while the Logs page is open.
 refresh_live_account_metrics(source_params)
-if st.session_state.get("running", False):
-    has_engine_state = all(
-        key in st.session_state for key in ("data", "engine", "broker", "index")
-    )
-    if has_engine_state:
-        process_next_candle()
-    else:
-        st.session_state.running = False
-        st.session_state.engine_status = "stopped"
 
 _STATUS_BADGE: dict[str, str] = {
     "SUCCESS":   "🟢",
@@ -163,11 +152,21 @@ def _session_logs_df(engine: BaseStrategyEngine | None) -> pd.DataFrame:
 
 
 def _market_data_logs_df() -> pd.DataFrame:
+    frames: list[pd.DataFrame] = []
     rows = st.session_state.get("market_data_logs") or []
-    if not rows:
+    if rows:
+        frames.append(pd.DataFrame(rows))
+    for path in sorted(LOGS_DIR.glob("monitoring_*.csv")):
+        try:
+            historical_df = pd.read_csv(path)
+        except (OSError, ValueError, pd.errors.ParserError):
+            continue
+        if not historical_df.empty:
+            frames.append(historical_df)
+    if not frames:
         return pd.DataFrame()
 
-    df = pd.DataFrame(rows).rename(
+    df = pd.concat(frames, ignore_index=True).rename(
         columns={
             "timestamp": "Timestamp",
             "category": "Category",
@@ -179,12 +178,16 @@ def _market_data_logs_df() -> pd.DataFrame:
             "message": "Message",
         }
     )
-    df["Timestamp"] = pd.to_datetime(df["Timestamp"], errors="coerce")
+    # Session rows may be timezone-aware while older CSV rows can be naive.
+    # Parse everything as UTC first so concatenated history has one dtype.
+    df["Timestamp"] = pd.to_datetime(df["Timestamp"], errors="coerce", utc=True)
     df = df.dropna(subset=["Timestamp"])
     if df.empty:
         return df
-    df["Date"] = df["Timestamp"].dt.date
-    df["Time"] = df["Timestamp"].dt.strftime("%H:%M:%S")
+    local_ts = df["Timestamp"].dt.tz_convert(DISPLAY_TZ)
+    df["Date"] = local_ts.dt.date
+    df["Time"] = local_ts.dt.strftime("%H:%M:%S")
+    df = df.drop_duplicates(subset=["Timestamp", "Category", "Symbol", "Message"], keep="last")
     return df[[
         "Date", "Time", "Timestamp", "Category", "Status", "Symbol",
         "Entry Price", "Exit Price", "Trade P&L", "Message",
@@ -302,41 +305,7 @@ def _build_console_logs_df(
     openalgo_lines: list[str],
 ) -> pd.DataFrame:
     rows: list[dict[str, str]] = []
-    now = datetime.now(DISPLAY_TZ)
     strategy_name = str(source_params.get("active_strategy") or "HD Strategy")
-    feed_symbol = str(source_params.get("openalgo_symbol") or "NSE:NIFTY-INDEX")
-    resolution = int(source_params.get("openalgo_resolution") or 3)
-
-    next_ts, wait_seconds = _next_candle_eta(resolution)
-    rows.append(
-        {
-            "Time": now.strftime("%H:%M:%S"),
-            "Level": "INFO",
-            "Strategy": strategy_name,
-            "Instrument": feed_symbol,
-            "Message": f"Next candle at {next_ts} (waiting {wait_seconds}s)",
-        }
-    )
-
-    ce_symbol = snapshot.get("ce_symbol")
-    pe_symbol = snapshot.get("pe_symbol")
-    if ce_symbol or pe_symbol:
-        sl_hits = snapshot.get("sl_hits_today", 0)
-        ce_pos = (snapshot.get("ce", {}) or {}).get("position")
-        pe_pos = (snapshot.get("pe", {}) or {}).get("position")
-        rows.append(
-            {
-                "Time": now.strftime("%H:%M:%S"),
-                "Level": "INFO",
-                "Strategy": strategy_name,
-                "Instrument": f"{ce_symbol or '-'} | {pe_symbol or '-'}",
-                "Message": (
-                    f"CE={'OPEN' if ce_pos else 'FLAT'} "
-                    f"PE={'OPEN' if pe_pos else 'FLAT'} "
-                    f"SL-Hits={sl_hits}/3"
-                ),
-            }
-        )
 
     if not market_data_df.empty:
         market_data_copy = market_data_df.copy()
@@ -359,22 +328,6 @@ def _build_console_logs_df(
                     "Message": str(row.get("Message") or ""),
                 }
             )
-
-    for line in openalgo_lines[-40:]:
-        text = str(line).strip()
-        if not text:
-            continue
-        time_match = re.search(r"\b(\d{2}:\d{2}:\d{2})\b", text)
-        level = "ERROR" if "error" in text.lower() else "INFO"
-        rows.append(
-            {
-                "Time": time_match.group(1) if time_match else now.strftime("%H:%M:%S"),
-                "Level": level,
-                "Strategy": "OpenAlgo",
-                "Instrument": _extract_symbol(text),
-                "Message": text,
-            }
-        )
 
     console_df = pd.DataFrame(rows)
     if console_df.empty:
@@ -477,8 +430,7 @@ last_refresh = st.session_state.get("live_account_updated_at") or "—"
 live_error = st.session_state.get("live_account_error")
 openalgo_log_lines, openalgo_log_error = _load_openalgo_container_logs(source_params)
 last_candle_processed_at = st.session_state.get("last_candle_processed_at")
-refresh_minutes = max(1, int(source_params.get("openalgo_resolution") or 3))
-refresh_interval_ms = refresh_minutes * 60 * 1000
+refresh_minutes = 1
 
 # ── 1. Top Status Header ──────────────────────────────────────────────────────
 if engine_status == "running" and live_error:
@@ -495,16 +447,31 @@ else:
 last_candle_display = _format_display_ts(last_candle_processed_at) if last_candle_processed_at else "—"
 selected_instruments = list(source_params.get("selected_instruments") or [])
 instrument_configs = source_params.get("instrument_configs") or {}
-selected_symbols = [
-    f"{instrument}: {dict(instrument_configs.get(instrument) or {}).get('symbol', instrument)}"
-    for instrument in selected_instruments
-]
 spot_symbol = str(source_params.get("openalgo_symbol") or source_params.get("primary_instrument") or "NSE:NIFTY-INDEX")
-ce_sym = snapshot.get("ce_symbol")
-pe_sym = snapshot.get("pe_symbol")
-active_symbols = " | ".join(selected_symbols) if selected_symbols else spot_symbol
-if len(selected_instruments) == 1 and ce_sym and pe_sym:
-    active_symbols = f"{selected_instruments[0]}: {ce_sym} | {pe_sym}"
+instrument_states = st.session_state.get("instrument_states") or {}
+instrument_symbol_labels: list[str] = []
+for instrument in selected_instruments:
+    state = instrument_states.get(instrument) or {}
+    state_runtime = state.get("runtime")
+    state_engine = None
+    if state_runtime is not None and state_runtime.active_keys:
+        state_engine = state_runtime.engines.get(state_runtime.active_keys[0])
+    state_snapshot = state_engine.get_status_snapshot() if state_engine is not None else {}
+    spot = str(
+        dict(instrument_configs.get(instrument) or {}).get("symbol")
+        or (state.get("source_params") or {}).get("openalgo_symbol")
+        or instrument
+    )
+    ce_symbol = state_snapshot.get("ce_symbol")
+    pe_symbol = state_snapshot.get("pe_symbol")
+    if ce_symbol or pe_symbol:
+        instrument_symbol_labels.append(
+            f"{instrument}: {ce_symbol or '-'} CE | {pe_symbol or '-'} PE"
+        )
+    else:
+        instrument_symbol_labels.append(f"{instrument}: {spot} (ATM pending)")
+
+active_symbols = " | ".join(instrument_symbol_labels) if instrument_symbol_labels else spot_symbol
 now_time = datetime.now(DISPLAY_TZ).time()
 if now_time < datetime.strptime("09:15", "%H:%M").time():
     market_phase = "Pre-Market"
@@ -562,21 +529,14 @@ st.html(f"""
 </div>
 """)
 
-# ── 2. Auto-refresh controls ──────────────────────────────────────────────────
-hdr_col, toggle_col = st.columns([6, 2])
+# ── 2. Auto-refresh status ────────────────────────────────────────────────────
+hdr_col, refresh_col = st.columns([6, 2])
 with hdr_col:
     render_section_heading("Operations Log", "Daily trade and alert logs",
                            "All trades, alerts, entry/exit prices, and events by date.")
-with toggle_col:
-    auto_refresh = st.toggle(
-        f"Auto-refresh ({refresh_minutes} min)",
-        value=True,
-        key="logs_auto_refresh",
-    )
+with refresh_col:
+    st.caption(f"Auto-refresh ({refresh_minutes} min)")
     st.caption(f"Last refresh: {last_refresh}")
-
-if auto_refresh:
-    st_autorefresh(interval=refresh_interval_ms, key="logs-autorefresh")
 
 with st.container(border=True):
     render_section_heading(
@@ -594,8 +554,8 @@ with st.container(border=True):
 with st.container(border=True):
     render_section_heading(
         "Console logs",
-        "Live 3-minute cycle stream",
-        "Shows each polling cycle, latest candle pulls, no-signal reasons, and raw OpenAlgo tail in one view.",
+        "One consolidated row per minute",
+        "Shows OHLC, EMA21, option values, trade status, and the next candle time.",
     )
 
     console_source_df = _build_console_logs_df(
