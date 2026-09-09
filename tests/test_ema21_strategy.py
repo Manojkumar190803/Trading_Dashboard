@@ -3,7 +3,7 @@ from datetime import datetime, timedelta
 import pandas as pd
 import pytest
 
-from core.models import Position, Signal
+from core.models import PendingEntry, Position, Signal
 from core.broker import ConsoleBroker, HistoricalReplayBroker
 from core.engine import BaseStrategyEngine
 from core.models import RiskConfig, StrategyConfig
@@ -197,6 +197,54 @@ def test_ema21_cancels_old_order_before_accepting_new_setup():
     assert broker.order_ids == [("OID-1", 116.25), ("OID-2", 123.40)]
     assert engine.state.ce.pending_entry is not None
     assert engine.state.ce.pending_entry.option_trigger_level == 123.40
+
+
+def test_completed_entry_with_zero_broker_quantity_clears_pending_state():
+    class CompletedButFlatBroker(ConsoleBroker):
+        requires_position_reconciliation = True
+
+        def get_order_status(self, order_id):
+            return {
+                "order_status": "complete",
+                "orderid": order_id,
+                "average_price": 128.85,
+            }
+
+        def get_position_book(self):
+            return []
+
+    provider = EMA21SignalProvider()
+    engine = BaseStrategyEngine(
+        StrategyConfig(),
+        RiskConfig(max_sl_per_day=3),
+        CompletedButFlatBroker(),
+        provider,
+    )
+    engine.state.atm_locked = True
+    engine.state.pe = provider.create_side_state()
+    engine.state.pe.option_symbol = "NIFTY15SEP2623700PE"
+    engine.state.pe.pending_entry = PendingEntry(
+        signal=Signal.BUY_PE,
+        created_at=datetime(2026, 9, 8, 12, 48),
+        option_symbol=engine.state.pe.option_symbol,
+        quantity=130,
+        option_trigger_level=128.70,
+        option_stop_level=118.30,
+        trigger_candle_high=128.70,
+        trigger_candle_low=125.05,
+        order_id="stale-completed-order",
+    )
+
+    engine.try_fill_pending_entry(
+        "PE",
+        engine.state.pe,
+        datetime(2026, 9, 8, 12, 54),
+        _row(0, open_=123, high=124, low=122, close=122.30, ema=123.0),
+    )
+
+    assert engine.state.pe.pending_entry is None
+    assert engine.state.pe.position is None
+    assert any("no broker position" in alert.message for alert in engine.alerts)
 
 
 def test_engine_does_not_create_order_when_entry_stop_gap_exceeds_25_points():

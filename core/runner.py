@@ -29,6 +29,209 @@ def _trade_alert_path(trading_day: date, script: str) -> Path:
     return Path("logs") / f"trade_alerts_{script}_{trading_day:%Y%m%d}.csv"
 
 
+def _runner_checkpoint_path(trading_day: date, script: str, strategy: str) -> Path:
+    safe_strategy = re.sub(r"[^A-Za-z0-9_-]+", "_", strategy)
+    return Path("logs") / f"runner_checkpoint_{script}_{safe_strategy}_{trading_day:%Y%m%d}.json"
+
+
+def _load_runner_checkpoint(trading_day: date, script: str, strategy: str) -> dict[str, datetime]:
+    path = _runner_checkpoint_path(trading_day, script, strategy)
+    if not path.exists():
+        return {}
+    try:
+        with path.open(encoding="utf-8") as handle:
+            raw = json.load(handle)
+        return {
+            side: datetime.fromisoformat(value)
+            for side, value in raw.items()
+            if side in {"CE", "PE"} and isinstance(value, str)
+        }
+    except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        logger.warning("could not load runner checkpoint %s: %s", path, exc)
+        return {}
+
+
+def _save_runner_checkpoint(
+    trading_day: date,
+    script: str,
+    strategy: str,
+    checkpoints: dict[str, Optional[datetime]],
+) -> None:
+    path = _runner_checkpoint_path(trading_day, script, strategy)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as handle:
+        json.dump(
+            {side: timestamp.isoformat() for side, timestamp in checkpoints.items() if timestamp is not None},
+            handle,
+        )
+
+
+def _persist_monitoring_row(row: dict[str, object]) -> None:
+    logs_dir = Path("logs")
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = pd.to_datetime(row.get("timestamp"), errors="coerce")
+    if pd.isna(timestamp):
+        return
+    date_key = timestamp.strftime("%Y%m%d")
+    csv_path = logs_dir / f"monitoring_{date_key}.csv"
+    txt_path = logs_dir / f"monitoring_{date_key}.txt"
+
+    with csv_path.open("a", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(row))
+        if not csv_path.stat().st_size:
+            writer.writeheader()
+        writer.writerow(row)
+    with txt_path.open("a", encoding="utf-8") as handle:
+        if not txt_path.stat().st_size:
+            handle.write("\t".join(row) + "\n")
+        handle.write("\t".join("" if value is None else str(value) for value in row.values()) + "\n")
+
+
+def _persist_tick_monitoring(symbol: str, ltp: float, tick_time: datetime, sides: str = "") -> None:
+    """Persist active-position ticks for the dashboard's live console view."""
+    row = {
+        "timestamp": tick_time.isoformat(),
+        "category": "TICK",
+        "status": "ACTIVE",
+        "symbol": symbol,
+        "entry_price": None,
+        "exit_price": None,
+        "trade_pnl": None,
+        "message": f"Tick {sides}: {symbol} LTP={ltp:.2f}",
+    }
+    _persist_monitoring_row(row)
+
+
+def _persist_candle_monitoring(
+    symbol: str,
+    candle: pd.Series,
+    timeframe_minutes: int,
+    ema21: object = None,
+) -> None:
+    """Persist one closed spot candle for the dashboard's background feed."""
+    candle_time = pd.to_datetime(candle.get("datetime"), errors="coerce")
+    if pd.isna(candle_time):
+        return
+    timestamp = candle_time.to_pydatetime()
+    ema_text = "NA" if ema21 is None or pd.isna(ema21) else f"{float(ema21):.2f}"
+    row = {
+        "timestamp": datetime.now().astimezone().isoformat(),
+        "category": "DATA",
+        "status": "INFO",
+        "symbol": symbol,
+        "entry_price": None,
+        "exit_price": None,
+        "trade_pnl": None,
+        "message": (
+            f"{timeframe_minutes}m candle {timestamp.strftime('%H:%M:%S')} "
+            f"O={float(candle['open']):.2f} H={float(candle['high']):.2f} "
+            f"L={float(candle['low']):.2f} C={float(candle['close']):.2f} "
+            f"EMA21={ema_text}"
+        ),
+    }
+    csv_path = Path("logs") / f"monitoring_{timestamp:%Y%m%d}.csv"
+    candle_key = f"{timeframe_minutes}m candle {timestamp.strftime('%H:%M:%S')}"
+    if csv_path.exists():
+        try:
+            with csv_path.open(newline="", encoding="utf-8") as handle:
+                if any(
+                    candle_key in str(existing.get("message") or "")
+                    and str(existing.get("symbol") or "") == symbol
+                    for existing in csv.DictReader(handle)
+                ):
+                    return
+        except OSError as exc:
+            logger.warning("could not check duplicate candle monitoring row: %s", exc)
+    _persist_monitoring_row(row)
+
+
+def _persist_setup_status_monitoring(
+    engine: BaseStrategyEngine,
+    side: str,
+    side_state: object,
+    candle: pd.Series,
+) -> None:
+    """Persist the per-side setup counter so Logs survives worker restarts."""
+    status = str(engine.signal_provider.format_setup_status(side_state) or "WAITING")
+    candle_time = pd.to_datetime(candle.get("datetime"), errors="coerce")
+    if pd.isna(candle_time):
+        return
+    symbol = str(getattr(side_state, "option_symbol", None) or side)
+    message = (
+        f"{side} EMA21 setup | {symbol} | {status} | "
+        f"candle={candle_time.strftime('%H:%M:%S')}"
+    )
+    row = {
+        "timestamp": datetime.now().astimezone().isoformat(),
+        "category": "SETUP_STATUS",
+        "status": "INFO",
+        "symbol": symbol,
+        "entry_price": None,
+        "exit_price": None,
+        "trade_pnl": None,
+        "message": message,
+    }
+    csv_path = Path("logs") / f"monitoring_{candle_time:%Y%m%d}.csv"
+    if csv_path.exists():
+        try:
+            with csv_path.open(newline="", encoding="utf-8") as handle:
+                if any(
+                    existing.get("category") == "SETUP_STATUS"
+                    and existing.get("symbol") == symbol
+                    and existing.get("message") == message
+                    for existing in csv.DictReader(handle)
+                ):
+                    return
+        except OSError as exc:
+            logger.warning("could not check duplicate setup status: %s", exc)
+    _persist_monitoring_row(row)
+
+
+def _cancel_stale_ema21_pending(
+    engine: BaseStrategyEngine,
+    broker: OpenAlgoBroker,
+    side: str,
+    candles: pd.DataFrame,
+) -> bool:
+    """Cancel a restored EMA21 entry invalidated before worker startup."""
+    if getattr(engine.signal_provider, "strategy_key", None) != "ema21":
+        return False
+    side_state = engine._side_state(side)
+    pending = side_state.pending_entry
+    if pending is None or candles.empty:
+        return False
+    created_at = pd.Timestamp(pending.created_at)
+    candle_times = pd.to_datetime(candles["datetime"])
+    if created_at.tzinfo is not None:
+        created_at = created_at.tz_localize(None)
+    if candle_times.dt.tz is not None:
+        candle_times = candle_times.dt.tz_localize(None)
+    invalidated = candles[
+        (candle_times > created_at)
+        & candles["ema21"].notna()
+        & (candles["close"] <= candles["ema21"])
+    ]
+    if invalidated.empty:
+        return False
+    candle = invalidated.iloc[0]
+    close = float(candle["close"])
+    ema_value = float(candle["ema21"])
+    if not engine._cancel_pending_entry_order(side, pending, candle["datetime"]):
+        return False
+    side_state.pending_entry = None
+    engine._record_alert(
+        candle["datetime"],
+        "CANCEL",
+        f"{side} pending cancelled on startup: EMA21 close failure "
+        f"(close={close:.2f} <= EMA21={ema_value:.2f})",
+    )
+    logger.info(
+        "cancelled stale restored %s EMA21 entry: close=%.2f <= EMA21=%.2f",
+        side, close, ema_value,
+    )
+    return True
+
+
 def _persist_atm_lock(engine: BaseStrategyEngine, spot_price: float) -> None:
     if not engine.state.atm_locked or not engine.state.trading_day:
         return
@@ -169,7 +372,7 @@ def _load_persisted_trade_alerts(
     engine: BaseStrategyEngine,
     trading_day: date,
 ) -> None:
-    """Restore today's entry and exit alerts so live status survives restarts."""
+    """Restore today's actionable alerts so restart deduplication survives."""
     path = _trade_alert_path(trading_day, engine.cfg.option_index_symbol)
     if not path.exists():
         return
@@ -178,7 +381,10 @@ def _load_persisted_trade_alerts(
             rows = [
                 row for row in csv.DictReader(handle)
                 if row.get("strategy") == engine.strategy_name
-                and row.get("category") in ("ENTRY", "EXIT")
+                and row.get("category") in {
+                    "SIGNAL", "PENDING_ENTRY", "ENTRY", "EXIT", "TARGET", "SL",
+                    "ORDER", "RISK", "REJECT", "FAILED", "ERROR", "UNCERTAIN_ENTRY",
+                }
             ]
     except (OSError, ValueError) as exc:
         logger.warning("could not load persisted trade alerts: %s", exc)
@@ -351,9 +557,20 @@ def _restore_open_positions(engine: BaseStrategyEngine, broker: OpenAlgoBroker, 
         risk_points = max(float(engine.cfg.max_option_risk_points), engine.cfg.option_tick_size)
         side_state.option_symbol = symbol
         side_state.order_submission_uncertain = False
+        pending_created_at = datetime.now()
+        for alert in reversed(alerts):
+            if (
+                alert.get("category") == "PENDING_ENTRY"
+                and symbol in str(alert.get("message") or "")
+            ):
+                try:
+                    pending_created_at = datetime.fromisoformat(str(alert["timestamp"]))
+                except (KeyError, TypeError, ValueError):
+                    pass
+                break
         side_state.pending_entry = PendingEntry(
             signal=Signal.BUY_CE if side == "CE" else Signal.BUY_PE,
-            created_at=datetime.now(),
+            created_at=pending_created_at,
             option_symbol=symbol,
             quantity=quantity,
             option_trigger_level=trigger,
@@ -531,6 +748,14 @@ class LiveFeedRunner:
         self._stop = threading.Event()
         self._last_bar_time: dict[str, Optional[datetime]] = {"CE": None, "PE": None}
         self._startup_baselined: set[str] = set()
+        self._checkpoint_day = datetime.now().date()
+        self._checkpoint = _load_runner_checkpoint(
+            self._checkpoint_day,
+            self.cfg.option_index_symbol,
+            getattr(self.engine, "strategy_name", "unknown"),
+        )
+        self._last_bar_time.update(self._checkpoint)
+        self._last_monitoring_candle: Optional[datetime] = None
         self._shown_alert_times: dict[str, Optional[datetime]] = {"ENTRY": None, "EXIT": None}
 
     def stop(self) -> None:
@@ -586,12 +811,12 @@ class LiveFeedRunner:
         now = datetime.now()
         tf = self.cfg.timeframe_minutes
         boundary_min = ((now.minute // tf) + 1) * tf
-        next_ts = now.replace(second=0, microsecond=0)
+        next_ts = now.replace(second=5, microsecond=0)
         if boundary_min >= 60:
             next_ts = next_ts.replace(minute=0) + timedelta(hours=1)
         else:
             next_ts = next_ts.replace(minute=boundary_min)
-        return max(1.0, (next_ts - now).total_seconds() + self.poll_slack_seconds)
+        return max(1.0, (next_ts - now).total_seconds())
 
     def _process_new_bars_for_side(self, side: str, data: pd.DataFrame) -> None:
         if data.empty:
@@ -605,10 +830,17 @@ class LiveFeedRunner:
         last_ts = self._last_bar_time.get(side)
         if side not in self._startup_baselined and last_ts is None:
             latest_ts = closed["datetime"].iloc[-1]
+            _cancel_stale_ema21_pending(self.engine, self.broker, side, closed)
             self._last_bar_time[side] = (
                 latest_ts.to_pydatetime() if hasattr(latest_ts, "to_pydatetime") else latest_ts
             )
             self._startup_baselined.add(side)
+            _save_runner_checkpoint(
+                self._checkpoint_day,
+                self.cfg.option_index_symbol,
+                self.engine.strategy_name,
+                self._last_bar_time,
+            )
             logger.info(
                 "baselined %s at %s; historical bars will not create orders, "
                 "new live signals remain enabled",
@@ -632,9 +864,21 @@ class LiveFeedRunner:
             if pos_in_full > 0:
                 prev_row = data.iloc[pos_in_full - 1]
             self.engine.process_option_candle(side, row, prev_row)
+            _persist_setup_status_monitoring(
+                self.engine,
+                side,
+                self.engine._side_state(side),
+                row,
+            )
             ts = row["datetime"]
             self._last_bar_time[side] = (
                 ts.to_pydatetime() if hasattr(ts, "to_pydatetime") else ts
+            )
+            _save_runner_checkpoint(
+                self._checkpoint_day,
+                self.cfg.option_index_symbol,
+                self.engine.strategy_name,
+                self._last_bar_time,
             )
             if not self.engine.verbose:
                 logger.info(
@@ -645,6 +889,37 @@ class LiveFeedRunner:
 
     def _poll_once(self) -> None:
         now = datetime.now()
+        try:
+            start_date = (now.date() - timedelta(days=1)).strftime("%Y-%m-%d")
+            end_date = now.date().strftime("%Y-%m-%d")
+            raw_spot = self.broker.fetch_history(
+                symbol=self.cfg.spot_symbol,
+                exchange=self.cfg.exchange_spot,
+                interval=f"{self.cfg.timeframe_minutes}m",
+                start_date=start_date,
+                end_date=end_date,
+            )
+            spot_data = add_indicators(_normalize_history_df(raw_spot), self.cfg)
+            if not spot_data.empty:
+                closed_spot = spot_data[
+                    spot_data["datetime"] + timedelta(minutes=self.cfg.timeframe_minutes) <= now
+                ]
+                if not closed_spot.empty:
+                    latest = closed_spot.iloc[-1]
+                    candle_time = pd.to_datetime(latest["datetime"])
+                else:
+                    latest = None
+                    candle_time = None
+                if latest is not None and candle_time.to_pydatetime() != self._last_monitoring_candle:
+                    _persist_candle_monitoring(
+                        self.cfg.spot_symbol,
+                        latest,
+                        self.cfg.timeframe_minutes,
+                        latest.get("ema21"),
+                    )
+                    self._last_monitoring_candle = candle_time.to_pydatetime()
+        except Exception as exc:
+            logger.warning("spot monitoring history failed: %s", exc)
         self._try_lock_atm(now)
         if not self.engine.state.atm_locked:
             return
@@ -707,6 +982,7 @@ class LiveFeedRunner:
                 tick_time = datetime.now()
                 labels = ",".join(side for side, _ in subscriptions)
                 print(f"[TICK] {tick_time} side={labels} symbol={symbol} ltp={float(ltp):.2f}")
+                _persist_tick_monitoring(symbol, float(ltp), tick_time, labels)
                 for side, side_state in subscriptions:
                     if side_state.position is not None:
                         self.engine.process_tick(side, float(ltp), tick_time)
@@ -733,12 +1009,6 @@ class LiveFeedRunner:
                 if self._wait_with_countdown(wait, "Market opens"):
                     break
 
-        try:
-            self._poll_once()
-            self._print_cycle_summary()
-        except Exception as exc:
-            logger.warning("initial poll failed: %s", exc)
-
         while not self._stop.is_set():
             # ── Skip poll if market is closed ────────────────────────────
             if not self._is_market_open():
@@ -747,7 +1017,6 @@ class LiveFeedRunner:
                 if self._wait_with_countdown(sleep_for, "Market opens"):
                     break
                 continue
-
             sleep_for = self._seconds_until_next_boundary()
             logger.debug("sleeping %.1fs until next boundary", sleep_for)
             if self._wait_with_countdown(sleep_for):
@@ -912,6 +1181,15 @@ class MultiEngineLiveFeedRunner:
         self._stop = threading.Event()
         self._last_bar_time: dict[str, Optional[datetime]] = {"CE": None, "PE": None}
         self._startup_baselined: set[str] = set()
+        self._checkpoint_day = datetime.now().date()
+        self._checkpoint_strategy = "+".join(name for name, _ in self.engines)
+        self._last_bar_time.update(
+            _load_runner_checkpoint(
+                self._checkpoint_day,
+                self.cfg.option_index_symbol,
+                self._checkpoint_strategy,
+            )
+        )
 
     def stop(self) -> None:
         self._stop.set()
@@ -986,12 +1264,12 @@ class MultiEngineLiveFeedRunner:
         now = datetime.now()
         tf = self.cfg.timeframe_minutes
         boundary_min = ((now.minute // tf) + 1) * tf
-        next_ts = now.replace(second=0, microsecond=0)
+        next_ts = now.replace(second=5, microsecond=0)
         if boundary_min >= 60:
             next_ts = next_ts.replace(minute=0) + timedelta(hours=1)
         else:
             next_ts = next_ts.replace(minute=boundary_min)
-        return max(1.0, (next_ts - now).total_seconds() + self.poll_slack_seconds)
+        return max(1.0, (next_ts - now).total_seconds())
 
     def _process_new_bars_for_side(self, side: str, data: pd.DataFrame) -> None:
         if data.empty:
@@ -1005,10 +1283,18 @@ class MultiEngineLiveFeedRunner:
         last_ts = self._last_bar_time.get(side)
         if side not in self._startup_baselined and last_ts is None:
             latest_ts = closed["datetime"].iloc[-1]
+            for _, engine in self.engines:
+                _cancel_stale_ema21_pending(engine, self.broker, side, closed)
             self._last_bar_time[side] = (
                 latest_ts.to_pydatetime() if hasattr(latest_ts, "to_pydatetime") else latest_ts
             )
             self._startup_baselined.add(side)
+            _save_runner_checkpoint(
+                self._checkpoint_day,
+                self.cfg.option_index_symbol,
+                self._checkpoint_strategy,
+                self._last_bar_time,
+            )
             logger.info(
                 "baselined %s at %s; historical bars will not create orders, "
                 "new live signals remain enabled",
@@ -1033,9 +1319,21 @@ class MultiEngineLiveFeedRunner:
                 prev_row = data.iloc[pos_in_full - 1]
             for _, engine in self.engines:
                 engine.process_option_candle(side, row, prev_row)
+                _persist_setup_status_monitoring(
+                    engine,
+                    side,
+                    engine._side_state(side),
+                    row,
+                )
             ts = row["datetime"]
             self._last_bar_time[side] = (
                 ts.to_pydatetime() if hasattr(ts, "to_pydatetime") else ts
+            )
+            _save_runner_checkpoint(
+                self._checkpoint_day,
+                self.cfg.option_index_symbol,
+                self._checkpoint_strategy,
+                self._last_bar_time,
             )
 
     def _poll_once(self) -> None:
@@ -1104,6 +1402,7 @@ class MultiEngineLiveFeedRunner:
                 continue
             if ltp > 0:
                 print(f"[TICK] {now} symbol={symbol} ltp={float(ltp):.2f}")
+                _persist_tick_monitoring(symbol, float(ltp), now)
                 for active_engine, active_side, side_state in subscriptions:
                     if side_state.position is not None:
                         active_engine.process_tick(active_side, float(ltp), now)
@@ -1131,12 +1430,6 @@ class MultiEngineLiveFeedRunner:
                 wait = _seconds_until_market_open(self.cfg)
                 if self._wait_with_countdown(wait, "Market opens"):
                     break
-
-        try:
-            self._poll_once()
-            self._print_cycle_summary()
-        except Exception as exc:
-            logger.warning("initial poll failed: %s", exc)
 
         while not self._stop.is_set():
             # ── Skip poll if market is closed ────────────────────────────

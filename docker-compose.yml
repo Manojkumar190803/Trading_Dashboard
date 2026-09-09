@@ -34,8 +34,27 @@ services:
       OPENALGO_WS_URL: ws://host.docker.internal:8766
       WEBSOCKET_HOST: host.docker.internal
       WEBSOCKET_PORT: "8766"
+      BACKGROUND_WORKER_ENABLED: "true"
     volumes:
       - ./logs:/app/logs
       - /var/run/docker.sock:/var/run/docker.sock
+
+  strategy_worker:
+    <<: *live-defaults
+    container_name: strategy_worker
+    labels:
+      com.openalgo.display-name: "Strategy background worker"
+    environment:
+      TZ: Asia/Kolkata
+      STRATEGY: ${STRATEGY:-ema21}
+      MODE: ${MODE:-live}
+      SCRIPT: ${SCRIPT:-NIFTY}
+      BACKGROUND_WORKER_ENABLED: "true"
+      OPENALGO_HOST: http://host.docker.internal:5002
+      OPENALGO_WS_URL: ws://host.docker.internal:8766
+      WEBSOCKET_HOST: host.docker.internal
+      WEBSOCKET_PORT: "8766"
+    volumes:
+      - ./logs:/app/logs
 
 

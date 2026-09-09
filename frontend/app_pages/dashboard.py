@@ -7,6 +7,7 @@ from _shared import (
     refresh_live_account_metrics,
     render_section_heading,
     render_sidebar,
+    run_premarket_checks,
 )
 
 inject_theme()
@@ -31,6 +32,7 @@ st.html(
     f"""
     <div class='hd-dashboard-header'>
         <div class='hd-header-left'>
+            <div style='color:#59d0ff;text-transform:uppercase;letter-spacing:.14em;font-size:.7rem;font-weight:800;margin-bottom:.25rem;'>Live control room</div>
             <h1 class='hd-dashboard-title'>Trading Dashboard</h1>
             <p class='hd-dashboard-subtitle'>Live overview of your trading account and market positions</p>
         </div>
@@ -72,3 +74,39 @@ if live_error:
     st.warning(f"Live account: {live_error}", icon="⚠️")
 elif updated_at:
     st.caption(f"Live account syncing every 10s · Last updated: {updated_at}")
+
+# ── Pre-market readiness (kept in the sidebar so the main dashboard stays clear)
+if "premarket_checks" not in st.session_state:
+    st.session_state.premarket_checks = run_premarket_checks(source_params)
+    st.session_state.premarket_checked_at = updated_at or "now"
+
+checks = st.session_state.get("premarket_checks", [])
+ready_count = sum(check["status"] == "READY" for check in checks)
+failed_count = sum(check["status"] == "FAILED" for check in checks)
+overall = "READY" if checks and failed_count == 0 else "ACTION REQUIRED"
+overall_color = "#27d48a" if overall == "READY" else "#ffbe32"
+
+st.sidebar.markdown("---")
+st.sidebar.markdown("**Pre-Market Readiness**")
+st.sidebar.markdown(
+    f"<div style='color:{overall_color};font-weight:800;font-size:.82rem;'>"
+    f"{overall} · {ready_count}/{len(checks)} passed</div>",
+    unsafe_allow_html=True,
+)
+st.sidebar.caption(f"Checked: {st.session_state.get('premarket_checked_at', 'not checked')}")
+if st.sidebar.button("Run checks", key="sidebar_run_premarket_checks", use_container_width=True):
+    st.session_state.premarket_checks = run_premarket_checks(source_params)
+    st.session_state.premarket_checked_at = updated_at or "now"
+    st.rerun()
+
+with st.sidebar.expander("View check details", expanded=False):
+    for check in checks:
+        status_color = {"READY": "#27d48a", "WARNING": "#ffbe32", "FAILED": "#ff5f6d"}.get(
+            check["status"], "#8899aa"
+        )
+        st.markdown(
+            f"<div style='padding:.2rem 0;border-bottom:1px solid rgba(86,184,222,.10);'>"
+            f"<strong style='color:{status_color};'>{check['status']}</strong><br>"
+            f"<span style='font-size:.75rem;'>{check['name']}</span></div>",
+            unsafe_allow_html=True,
+        )

@@ -1,7 +1,10 @@
 """Analytics page — equity curve and underlying spot charts."""
 from __future__ import annotations
 
+import csv
 import re
+from datetime import date
+from pathlib import Path
 
 import pandas as pd
 import streamlit as st
@@ -11,19 +14,63 @@ from _shared import inject_theme, render_section_heading, render_sidebar
 inject_theme()
 render_sidebar()
 
+st.markdown(
+    """
+    <style>
+    .analytics-hero { border:1px solid rgba(89,208,255,.24); border-radius:18px; padding:1.2rem 1.35rem; margin:.3rem 0 1.1rem; background:linear-gradient(110deg,rgba(18,57,70,.9),rgba(12,29,40,.62)); box-shadow:0 16px 36px rgba(0,0,0,.16); }
+    .analytics-kicker { color:#59d0ff; text-transform:uppercase; letter-spacing:.14em; font-size:.7rem; font-weight:800; }
+    .analytics-title { color:#edfaff; font-size:1.55rem; font-weight:800; margin-top:.25rem; }
+    .analytics-copy { color:#a9c2cc; font-size:.86rem; margin-top:.25rem; }
+    </style>
+    <div class="analytics-hero">
+        <div class="analytics-kicker">Performance intelligence</div>
+        <div class="analytics-title">Analytics</div>
+        <div class="analytics-copy">Read the session through expectancy, risk, equity movement, and strategy quality.</div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
 equity_curve = st.session_state.get("equity_curve", [])
 engine = st.session_state.get("engine")
 
 
-def _extract_trade_pnls() -> list[float]:
-    if engine is None:
+def _load_persisted_alerts() -> list[dict[str, str]]:
+    source_params = st.session_state.get("source_params", {}) or {}
+    instrument = str(source_params.get("option_index_symbol") or "NIFTY").upper()
+    path = Path("logs") / f"trade_alerts_{instrument}_{date.today():%Y%m%d}.csv"
+    if not path.exists():
+        return []
+    try:
+        with path.open(newline="", encoding="utf-8") as handle:
+            return [row for row in csv.DictReader(handle) if row.get("message")]
+    except (OSError, csv.Error):
         return []
 
+
+persisted_alerts = _load_persisted_alerts()
+
+
+def _extract_trade_pnls() -> list[float]:
     pnls: list[float] = []
-    for alert in engine.alerts:
-        if str(alert.category).upper() != "EXIT":
+    alerts = (
+        [
+            {"category": str(alert.category), "message": str(alert.message)}
+            for alert in engine.alerts
+        ]
+        if engine is not None
+        else []
+    )
+    alerts.extend(persisted_alerts)
+    seen: set[tuple[str, str]] = set()
+    for alert in alerts:
+        category = str(alert.get("category") or "").upper()
+        message = str(alert.get("message") or "")
+        key = (category, message)
+        if key in seen or category != "EXIT":
             continue
-        match = re.search(r"trade_pnl=([\-0-9]+(?:\.[0-9]+)?)", str(alert.message), flags=re.IGNORECASE)
+        seen.add(key)
+        match = re.search(r"trade_pnl=([\-0-9]+(?:\.[0-9]+)?)", message, flags=re.IGNORECASE)
         if not match:
             continue
         try:
@@ -105,9 +152,17 @@ def _strategy_tracking_df() -> pd.DataFrame:
     if active_strategy not in strategy_list:
         strategy_list.append(active_strategy)
 
-    entry_alerts = []
+    entry_alerts = [
+        row for row in persisted_alerts
+        if str(row.get("category") or "").upper() == "ENTRY"
+    ]
     if engine is not None:
-        entry_alerts = [a for a in engine.alerts if str(a.category).upper() == "ENTRY"]
+        entry_alerts.extend(
+            {"category": str(a.category), "message": str(a.message)}
+            for a in engine.alerts
+            if str(a.category).upper() == "ENTRY"
+        )
+    entry_alerts = list({str(row.get("message") or "") for row in entry_alerts})
 
     triggers_for_active = len(entry_alerts)
     wins_for_active = sum(1 for pnl in trade_pnls if pnl > 0)

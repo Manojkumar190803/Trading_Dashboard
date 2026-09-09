@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import json
 import re
 from datetime import date, datetime, timedelta
 from html import escape
@@ -236,6 +237,25 @@ def _format_display_ts(value: object) -> str:
     return ts.strftime("%I:%M:%S %p IST")
 
 
+def _latest_worker_candle_time(target_date: date) -> datetime | None:
+    """Read the latest candle checkpoint written by the background worker."""
+    latest: datetime | None = None
+    for path in LOGS_DIR.glob(f"runner_checkpoint_*_{target_date:%Y%m%d}.json"):
+        try:
+            with path.open(encoding="utf-8") as handle:
+                checkpoint = json.load(handle)
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            continue
+        for value in checkpoint.values() if isinstance(checkpoint, dict) else ():
+            try:
+                timestamp = datetime.fromisoformat(str(value))
+            except (TypeError, ValueError):
+                continue
+            if latest is None or timestamp > latest:
+                latest = timestamp
+    return latest
+
+
 def _auto_include_new_filter_options(filter_key: str, seen_key: str, available: list[str]) -> list[str]:
     current = [value for value in st.session_state.get(filter_key, []) if value in available]
     seen = set(st.session_state.get(seen_key, []))
@@ -285,6 +305,15 @@ def _format_category_label(category: object) -> str:
     return f"{icon_map.get(category_upper, '•')} {label}"
 
 
+def _console_side(instrument: object, message: object) -> str:
+    text = f"{instrument or ''} {message or ''}".upper()
+    if re.search(r"\bPE\b|PE$", text):
+        return "PE"
+    if re.search(r"\bCE\b|CE$", text):
+        return "CE"
+    return "OTHER"
+
+
 def _next_candle_eta(resolution_minutes: int) -> tuple[str, int]:
     now = datetime.now(DISPLAY_TZ)
     tf = max(1, int(resolution_minutes or 3))
@@ -306,12 +335,39 @@ def _build_console_logs_df(
 ) -> pd.DataFrame:
     rows: list[dict[str, str]] = []
     strategy_name = str(source_params.get("active_strategy") or "HD Strategy")
+    configured_resolution = max(1, int(source_params.get("openalgo_resolution") or 3))
 
     if not market_data_df.empty:
         market_data_copy = market_data_df.copy()
         market_data_copy["Timestamp"] = pd.to_datetime(market_data_copy["Timestamp"], errors="coerce")
         market_data_copy = market_data_copy.dropna(subset=["Timestamp"]).sort_values("Timestamp", ascending=False)
-        for _, row in market_data_copy.head(120).iterrows():
+        actionable_categories = {
+            "SIGNAL", "PENDING_ENTRY", "ENTRY", "EXIT", "TARGET", "SL",
+            "ORDER", "RISK", "REJECT", "FAILED", "ERROR", "UNCERTAIN_ENTRY",
+        }
+        alert_symbols: set[str] = set()
+        alert_started_at: pd.Timestamp | None = None
+        for _, alert_row in market_data_copy.iterrows():
+            alert_category = str(alert_row.get("Category") or "").upper()
+            if alert_category not in actionable_categories:
+                continue
+            alert_timestamp = pd.to_datetime(alert_row.get("Timestamp"), errors="coerce")
+            if pd.isna(alert_timestamp):
+                continue
+            alert_message = str(alert_row.get("Message") or "")
+            symbol = _extract_symbol(alert_message)
+            if symbol != "-":
+                alert_symbols.add(symbol)
+            if alert_started_at is None or alert_timestamp < alert_started_at:
+                alert_started_at = alert_timestamp
+
+        setup_status_rows = market_data_copy[
+            market_data_copy["Category"].astype(str).str.upper().eq("SETUP_STATUS")
+        ]
+        event_rows = market_data_copy[
+            ~market_data_copy["Category"].astype(str).str.upper().eq("SETUP_STATUS")
+        ].head(120)
+        for _, row in pd.concat([setup_status_rows, event_rows]).iterrows():
             ts = pd.to_datetime(row["Timestamp"], errors="coerce")
             if pd.isna(ts):
                 continue
@@ -319,25 +375,93 @@ def _build_console_logs_df(
                 ts = ts.tz_localize(DISPLAY_TZ)
             else:
                 ts = ts.tz_convert(DISPLAY_TZ)
+            level = str(row.get("Status") or "INFO").upper()
+            message = str(row.get("Message") or "")
+            category = str(row.get("Category") or "").upper()
+            if category == "TICK":
+                tick_symbol = str(row.get("Symbol") or "")
+                if (
+                    alert_started_at is None
+                    or (alert_symbols and tick_symbol not in alert_symbols)
+                    or ts < alert_started_at
+                ):
+                    continue
+                level = "TICK"
+            candle_match = re.match(r"^(\d+)m candle\b", message)
+            if candle_match and int(candle_match.group(1)) != configured_resolution:
+                continue
+            if level == "TRIGGERED" and "| ALERT: " in message:
+                alert_text = message.split("| ALERT: ", 1)[1].split(" | Next candle", 1)[0]
+                categories = {
+                    part.split(":", 1)[0].strip().upper()
+                    for part in alert_text.split(" | ")
+                    if part.strip()
+                }
+                if not categories.intersection(actionable_categories):
+                    level = "INFO"
             rows.append(
                 {
+                    "Date": ts.strftime("%Y-%m-%d"),
                     "Time": ts.strftime("%H:%M:%S"),
-                    "Level": str(row.get("Status") or "INFO").upper(),
+                    "Level": level,
+                    "Side": _console_side(row.get("Symbol"), message),
                     "Strategy": strategy_name,
                     "Instrument": str(row.get("Symbol") or "-"),
-                    "Message": str(row.get("Message") or ""),
+                    "Message": message,
                 }
             )
 
     console_df = pd.DataFrame(rows)
     if console_df.empty:
         return console_df
-    return console_df.drop_duplicates(subset=["Time", "Strategy", "Instrument", "Message"]).reset_index(drop=True)
+    console_df = console_df.drop_duplicates(
+        subset=["Time", "Strategy", "Instrument", "Message"]
+    ).reset_index(drop=True)
+    candle_keys = console_df["Message"].str.extract(
+        r"^(\d+m candle \d{2}:\d{2}:\d{2})", expand=False
+    )
+    console_df["_CandleKey"] = candle_keys
+    console_df = console_df[console_df["_CandleKey"].isna() | ~console_df.duplicated(
+        subset=["Date", "Strategy", "Instrument", "_CandleKey"], keep="first"
+    )]
+    return console_df.drop(columns=["_CandleKey"]).reset_index(drop=True)
+
+
+def _clear_stale_session_logs(target_date: date) -> None:
+    """Keep in-memory dashboard logs scoped to the active trading day."""
+    market_rows = st.session_state.get("market_data_logs") or []
+    current_market_rows = []
+    for row in market_rows:
+        timestamp = pd.to_datetime(row.get("timestamp"), errors="coerce")
+        if pd.isna(timestamp):
+            continue
+        if getattr(timestamp, "tzinfo", None) is None:
+            timestamp = timestamp.tz_localize(DISPLAY_TZ)
+        else:
+            timestamp = timestamp.tz_convert(DISPLAY_TZ)
+        if timestamp.date() == target_date:
+            current_market_rows.append(row)
+    st.session_state.market_data_logs = current_market_rows
+
+    alert_rows = st.session_state.get("triggered_alert_rows") or []
+    current_alert_rows = []
+    for row in alert_rows:
+        timestamp = pd.to_datetime(row.get("Timestamp"), errors="coerce")
+        if pd.isna(timestamp):
+            continue
+        if getattr(timestamp, "tzinfo", None) is None:
+            timestamp = timestamp.tz_localize(DISPLAY_TZ)
+        else:
+            timestamp = timestamp.tz_convert(DISPLAY_TZ)
+        if timestamp.date() == target_date:
+            current_alert_rows.append(row)
+    st.session_state.triggered_alert_rows = current_alert_rows
 
 
 def _extract_alert_price(message: str) -> float | None:
     for pattern in (
         r"trigger=([0-9]+(?:\.[0-9]+)?)",
+        r"close=([0-9]+(?:\.[0-9]+)?)",
         r"@\s*([0-9]+(?:\.[0-9]+)?)",
         r"\bat\s*([0-9]+(?:\.[0-9]+)?)",
         r"SL=([0-9]+(?:\.[0-9]+)?)",
@@ -352,6 +476,92 @@ def _status_for_alert(category: str, message: str) -> str:
     return _classify_status(category, message)
 
 
+def _alert_symbol(engine: BaseStrategyEngine, message: str) -> str:
+    symbol = _extract_symbol(message)
+    if symbol != "-":
+        return symbol
+    message_upper = message.upper()
+    if message_upper.startswith("CE "):
+        return str(getattr(engine.state, "ce_symbol", None) or "-")
+    if message_upper.startswith("PE "):
+        return str(getattr(engine.state, "pe_symbol", None) or "-")
+    return "-"
+
+
+def _load_persisted_alert_rows() -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    visible_categories = {
+        "SIGNAL", "PENDING_ENTRY", "ENTRY", "EXIT", "TARGET", "SL",
+        "ORDER", "RISK", "REJECT", "FAILED", "ERROR", "UNCERTAIN_ENTRY",
+    }
+
+    def append_alert(ts: pd.Timestamp, category: str, message: str) -> None:
+        if category not in visible_categories:
+            return
+        rows.append(
+            {
+                "Timestamp": ts,
+                "Date": ts.strftime("%Y-%m-%d"),
+                "Time": ts.strftime("%H:%M:%S"),
+                "Symbol": _extract_symbol(message),
+                "Category": category,
+                "Status": _status_for_alert(category, message),
+                "Price": _extract_alert_price(message),
+                "Message": message,
+            }
+        )
+
+    for path in sorted(LOGS_DIR.glob("trade_alerts_*.csv")):
+        try:
+            persisted_df = pd.read_csv(path)
+        except (OSError, ValueError, pd.errors.ParserError):
+            continue
+        required = {"timestamp", "category", "message"}
+        if not required.issubset(persisted_df.columns):
+            continue
+        for _, persisted in persisted_df.iterrows():
+            ts = pd.to_datetime(persisted.get("timestamp"), errors="coerce")
+            if pd.isna(ts):
+                continue
+            if getattr(ts, "tzinfo", None) is None:
+                ts = ts.tz_localize(DISPLAY_TZ)
+            else:
+                ts = ts.tz_convert(DISPLAY_TZ)
+            category = str(persisted.get("category") or "INFO").upper()
+            message = str(persisted.get("message") or "")
+            append_alert(ts, category, message)
+
+    # Setup and signal alerts were originally included only in monitoring rows.
+    # Restore those entries too so a restart does not erase the trigger history.
+    for path in sorted(LOGS_DIR.glob("monitoring_*.csv")):
+        try:
+            monitoring_df = pd.read_csv(path)
+        except (OSError, ValueError, pd.errors.ParserError):
+            continue
+        if not {"timestamp", "message"}.issubset(monitoring_df.columns):
+            continue
+        for _, monitoring in monitoring_df.iterrows():
+            raw_message = str(monitoring.get("message") or "")
+            if "| ALERT: " not in raw_message:
+                continue
+            ts = pd.to_datetime(monitoring.get("timestamp"), errors="coerce")
+            if pd.isna(ts):
+                continue
+            if getattr(ts, "tzinfo", None) is None:
+                ts = ts.tz_localize(DISPLAY_TZ)
+            else:
+                ts = ts.tz_convert(DISPLAY_TZ)
+            alert_text = raw_message.split("| ALERT: ", 1)[1].split(" | Next candle", 1)[0]
+            for message in (part.strip() for part in alert_text.split(" | ")):
+                if message:
+                    category, _, detail = message.partition(":")
+                    category = category.strip().upper()
+                    if category not in visible_categories:
+                        continue
+                    append_alert(ts, category, detail.strip() if detail else message)
+    return rows
+
+
 def _sync_triggered_alert_rows(engine: BaseStrategyEngine | None) -> pd.DataFrame:
     if "triggered_alert_rows" not in st.session_state:
         st.session_state.triggered_alert_rows = []
@@ -360,8 +570,32 @@ def _sync_triggered_alert_rows(engine: BaseStrategyEngine | None) -> pd.DataFram
 
     rows: list[dict[str, object]] = st.session_state.triggered_alert_rows
     seen: set[str] = st.session_state.triggered_alert_seen
+    alert_files = [
+        path for path in LOGS_DIR.glob("trade_alerts_*.csv")
+        if path.is_file()
+    ]
+    persisted_alerts_state = tuple(
+        sorted((str(path), path.stat().st_mtime_ns, path.stat().st_size) for path in alert_files)
+    )
+    if st.session_state.get("persisted_alerts_state") != persisted_alerts_state:
+        for row in _load_persisted_alert_rows():
+            key = f"{row['Timestamp'].isoformat()}|{row['Category']}|{row['Message']}"
+            if key not in seen:
+                rows.append(row)
+                seen.add(key)
+        st.session_state.persisted_alerts_state = persisted_alerts_state
 
-    if engine is None or not getattr(engine, "alerts", None):
+    engines: list[BaseStrategyEngine] = []
+    instrument_states = st.session_state.get("instrument_states") or {}
+    for state in instrument_states.values():
+        runtime = state.get("runtime") or {}
+        for state_engine in getattr(runtime, "engines", {}).values():
+            if state_engine not in engines:
+                engines.append(state_engine)
+    if engine is not None and engine not in engines:
+        engines.append(engine)
+
+    if not any(getattr(item, "alerts", None) for item in engines):
         if not rows:
             return pd.DataFrame()
         out = pd.DataFrame(rows)
@@ -373,40 +607,41 @@ def _sync_triggered_alert_rows(engine: BaseStrategyEngine | None) -> pd.DataFram
         "ORDER", "RISK", "REJECT", "FAILED", "ERROR",
     }
 
-    for alert in engine.alerts:
-        ts = pd.to_datetime(alert.timestamp, errors="coerce")
-        if pd.isna(ts):
-            continue
-        category = str(alert.category).upper()
-        message = str(alert.message)
-        status = _status_for_alert(category, message)
-        is_actionable = category in track_categories or status in {"TRIGGERED", "EXECUTED", "SUCCESS", "FAILED"}
-        if not is_actionable:
-            continue
+    for alert_engine in engines:
+        for alert in alert_engine.alerts:
+            ts = pd.to_datetime(alert.timestamp, errors="coerce")
+            if pd.isna(ts):
+                continue
+            category = str(alert.category).upper()
+            message = str(alert.message)
+            status = _status_for_alert(category, message)
+            is_actionable = category in track_categories or status in {"TRIGGERED", "EXECUTED", "SUCCESS", "FAILED"}
+            if not is_actionable:
+                continue
 
-        key = f"{ts.isoformat()}|{category}|{message}"
-        if key in seen:
-            continue
+            key = f"{ts.isoformat()}|{category}|{message}"
+            if key in seen:
+                continue
 
-        local_ts = ts
-        if getattr(local_ts, "tzinfo", None) is None:
-            local_ts = local_ts.tz_localize(DISPLAY_TZ)
-        else:
-            local_ts = local_ts.tz_convert(DISPLAY_TZ)
+            local_ts = ts
+            if getattr(local_ts, "tzinfo", None) is None:
+                local_ts = local_ts.tz_localize(DISPLAY_TZ)
+            else:
+                local_ts = local_ts.tz_convert(DISPLAY_TZ)
 
-        rows.append(
-            {
-                "Timestamp": local_ts,
-                "Date": local_ts.strftime("%Y-%m-%d"),
-                "Time": local_ts.strftime("%H:%M:%S"),
-                "Symbol": _extract_symbol(message),
-                "Category": category,
-                "Status": status,
-                "Price": _extract_alert_price(message),
-                "Message": message,
-            }
-        )
-        seen.add(key)
+            rows.append(
+                {
+                    "Timestamp": local_ts,
+                    "Date": local_ts.strftime("%Y-%m-%d"),
+                    "Time": local_ts.strftime("%H:%M:%S"),
+                    "Symbol": _alert_symbol(alert_engine, message),
+                    "Category": category,
+                    "Status": status,
+                    "Price": _extract_alert_price(message),
+                    "Message": message,
+                }
+            )
+            seen.add(key)
 
     st.session_state.triggered_alert_rows = rows[-500:]
     st.session_state.triggered_alert_seen = seen
@@ -429,8 +664,14 @@ source_params = st.session_state.get("source_params", {}) or {}
 last_refresh = st.session_state.get("live_account_updated_at") or "—"
 live_error = st.session_state.get("live_account_error")
 openalgo_log_lines, openalgo_log_error = _load_openalgo_container_logs(source_params)
+today = datetime.now(DISPLAY_TZ).date()
 last_candle_processed_at = st.session_state.get("last_candle_processed_at")
+if not last_candle_processed_at:
+    last_candle_processed_at = _latest_worker_candle_time(today)
+if not last_candle_time:
+    last_candle_time = last_candle_processed_at
 refresh_minutes = 1
+_clear_stale_session_logs(today)
 
 # ── 1. Top Status Header ──────────────────────────────────────────────────────
 if engine_status == "running" and live_error:
@@ -554,14 +795,18 @@ with st.container(border=True):
 with st.container(border=True):
     render_section_heading(
         "Console logs",
-        "One consolidated row per minute",
-        "Shows OHLC, EMA21, option values, trade status, and the next candle time.",
+        "Three-minute monitoring with event updates",
+        "Shows routine market state every three minutes and keeps alert, trigger, and confirmation events immediately.",
     )
+
+    market_data_df = _market_data_logs_df()
+    if not market_data_df.empty:
+        market_data_df = market_data_df[market_data_df["Date"] == today]
 
     console_source_df = _build_console_logs_df(
         source_params,
         snapshot,
-        _market_data_logs_df(),
+        market_data_df,
         openalgo_log_lines,
     )
 
@@ -569,41 +814,98 @@ with st.container(border=True):
         st.info("No console logs available yet.", icon="📝")
     else:
         st.caption(f"{len(console_source_df)} log entries")
-        console_view = console_source_df.copy()
-        console_view = console_view[["Time", "Level", "Strategy", "Instrument", "Message"]].fillna("-")
-        row_html = "".join(
-            (
+        console_export = console_source_df[[
+            "Date", "Time", "Side", "Level", "Strategy", "Instrument", "Message",
+        ]].copy()
+        st.download_button(
+            "Download CSV",
+            data=console_export.to_csv(index=False),
+            file_name=f"console_logs_{today.isoformat()}.csv",
+            mime="text/csv",
+            key="download_console_logs_csv",
+        )
+        console_view = console_source_df[[
+            "Time", "Side", "Level", "Instrument", "Message",
+        ]].fillna("-")
+
+        def _side_panel(side: str, accent: str, title: str) -> str:
+            side_view = console_view[console_view["Side"] == side]
+            status_rows = side_view[side_view["Level"] == "INFO"]
+            status_rows = status_rows[status_rows["Message"].str.contains("EMA21 setup", na=False)]
+            latest_status = status_rows.iloc[0] if not status_rows.empty else None
+            side_rows = side_view[~side_view.index.isin(status_rows.index)].head(60)
+            if side_rows.empty:
+                event_html = "<div style='margin-top:.7rem;'>No CE/PE events yet.</div>"
+            else:
+                event_html = ""
+            rows_html = "".join(
                 "<tr>"
-                f"<td>{escape(str(row['Time']))}</td>"
-                f"<td>{escape(str(row['Level']))}</td>"
-                f"<td>{escape(str(row['Strategy']))}</td>"
-                f"<td>{escape(str(row['Instrument']))}</td>"
-                f"<td>{escape(str(row['Message']))}</td>"
+                f"<td style='padding:.48rem .55rem;vertical-align:top;white-space:nowrap;border-bottom:1px solid rgba(86,184,222,.12);'>{escape(str(row['Time']))}</td>"
+                f"<td style='padding:.48rem .55rem;vertical-align:top;white-space:nowrap;border-bottom:1px solid rgba(86,184,222,.12);'>{escape(str(row['Level']))}</td>"
+                f"<td style='padding:.48rem .55rem;vertical-align:top;overflow-wrap:anywhere;border-bottom:1px solid rgba(86,184,222,.12);'>{escape(str(row['Message']))}</td>"
                 "</tr>"
+                for _, row in side_rows.iterrows()
             )
-            for _, row in console_view.iterrows()
-        )
-        st.markdown(
-            f"""
-            <div style="overflow-x:auto; overflow-y:auto; max-height:430px; border:1px solid rgba(86,184,222,0.28); border-radius:12px;">
-                <table style="min-width:1700px; width:max-content; border-collapse:collapse; font-size:0.86rem; white-space:nowrap;">
-                    <thead style="position:sticky; top:0; background:rgba(19,28,46,0.98); z-index:1;">
-                        <tr>
-                            <th style="text-align:left; padding:0.55rem 0.6rem; border-bottom:1px solid rgba(86,184,222,0.22);">Time</th>
-                            <th style="text-align:left; padding:0.55rem 0.6rem; border-bottom:1px solid rgba(86,184,222,0.22);">Level</th>
-                            <th style="text-align:left; padding:0.55rem 0.6rem; border-bottom:1px solid rgba(86,184,222,0.22);">Strategy</th>
-                            <th style="text-align:left; padding:0.55rem 0.6rem; border-bottom:1px solid rgba(86,184,222,0.22);">Instrument</th>
-                            <th style="text-align:left; padding:0.55rem 0.6rem; border-bottom:1px solid rgba(86,184,222,0.22);">Message</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        {row_html}
-                    </tbody>
-                </table>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
+            status_html = ""
+            if latest_status is not None:
+                status_html = (
+                    f"<div style='margin:.7rem .8rem;padding:.65rem .7rem;border-left:3px solid {accent};"
+                    f"background:{accent}12;color:#e7eef7;overflow-wrap:anywhere;'>"
+                    f"<b style='color:{accent};'>Current setup</b><br>"
+                    f"<span style='color:#a9b8c9;'>Monitoring: {escape(str(latest_status['Instrument']))}</span><br>"
+                    f"{escape(str(latest_status['Message']))}</div>"
+                )
+            elif side_rows.empty:
+                status_html = "<div style='margin:.7rem .8rem;color:#91a3b8;'>No setup status recorded yet.</div>"
+            return f"""
+                <div style="border:1px solid {accent}88;border-radius:12px;overflow:hidden;">
+                    <div style="padding:.7rem .8rem;background:{accent}18;color:{accent};font-weight:800;">
+                        {title} <span style="float:right;color:#a9b8c9;font-size:.78rem;">{len(side_rows)} latest rows</span>
+                    </div>
+                    {status_html}
+                    <div style="overflow-y:auto;max-height:360px;">
+                        <table style="width:100%;table-layout:fixed;border-collapse:collapse;font-size:.82rem;">
+                            <colgroup><col style="width:23%;"><col style="width:20%;"><col style="width:57%;"></colgroup>
+                            <thead style="position:sticky;top:0;background:rgba(19,28,46,.98);z-index:1;">
+                                <tr><th style="text-align:left;padding:.48rem .55rem;">Time</th><th style="text-align:left;padding:.48rem .55rem;">Level</th><th style="text-align:left;padding:.48rem .55rem;">Message</th></tr>
+                            </thead>
+                            <tbody>{rows_html or '<tr><td colspan="3" style="padding:.6rem;color:#91a3b8;">No event rows yet.</td></tr>'}</tbody>
+                        </table>
+                    </div>
+                </div>
+            """
+
+        market_rows = console_view[console_view["Side"] == "OTHER"]
+        if not market_rows.empty:
+            market_rows_html = "".join(
+                "<tr>"
+                f"<td style='padding:.48rem .55rem;vertical-align:top;white-space:nowrap;border-bottom:1px solid rgba(86,184,222,.12);'>{escape(str(row['Time']))}</td>"
+                f"<td style='padding:.48rem .55rem;vertical-align:top;white-space:nowrap;border-bottom:1px solid rgba(86,184,222,.12);'>{escape(str(row['Level']))}</td>"
+                f"<td style='padding:.48rem .55rem;vertical-align:top;overflow-wrap:anywhere;border-bottom:1px solid rgba(86,184,222,.12);'>{escape(str(row['Message']))}</td>"
+                "</tr>"
+                for _, row in market_rows.head(60).iterrows()
+            )
+            st.markdown(
+                "<div style='margin:.8rem 0;border:1px solid rgba(89,208,255,.45);border-radius:12px;overflow:hidden;'>"
+                "<div style='padding:.7rem .8rem;background:rgba(89,208,255,.10);color:#59d0ff;font-weight:800;'>"
+                "Market data <span style='float:right;color:#a9b8c9;font-size:.78rem;'>"
+                f"{len(market_rows)} latest rows</span></div>"
+                "<div style='overflow-y:auto;max-height:240px;'><table style='width:100%;table-layout:fixed;border-collapse:collapse;font-size:.82rem;'>"
+                "<colgroup><col style='width:15%;'><col style='width:15%;'><col style='width:70%;'></colgroup>"
+                "<thead style='position:sticky;top:0;background:rgba(19,28,46,.98);z-index:1;'>"
+                "<tr><th style='text-align:left;padding:.48rem .55rem;'>Time</th><th style='text-align:left;padding:.48rem .55rem;'>Level</th><th style='text-align:left;padding:.48rem .55rem;'>Message</th></tr>"
+                f"</thead><tbody>{market_rows_html}</tbody></table></div></div>",
+                unsafe_allow_html=True,
+            )
+
+        ce_rows = int((console_view["Side"] == "CE").sum())
+        pe_rows = int((console_view["Side"] == "PE").sum())
+        st.caption(f"{ce_rows} CE rows | {pe_rows} PE rows | newest events first")
+        ce_col, pe_col = st.columns(2)
+        with ce_col:
+            st.markdown(_side_panel("CE", "#59d0ff", "CE · Call option"), unsafe_allow_html=True)
+        with pe_col:
+            st.markdown(_side_panel("PE", "#ff9f7f", "PE · Put option"), unsafe_allow_html=True)
 
 with st.container(border=True):
     render_section_heading(
@@ -612,26 +914,54 @@ with st.container(border=True):
         "Captures actionable triggered alerts with date, time, symbol, category, status, and price.",
     )
     triggered_df = _sync_triggered_alert_rows(engine)
+    if not triggered_df.empty:
+        triggered_df = triggered_df[triggered_df["Date"] == today.isoformat()].reset_index(drop=True)
     if triggered_df.empty:
         st.info("No triggered alerts yet.", icon="🚨")
     else:
         st.caption(f"{len(triggered_df)} saved alerts")
-        view_df = triggered_df[["Date", "Time", "Symbol", "Category", "Status", "Price", "Message"]].copy()
+        alert_columns = ["Date", "Time", "Symbol", "Category", "Status", "Price", "Message"]
+        export_df = triggered_df[alert_columns].copy()
+        st.download_button(
+            "Download CSV",
+            data=export_df.to_csv(index=False),
+            file_name=f"triggered_alerts_{date.today().isoformat()}.csv",
+            mime="text/csv",
+            key="download_triggered_alerts_csv",
+        )
+        view_df = export_df.copy()
         view_df["Price"] = view_df["Price"].apply(lambda v: f"₹{v:,.2f}" if pd.notna(v) else "—")
         view_df["Status"] = view_df["Status"].map(lambda s: f"{_STATUS_BADGE.get(str(s), '⚪')} {s}")
-        st.dataframe(
-            view_df,
-            hide_index=True,
-            use_container_width=True,
-            height=300,
-            column_config={
-                "Date": st.column_config.TextColumn("Date", width="small"),
-                "Time": st.column_config.TextColumn("Time", width="small"),
-                "Symbol": st.column_config.TextColumn("Symbol", width="medium"),
-                "Category": st.column_config.TextColumn("Category", width="small"),
-                "Status": st.column_config.TextColumn("Status", width="small"),
-                "Price": st.column_config.TextColumn("Price", width="small"),
-                "Message": st.column_config.TextColumn("Message", width="large"),
-            },
+        alert_row_html = "".join(
+            (
+                "<tr>"
+                + "".join(
+                    f"<td style=\"padding:0.55rem 0.6rem; vertical-align:top; "
+                    f"overflow-wrap:anywhere; word-break:break-word; "
+                    f"border-bottom:1px solid rgba(86,184,222,0.12);\">{escape(str(row[column]))}</td>"
+                    for column in ("Date", "Time", "Symbol", "Category", "Status", "Price", "Message")
+                )
+                + "</tr>"
+            )
+            for _, row in view_df.iterrows()
+        )
+        st.markdown(
+            f"""
+            <div style="overflow-y:auto; max-height:430px; border:1px solid rgba(86,184,222,0.28); border-radius:12px;">
+                <table style="width:100%; table-layout:fixed; border-collapse:collapse; font-size:0.86rem;">
+                    <colgroup>
+                        <col style="width:12%;"><col style="width:10%;"><col style="width:22%;">
+                        <col style="width:12%;"><col style="width:13%;"><col style="width:11%;"><col style="width:20%;">
+                    </colgroup>
+                    <thead style="position:sticky; top:0; background:rgba(19,28,46,0.98); z-index:1;">
+                        <tr>
+                            {''.join(f'<th style="text-align:left; padding:0.55rem 0.6rem; border-bottom:1px solid rgba(86,184,222,0.22);">{column}</th>' for column in ("Date", "Time", "Symbol", "Category", "Status", "Price", "Message"))}
+                        </tr>
+                    </thead>
+                    <tbody>{alert_row_html}</tbody>
+                </table>
+            </div>
+            """,
+            unsafe_allow_html=True,
         )
 

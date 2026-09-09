@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import threading
@@ -204,6 +205,15 @@ def _apply_ema21_policy(cfg: StrategyConfig, script: str) -> None:
     cfg.max_trades_per_day = _env_int("EMA21_MAX_TRADES_PER_DAY", 3)
     cfg.full_size_lots = _env_int("EMA21_FULL_SIZE_LOTS", 2)
     cfg.half_size_lots = _env_int("EMA21_HALF_SIZE_LOTS", 1)
+    preferences_path = Path("logs") / "dashboard_preferences.json"
+    try:
+        preferences = json.loads(preferences_path.read_text(encoding="utf-8"))
+        saved_lots = int(preferences.get("lots", 0))
+        if saved_lots > 0:
+            cfg.full_size_lots = saved_lots
+            cfg.half_size_lots = max(1, saved_lots // 2)
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        pass
     cfg.trailing_step_rr = _env_float("EMA21_TRAILING_STEP_RR", 0.5)
     cfg.t1_rr = _env_float("EMA21_BREAKEVEN_RR", 1.5)
     cfg.t2_rr = _env_float("EMA21_PARTIAL_EXIT_RR", 2.0)

@@ -285,11 +285,14 @@ class OpenAlgoBroker(BrokerInterface):
 
     def get_ltp(self, symbol: str) -> float:
         exchange = self._infer_exchange(symbol)
+        quote_symbol = symbol.split(":", 1)[-1]
+        if quote_symbol.endswith("-INDEX"):
+            quote_symbol = quote_symbol.removesuffix("-INDEX")
         for attempt in range(3):
             try:
-                resp = self.client.quotes(symbol=symbol, exchange=exchange)
+                resp = self.client.quotes(symbol=quote_symbol, exchange=exchange)
             except Exception as exc:
-                logger.warning("quotes(%s) error: %s", symbol, exc)
+                logger.warning("quotes(%s) error: %s", quote_symbol, exc)
                 return 0.0
 
             if isinstance(resp, dict) and resp.get("status") == "success":
@@ -300,7 +303,7 @@ class OpenAlgoBroker(BrokerInterface):
 
             message = str(resp.get("message") if isinstance(resp, dict) else resp)
             if "429" not in message or attempt == 2:
-                logger.warning("quotes(%s) unexpected response: %s", symbol, resp)
+                logger.warning("quotes(%s) unexpected response: %s", quote_symbol, resp)
                 return 0.0
             delay = 0.5 * (attempt + 1)
             logger.warning("quotes(%s) rate-limited; retrying in %.1fs", symbol, delay)
@@ -358,6 +361,9 @@ class OpenAlgoBroker(BrokerInterface):
         ]
 
     def cancel_order(self, order_id: str) -> bool:
+        if self.dry_run:
+            logger.info("[DRY_RUN] cancel_order id=%s", order_id)
+            return True
         try:
             response = self.client.cancelorder(order_id=order_id, strategy=self.strategy_tag)
         except Exception as exc:

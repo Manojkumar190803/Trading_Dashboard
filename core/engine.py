@@ -233,10 +233,20 @@ class BaseStrategyEngine:
     # ── helpers ──────────────────────────────────────────────────────
 
     def _record_alert(self, ts: datetime, category: str, message: str) -> None:
+        if category in {"SIGNAL", "PENDING_ENTRY"} and any(
+            alert.timestamp.date() == ts.date()
+            and alert.category == category
+            and alert.message == message
+            for alert in self.alerts
+        ):
+            return
         self.alerts.append(StrategyAlert(timestamp=ts, category=category, message=message))
         if len(self.alerts) > 500:
             self.alerts = self.alerts[-500:]
-        if self.persist_alerts and category in ("ENTRY", "EXIT", "UNCERTAIN_ENTRY"):
+        if self.persist_alerts and category in (
+            "SIGNAL", "PENDING_ENTRY", "ENTRY", "EXIT", "TARGET", "SL",
+            "ORDER", "RISK", "REJECT", "FAILED", "ERROR", "UNCERTAIN_ENTRY",
+        ):
             self._persist_trade_alert(ts, category, message)
         print(f"[ENGINE][{category}] {message}")
 
@@ -288,6 +298,21 @@ class BaseStrategyEngine:
         path = Path("logs") / f"trade_alerts_{script}_{ts:%Y%m%d}.csv"
         path.parent.mkdir(parents=True, exist_ok=True)
         needs_header = not path.exists()
+        alert_key = (ts.isoformat(sep=" "), self.strategy_name, category, message)
+        if not needs_header:
+            try:
+                with path.open(newline="", encoding="utf-8") as handle:
+                    for row in csv.DictReader(handle):
+                        existing_key = (
+                            row.get("timestamp", ""),
+                            row.get("strategy", ""),
+                            row.get("category", ""),
+                            row.get("message", ""),
+                        )
+                        if existing_key == alert_key:
+                            return
+            except OSError as exc:
+                logger.warning("could not check persisted alert duplicate: %s", exc)
         with path.open("a", newline="", encoding="utf-8") as handle:
             writer = csv.writer(handle)
             if needs_header:
@@ -727,6 +752,7 @@ class BaseStrategyEngine:
         ts: datetime,
         row: pd.Series,
     ) -> None:
+        pending_ema_failure = False
         if (
             side_state.position is not None
             or side_state.pending_entry is not None
@@ -957,6 +983,16 @@ class BaseStrategyEngine:
                 side_state.pending_entry = None
             elif order_status in {"complete", "filled", "executed"}:
                 broker_quantity = self._broker_quantity(pending.option_symbol)
+                if broker_quantity == 0:
+                    self._record_alert(
+                        ts,
+                        "RISK",
+                        f"{side} completed entry order has no broker position; "
+                        f"clearing stale pending state for {pending.option_symbol}",
+                    )
+                    side_state.pending_entry = None
+                    self.signal_provider.reset_after_entry(side_state)
+                    return
                 if broker_quantity is not None and broker_quantity < pending.quantity:
                     side_state.order_submission_uncertain = True
                     self._record_alert(
@@ -1411,11 +1447,49 @@ class BaseStrategyEngine:
             self._record_trace_row(side, side_state, row, signal, False, remark)
             return
 
-        self.try_fill_pending_entry(side, side_state, ts, row)
+        # An EMA21 stop-entry is valid only while the confirmation candle
+        # remains above EMA21. Cancel it before checking the trigger so a
+        # broken follow-up candle cannot leave a stale broker order open.
+        pending_ema_failure = False
+        if (
+            self._is_ema21_strategy()
+            and side_state.pending_entry is not None
+            and row.get("ema21") is not None
+            and not pd.isna(row.get("ema21"))
+            and float(row["close"]) <= float(row["ema21"])
+        ):
+            pending = side_state.pending_entry
+            if self._cancel_pending_entry_order(side, pending, ts):
+                side_state.pending_entry = None
+                pending_ema_failure = True
+                self._record_alert(
+                    ts,
+                    "CANCEL",
+                    f"{side} pending cancelled: EMA21 close failure "
+                    f"(close={float(row['close']):.2f} <= EMA21={float(row['ema21']):.2f})",
+                )
+        if not pending_ema_failure:
+            self.try_fill_pending_entry(side, side_state, ts, row)
         self.monitor_open_position(side_state, row)
 
         # Delegate signal generation to the strategy provider.
+        setup_was_active = getattr(side_state, "setup_active", False)
         self.signal_provider.update_state(side_state, row, prev_row)
+        if (
+            self._is_ema21_strategy()
+            and not setup_was_active
+            and getattr(side_state, "setup_active", False)
+        ):
+            ema21 = row.get("ema21")
+            ema_text = "NA" if ema21 is None or pd.isna(ema21) else f"{float(ema21):.2f}"
+            self._record_alert(
+                ts,
+                "SIGNAL",
+                f"{side} EMA21 green candle crossed above EMA21: "
+                f"symbol={side_state.option_symbol or '-'} "
+                f"close={float(row['close']):.2f} EMA21={ema_text}; "
+                "looking for red confirmation candle",
+            )
         if self._is_ema21_strategy() and getattr(side_state, "ema_failure", False):
             if side_state.pending_entry is not None:
                 pending = side_state.pending_entry
@@ -1453,6 +1527,15 @@ class BaseStrategyEngine:
         signal = self.signal_provider.generate_signal(side, side_state, row, prev_row)
 
         if signal in (Signal.BUY_CE, Signal.BUY_PE):
+            self._record_alert(
+                ts,
+                "SIGNAL",
+                f"{side} {signal.value} signal at close={float(row['close']):.2f} "
+                f"symbol={side_state.option_symbol or '-'} "
+                f"EMA21={float(row['ema21']):.2f}" if row.get("ema21") is not None and not pd.isna(row.get("ema21"))
+                else f"{side} {signal.value} signal at close={float(row['close']):.2f} "
+                f"symbol={side_state.option_symbol or '-'} EMA21=NA",
+            )
             had_pending_after_pre_checks = side_state.pending_entry is not None
             self.place_pending_entry(side, side_state, ts, row)
             if side_state.pending_entry is not None and not had_pending_after_pre_checks:

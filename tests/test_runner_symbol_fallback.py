@@ -8,7 +8,7 @@ import pandas as pd
 import core.runner as runner
 from core.broker import ConsoleBroker
 from core.engine import BaseStrategyEngine
-from core.models import Position, RiskConfig, StrategyConfig
+from core.models import PendingEntry, Position, RiskConfig, Signal, StrategyConfig
 from strategies.ema21 import EMA21SignalProvider
 
 
@@ -35,6 +35,16 @@ class PositionBookBroker(ConsoleBroker):
 
     def get_position_book(self):
         return self.positions
+
+
+class CancelTrackingBroker(ConsoleBroker):
+    def __init__(self):
+        super().__init__()
+        self.cancelled = []
+
+    def cancel_order(self, order_id):
+        self.cancelled.append(order_id)
+        return True
 
 
 def _engine_with_position():
@@ -74,6 +84,42 @@ def test_position_reconciliation_preserves_local_position_when_book_unavailable(
     runner._clear_positions_missing_from_broker([engine], broker)
 
     assert engine.state.ce.position is not None
+
+
+def test_startup_cancels_pending_order_on_any_later_ema21_failure():
+    broker = CancelTrackingBroker()
+    engine = BaseStrategyEngine(
+        cfg=StrategyConfig(),
+        risk=RiskConfig(),
+        broker=broker,
+        signal_provider=EMA21SignalProvider(),
+    )
+    engine.state.pe.pending_entry = PendingEntry(
+        signal=Signal.BUY_PE,
+        created_at=datetime(2026, 9, 8, 12, 48),
+        option_symbol="NIFTY15SEP2623700PE",
+        quantity=130,
+        option_trigger_level=128.70,
+        option_stop_level=118.30,
+        trigger_candle_high=128.70,
+        trigger_candle_low=125.05,
+        order_id="stale-order",
+    )
+    candles = pd.DataFrame(
+        {
+            "datetime": [
+                datetime(2026, 9, 8, 12, 51),
+                datetime(2026, 9, 8, 12, 54),
+                datetime(2026, 9, 8, 12, 57),
+            ],
+            "close": [126.0, 122.0, 123.75],
+            "ema21": [123.5, 123.0, 123.37],
+        }
+    )
+
+    assert runner._cancel_stale_ema21_pending(engine, broker, "PE", candles)
+    assert broker.cancelled == ["stale-order"]
+    assert engine.state.pe.pending_entry is None
 
 
 def test_parse_option_symbol():

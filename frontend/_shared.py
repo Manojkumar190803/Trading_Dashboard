@@ -6,6 +6,7 @@ engine wiring are consistent across all pages.
 from __future__ import annotations
 
 import os
+import json
 import re
 import sys
 from datetime import date, datetime, time, timedelta
@@ -21,6 +22,7 @@ from streamlit_autorefresh import st_autorefresh
 FRONTEND_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = FRONTEND_DIR.parent
 LOGS_DIR = PROJECT_ROOT / "logs"
+PREFERENCES_PATH = LOGS_DIR / "dashboard_preferences.json"
 for import_path in (FRONTEND_DIR, PROJECT_ROOT):
     if str(import_path) not in sys.path:
         sys.path.insert(0, str(import_path))
@@ -89,7 +91,16 @@ class OpenAlgoDataClient:
         if isinstance(raw, dict) or raw is None:
             raise OpenAlgoError(f"history returned no data for {symbol}: {raw}")
         data = raw.copy()
-        return _normalize_ohlcv_datetime(data)
+        data = _normalize_ohlcv_datetime(data)
+        if data.empty:
+            return data
+        # OpenAlgo can return multiple updates for the same candle timestamp.
+        # Keep only the latest update so the live cursor cannot replay a candle.
+        return (
+            data.sort_values("datetime")
+            .drop_duplicates(subset=["datetime"], keep="last")
+            .reset_index(drop=True)
+        )
 
 
 class OpenAlgoAccountClient:
@@ -110,7 +121,17 @@ class OpenAlgoAccountClient:
     def get_orderbook(self) -> list[dict[str, Any]]:
         response = self.client.orderbook()
         data = response.get("data", []) if isinstance(response, dict) else []
-        return data if isinstance(data, list) else []
+        if isinstance(data, dict):
+            data = data.get("orders", data.get("orderbook", []))
+        return [row for row in data if isinstance(row, dict)] if isinstance(data, list) else []
+
+    def cancel_order(self, order_id: str) -> bool:
+        """Cancel a live broker order and return only on OpenAlgo success."""
+        try:
+            response = self.client.cancelorder(order_id=order_id)
+        except Exception as exc:
+            raise OpenAlgoError(f"OpenAlgo cancel request failed: {exc}") from exc
+        return isinstance(response, dict) and response.get("status") == "success"
 
 
 def _log_status_from_text(category: str, message: str) -> str:
@@ -148,6 +169,33 @@ STRATEGY_ENGINE_MAP: dict[str, tuple[str, str]] = {
 
 DEFAULT_CSV = PROJECT_ROOT / "data" / "spot_3m.csv"
 DISPLAY_TZ = ZoneInfo("Asia/Kolkata")
+
+
+def _load_dashboard_preferences() -> dict[str, Any]:
+    try:
+        payload = json.loads(PREFERENCES_PATH.read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _save_lots_preference() -> None:
+    try:
+        lots = max(1, min(1000, int(st.session_state.get("lots", 1))))
+    except (TypeError, ValueError):
+        lots = 1
+    try:
+        LOGS_DIR.mkdir(parents=True, exist_ok=True)
+        preferences = _load_dashboard_preferences()
+        preferences["lots"] = lots
+        temporary_path = PREFERENCES_PATH.with_suffix(".tmp")
+        temporary_path.write_text(
+            json.dumps(preferences, indent=2) + "\n", encoding="utf-8"
+        )
+        temporary_path.replace(PREFERENCES_PATH)
+    except OSError:
+        # The dashboard can continue using session state if persistence is unavailable.
+        pass
 
 
 def load_spot_ohlcv_csv(csv_path: Path) -> pd.DataFrame:
@@ -793,6 +841,8 @@ def _build_instrument_state(
         if definition.label in enabled_labels
     ]
     runtime = MultiStrategyRuntime(cfg, risk, broker, enabled_keys=enabled_keys or ["ema21"])
+    for engine in runtime.engines.values():
+        engine.persist_alerts = True
 
     return {
         "cfg": cfg,
@@ -993,6 +1043,9 @@ def _process_single_instrument_candle() -> None:
     ts = pd.to_datetime(row["datetime"])
 
     option_frames: dict[str, dict[str, pd.DataFrame]] = {}
+    alert_counts_before = {
+        key: len(engine.alerts) for key, engine in runtime.engines.items()
+    }
     for key, engine in runtime.engines.items():
         if not engine.state.atm_locked and ts.time() >= engine.cfg.atm_lock_time:
             engine.on_day_transition_if_needed(ts)
@@ -1028,14 +1081,28 @@ def _process_single_instrument_candle() -> None:
         }
     )
     market_data_logs = st.session_state.get("market_data_logs") or []
-    resolution = int(source_params.get("openalgo_resolution") or 1)
+    resolution = int(source_params.get("openalgo_resolution") or 3)
     candle_ts = pd.to_datetime(row["datetime"])
     ema21 = row.get("ema21")
     ema_text = "NA" if ema21 is None or pd.isna(ema21) else f"{float(ema21):.2f}"
     option_parts: list[str] = []
     active_parts: list[str] = []
+    new_alert_parts: list[str] = []
+    actionable_alert_categories = {
+        "SIGNAL", "PENDING_ENTRY", "ENTRY", "EXIT", "TARGET", "SL",
+        "ORDER", "RISK", "REJECT", "FAILED", "ERROR", "UNCERTAIN_ENTRY",
+    }
+    has_actionable_event = False
     for strategy_key, active_engine in runtime.engines.items():
         strategy_snapshot = active_engine.get_status_snapshot()
+        new_alerts = active_engine.alerts[alert_counts_before.get(strategy_key, 0):]
+        for alert in new_alerts:
+            category = str(alert.category).upper()
+            new_alert_parts.append(
+                f"{category}: {str(alert.message)}"
+            )
+            if category in actionable_alert_categories:
+                has_actionable_event = True
         for side in ("CE", "PE"):
             side_snapshot = strategy_snapshot.get(side.lower(), {}) or {}
             symbol = side_snapshot.get("watched_symbol") or strategy_snapshot.get(f"{side.lower()}_symbol")
@@ -1057,11 +1124,21 @@ def _process_single_instrument_candle() -> None:
                     f"{position.get('progress_status') or 'ACTIVE'}"
                 )
     status_text = "ACTIVE TRADE: " + " | ".join(active_parts) if active_parts else "No active trade"
+    alert_text = " | ALERT: " + " | ".join(new_alert_parts) if new_alert_parts else ""
     next_ts, wait_seconds = _next_candle_boundary(candle_ts, resolution)
+    # Keep routine console monitoring at three-minute cadence, but never hide
+    # a candle that produced a new alert or confirmation.
+    is_event = has_actionable_event
+    is_monitoring_boundary = candle_ts.minute % 3 == 0
+    if not is_event and not is_monitoring_boundary:
+        st.session_state.last_candle_processed_at = processed_now
+        st.session_state.index = idx + 1
+        return
+
     monitoring_row = {
             "timestamp": processed_now,
-            "category": "DATA",
-            "status": "ACTIVE" if active_parts else "INFO",
+            "category": "ALERT" if is_event else "DATA",
+            "status": "TRIGGERED" if is_event else ("ACTIVE" if active_parts else "INFO"),
             "symbol": feed_symbol,
             "entry_price": None,
             "exit_price": None,
@@ -1071,7 +1148,7 @@ def _process_single_instrument_candle() -> None:
                 f"O={float(row['open']):.2f} H={float(row['high']):.2f} "
                 f"L={float(row['low']):.2f} C={float(row['close']):.2f} "
                 f"EMA21={ema_text} | {' | '.join(option_parts) or 'Options=NA'} | "
-                f"{status_text} | Next candle at {next_ts} (waiting {wait_seconds}s)"
+                f"{status_text}{alert_text} | Next candle at {next_ts} (waiting {wait_seconds}s)"
             ),
         }
     market_data_logs.append(monitoring_row)
@@ -1211,6 +1288,77 @@ def refresh_live_account_metrics(source_params: dict[str, Any] | None = None) ->
     st.session_state["live_account_updated_at"] = display_now.strftime("%H:%M:%S IST")
 
 
+def run_premarket_checks(source_params: dict[str, Any] | None = None) -> list[dict[str, str]]:
+    """Run read-only readiness checks against the current dashboard state."""
+    params = source_params or st.session_state.get("source_params", {}) or {}
+    checks: list[dict[str, str]] = []
+
+    def add(name: str, status: str, detail: str) -> None:
+        checks.append({"name": name, "status": status, "detail": detail})
+
+    broker = st.session_state.get("broker")
+    data = st.session_state.get("data")
+    runtime = st.session_state.get("runtime")
+    feed_symbol = str(params.get("openalgo_symbol") or "NSE:NIFTY-INDEX")
+
+    add(
+        "OpenAlgo configuration",
+        "READY" if params.get("openalgo_base_url") else "FAILED",
+        str(params.get("openalgo_base_url") or "Base URL is not configured"),
+    )
+    add(
+        "Selected strategies",
+        "READY" if runtime is not None and getattr(runtime, "engines", {}) else "FAILED",
+        "All selected strategies initialized"
+        if runtime is not None and getattr(runtime, "engines", {})
+        else "One or more selected strategies are not initialized",
+    )
+
+    data_ready = isinstance(data, pd.DataFrame) and not data.empty
+    indicator_ready = data_ready and {"ema21"}.issubset(data.columns)
+    add(
+        "Market candles and indicators",
+        "READY" if indicator_ready else ("WARNING" if data_ready else "FAILED"),
+        f"{len(data):,} candles loaded; EMA21 available" if indicator_ready
+        else ("Candles loaded but EMA21 is missing" if data_ready else "No market candles loaded"),
+    )
+
+    quote_value = 0.0
+    quote_error = ""
+    if broker is not None:
+        try:
+            quote_value = float(broker.get_ltp(feed_symbol) or 0.0)
+        except Exception as exc:
+            quote_error = str(exc)
+    add(
+        "Live market quote",
+        "READY" if quote_value > 0 else "FAILED",
+        f"{feed_symbol} LTP {quote_value:.2f}" if quote_value > 0
+        else (quote_error or f"No quote returned for {feed_symbol}"),
+    )
+
+    account_error = st.session_state.get("live_account_error")
+    account_updated = st.session_state.get("live_account_updated_at")
+    add(
+        "Funds and account APIs",
+        "READY" if account_updated and not account_error else "FAILED",
+        f"Last successful account sync: {account_updated}" if account_updated and not account_error
+        else str(account_error or "Account data has not been loaded"),
+    )
+
+    try:
+        LOGS_DIR.mkdir(parents=True, exist_ok=True)
+        probe = LOGS_DIR / ".premarket_write_check"
+        probe.write_text("ready\n", encoding="utf-8")
+        probe.unlink(missing_ok=True)
+        logs_status, logs_detail = "READY", "Logs directory is writable"
+    except OSError as exc:
+        logs_status, logs_detail = "FAILED", f"Logs directory is not writable: {exc}"
+    add("Monitoring log storage", logs_status, logs_detail)
+
+    return checks
+
+
 # ── Sidebar (common across all pages) ─────────────────────────────────────────
 
 def render_sidebar() -> dict[str, Any]:
@@ -1313,14 +1461,20 @@ def render_sidebar() -> dict[str, Any]:
 
     # ── Lot Size (number of lots — quantity auto-scales per instrument) ─────
     st.sidebar.markdown("### Lot Size")
+    if "lots" not in st.session_state:
+        saved_lots = _load_dashboard_preferences().get("lots", 1)
+        try:
+            st.session_state.lots = max(1, min(1000, int(saved_lots)))
+        except (TypeError, ValueError):
+            st.session_state.lots = 1
     lots = int(
         st.sidebar.number_input(
             "Number of Lots",
             min_value=1,
             max_value=1000,
-            value=int(st.session_state.get("lots", 1)),
             step=1,
             key="lots",
+            on_change=_save_lots_preference,
             help=(
                 "Number of lots to trade. Quantity is auto-computed per "
                 "instrument using its contract size "
@@ -1377,7 +1531,7 @@ def render_sidebar() -> dict[str, Any]:
         or os.getenv("OPENALGO_HOST", "http://host.docker.internal:5002")
     )
     openalgo_api_key = os.getenv("OPENALGO_API_KEY", "")
-    openalgo_resolution = 1
+    openalgo_resolution = 3
     openalgo_days = 5
 
     source = selected_source
@@ -1553,7 +1707,8 @@ def render_sidebar() -> dict[str, Any]:
     if st.session_state.get("openalgo_unavailable"):
         st.sidebar.error(st.session_state["openalgo_unavailable"], icon="⚠️")
 
-    if st.session_state.get("running"):
+    background_worker_enabled = os.getenv("BACKGROUND_WORKER_ENABLED", "false").lower() == "true"
+    if st.session_state.get("running") and not background_worker_enabled:
         has_engine_state = all(
             key in st.session_state for key in ("data", "engine", "broker", "index")
         )
