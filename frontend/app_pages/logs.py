@@ -10,18 +10,21 @@ from urllib.parse import urlparse
 
 import pandas as pd
 import streamlit as st
+from streamlit_autorefresh import st_autorefresh
 from _shared import (
     DISPLAY_TZ,
     LOGS_DIR,
     inject_theme,
     refresh_live_account_metrics,
+    render_alert_toasts,
     render_section_heading,
     render_sidebar,
 )
 from core.engine import BaseStrategyEngine
 
 inject_theme()
-source_params = render_sidebar()
+source_params = render_sidebar(manage_runtime=False)
+st_autorefresh(interval=30_000, key="logs-live-refresh")
 
 # Keep account metrics current while the Logs page is open.
 refresh_live_account_metrics(source_params)
@@ -49,7 +52,11 @@ def _parse_openalgo_port(base_url: str) -> str | None:
     return None
 
 
-def _load_openalgo_container_logs(source_params: dict[str, object]) -> tuple[list[str], str | None]:
+@st.cache_data(ttl=10, show_spinner=False)
+def _load_openalgo_container_logs_cached(
+    base_url: str,
+    configured_name: str,
+) -> tuple[list[str], str | None]:
     try:
         import docker  # type: ignore
     except Exception as exc:
@@ -57,8 +64,6 @@ def _load_openalgo_container_logs(source_params: dict[str, object]) -> tuple[lis
 
     try:
         client = docker.from_env()
-        configured_name = os.getenv("OPENALGO_LOG_CONTAINER", "").strip()
-        base_url = str(source_params.get("openalgo_base_url") or os.getenv("OPENALGO_BASE_URL", "http://host.docker.internal:5002"))
         target_port = _parse_openalgo_port(base_url)
 
         container = None
@@ -90,6 +95,15 @@ def _load_openalgo_container_logs(source_params: dict[str, object]) -> tuple[lis
         return lines[-60:], None
     except Exception as exc:
         return [], f"Unable to load OpenAlgo container logs: {exc}"
+
+
+def _load_openalgo_container_logs(source_params: dict[str, object]) -> tuple[list[str], str | None]:
+    base_url = str(
+        source_params.get("openalgo_base_url")
+        or os.getenv("OPENALGO_BASE_URL", "http://host.docker.internal:5002")
+    )
+    configured_name = os.getenv("OPENALGO_LOG_CONTAINER", "").strip()
+    return _load_openalgo_container_logs_cached(base_url, configured_name)
 
 
 def _extract_price(pattern: str, message: str) -> float | None:
@@ -157,7 +171,8 @@ def _market_data_logs_df() -> pd.DataFrame:
     rows = st.session_state.get("market_data_logs") or []
     if rows:
         frames.append(pd.DataFrame(rows))
-    for path in sorted(LOGS_DIR.glob("monitoring_*.csv")):
+    today_path = LOGS_DIR / f"monitoring_{datetime.now(DISPLAY_TZ):%Y%m%d}.csv"
+    for path in (today_path,) if today_path.exists() else ():
         try:
             historical_df = pd.read_csv(path)
         except (OSError, ValueError, pd.errors.ParserError):
@@ -179,20 +194,71 @@ def _market_data_logs_df() -> pd.DataFrame:
             "message": "Message",
         }
     )
-    # Session rows may be timezone-aware while older CSV rows can be naive.
-    # Parse everything as UTC first so concatenated history has one dtype.
-    df["Timestamp"] = pd.to_datetime(df["Timestamp"], errors="coerce", utc=True)
+    # Worker rows written without an offset are already local IST timestamps;
+    # do not reinterpret them as UTC or they appear 5:30 hours in the future.
+    def _normalize_log_timestamp(value: object) -> pd.Timestamp:
+        timestamp = pd.to_datetime(value, errors="coerce")
+        if pd.isna(timestamp):
+            return pd.NaT
+        if getattr(timestamp, "tzinfo", None) is None:
+            return timestamp.tz_localize(DISPLAY_TZ)
+        return timestamp.tz_convert(DISPLAY_TZ)
+
+    df["Timestamp"] = pd.Series(
+        [_normalize_log_timestamp(value) for value in df["Timestamp"]],
+        index=df.index,
+    )
     df = df.dropna(subset=["Timestamp"])
     if df.empty:
         return df
     local_ts = df["Timestamp"].dt.tz_convert(DISPLAY_TZ)
     df["Date"] = local_ts.dt.date
     df["Time"] = local_ts.dt.strftime("%H:%M:%S")
+    now = datetime.now(DISPLAY_TZ)
+    market_open = datetime.strptime("09:20", "%H:%M").time()
+    market_close = datetime.strptime("15:15", "%H:%M").time()
+    if now.weekday() >= 5 or not (market_open <= now.time() < market_close):
+        df = df[~df["Category"].astype(str).str.upper().isin({"DATA", "TICK"})]
+        if df.empty:
+            return df
     df = df.drop_duplicates(subset=["Timestamp", "Category", "Symbol", "Message"], keep="last")
     return df[[
         "Date", "Time", "Timestamp", "Category", "Status", "Symbol",
         "Entry Price", "Exit Price", "Trade P&L", "Message",
     ]].sort_values("Timestamp", ascending=False)
+
+
+def _latest_persisted_option_symbols(target_date: date) -> dict[str, str]:
+    """Recover the worker's current CE/PE symbols for the dashboard header."""
+    latest: dict[str, tuple[pd.Timestamp, str]] = {}
+    for path in sorted(LOGS_DIR.glob("monitoring_*.csv")):
+        try:
+            monitoring_df = pd.read_csv(path)
+        except (OSError, ValueError, pd.errors.ParserError):
+            continue
+        required = {"timestamp", "category", "symbol"}
+        if not required.issubset(monitoring_df.columns):
+            continue
+        for _, row in monitoring_df.iterrows():
+            if str(row.get("category") or "").upper() != "SETUP_STATUS":
+                continue
+            timestamp = pd.to_datetime(row.get("timestamp"), errors="coerce")
+            if pd.isna(timestamp):
+                continue
+            if getattr(timestamp, "tzinfo", None) is None:
+                timestamp = timestamp.tz_localize(DISPLAY_TZ)
+            else:
+                timestamp = timestamp.tz_convert(DISPLAY_TZ)
+            if timestamp.date() != target_date:
+                continue
+            message = str(row.get("message") or "").upper()
+            side = "CE" if message.startswith("CE ") else "PE" if message.startswith("PE ") else ""
+            symbol = str(row.get("symbol") or "").strip()
+            if side and symbol and symbol != "-" and (
+                side not in latest or timestamp >= latest[side][0]
+            ):
+                latest[side] = (timestamp, symbol)
+    return {side: value[1] for side, value in latest.items()}
 
 
 def _combined_logs_for_date(engine: BaseStrategyEngine | None, target_date: date) -> pd.DataFrame:
@@ -237,6 +303,17 @@ def _format_display_ts(value: object) -> str:
     return ts.strftime("%I:%M:%S %p IST")
 
 
+def _normalize_candle_timestamp(value: object) -> datetime | None:
+    timestamp = pd.to_datetime(value, errors="coerce")
+    if pd.isna(timestamp):
+        return None
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.tz_localize(DISPLAY_TZ)
+    else:
+        timestamp = timestamp.tz_convert(DISPLAY_TZ)
+    return timestamp.to_pydatetime()
+
+
 def _latest_worker_candle_time(target_date: date) -> datetime | None:
     """Read the latest candle checkpoint written by the background worker."""
     latest: datetime | None = None
@@ -247,9 +324,29 @@ def _latest_worker_candle_time(target_date: date) -> datetime | None:
         except (OSError, TypeError, ValueError, json.JSONDecodeError):
             continue
         for value in checkpoint.values() if isinstance(checkpoint, dict) else ():
-            try:
-                timestamp = datetime.fromisoformat(str(value))
-            except (TypeError, ValueError):
+            timestamp = _normalize_candle_timestamp(value)
+            if timestamp is None:
+                continue
+            if latest is None or timestamp > latest:
+                latest = timestamp
+    return latest
+
+
+def _latest_persisted_candle_time(target_date: date) -> datetime | None:
+    """Read the newest candle timestamp from the worker's monitoring files."""
+    latest: datetime | None = None
+    for path in LOGS_DIR.glob(f"monitoring_{target_date:%Y%m%d}.csv"):
+        try:
+            monitoring_df = pd.read_csv(path, usecols=["timestamp", "category", "message"])
+        except (OSError, ValueError, pd.errors.ParserError):
+            continue
+        candle_rows = monitoring_df[
+            monitoring_df["category"].astype(str).str.upper().eq("DATA")
+            & monitoring_df["message"].astype(str).str.match(r"^\d+m candle\b")
+        ]
+        for value in candle_rows["timestamp"]:
+            timestamp = _normalize_candle_timestamp(value)
+            if timestamp is None:
                 continue
             if latest is None or timestamp > latest:
                 latest = timestamp
@@ -342,32 +439,35 @@ def _build_console_logs_df(
         market_data_copy["Timestamp"] = pd.to_datetime(market_data_copy["Timestamp"], errors="coerce")
         market_data_copy = market_data_copy.dropna(subset=["Timestamp"]).sort_values("Timestamp", ascending=False)
         actionable_categories = {
-            "SIGNAL", "PENDING_ENTRY", "ENTRY", "EXIT", "TARGET", "SL",
-            "ORDER", "RISK", "REJECT", "FAILED", "ERROR", "UNCERTAIN_ENTRY",
+            "SIGNAL", "PENDING_ENTRY", "ENTRY", "EXIT", "TARGET", "SL", "CANCEL",
+            "ORDER", "PROTECTIVE_SL", "TSL", "RISK", "REJECT", "FAILED", "ERROR", "UNCERTAIN_ENTRY",
         }
-        alert_symbols: set[str] = set()
-        alert_started_at: pd.Timestamp | None = None
-        for _, alert_row in market_data_copy.iterrows():
-            alert_category = str(alert_row.get("Category") or "").upper()
-            if alert_category not in actionable_categories:
-                continue
-            alert_timestamp = pd.to_datetime(alert_row.get("Timestamp"), errors="coerce")
-            if pd.isna(alert_timestamp):
-                continue
-            alert_message = str(alert_row.get("Message") or "")
-            symbol = _extract_symbol(alert_message)
-            if symbol != "-":
-                alert_symbols.add(symbol)
-            if alert_started_at is None or alert_timestamp < alert_started_at:
-                alert_started_at = alert_timestamp
-
         setup_status_rows = market_data_copy[
             market_data_copy["Category"].astype(str).str.upper().eq("SETUP_STATUS")
         ]
+        current_option_symbols = {
+            str(row.get("Symbol") or "").strip()
+            for _, row in setup_status_rows.iterrows()
+            if str(row.get("Symbol") or "").strip() not in {"", "-", "CE", "PE"}
+        }
+        if not current_option_symbols:
+            current_option_symbols = {
+                str(snapshot.get(key) or "").strip()
+                for key in ("ce_symbol", "pe_symbol")
+                if str(snapshot.get(key) or "").strip()
+            }
+        data_rows = market_data_copy[
+            market_data_copy["Category"].astype(str).str.upper().eq("DATA")
+        ]
+        if current_option_symbols:
+            data_rows = data_rows[data_rows["Symbol"].astype(str).isin(current_option_symbols)]
+        data_rows = data_rows.head(40)
         event_rows = market_data_copy[
-            ~market_data_copy["Category"].astype(str).str.upper().eq("SETUP_STATUS")
+            ~market_data_copy["Category"].astype(str).str.upper().isin(
+                {"SETUP_STATUS", "DATA"}
+            )
         ].head(120)
-        for _, row in pd.concat([setup_status_rows, event_rows]).iterrows():
+        for _, row in pd.concat([setup_status_rows, data_rows, event_rows]).iterrows():
             ts = pd.to_datetime(row["Timestamp"], errors="coerce")
             if pd.isna(ts):
                 continue
@@ -379,14 +479,7 @@ def _build_console_logs_df(
             message = str(row.get("Message") or "")
             category = str(row.get("Category") or "").upper()
             if category == "TICK":
-                tick_symbol = str(row.get("Symbol") or "")
-                if (
-                    alert_started_at is None
-                    or (alert_symbols and tick_symbol not in alert_symbols)
-                    or ts < alert_started_at
-                ):
-                    continue
-                level = "TICK"
+                continue
             candle_match = re.match(r"^(\d+)m candle\b", message)
             if candle_match and int(candle_match.group(1)) != configured_resolution:
                 continue
@@ -491,8 +584,8 @@ def _alert_symbol(engine: BaseStrategyEngine, message: str) -> str:
 def _load_persisted_alert_rows() -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
     visible_categories = {
-        "SIGNAL", "PENDING_ENTRY", "ENTRY", "EXIT", "TARGET", "SL",
-        "ORDER", "RISK", "REJECT", "FAILED", "ERROR", "UNCERTAIN_ENTRY",
+        "SIGNAL", "PENDING_ENTRY", "ENTRY", "EXIT", "TARGET", "SL", "CANCEL",
+        "ORDER", "PROTECTIVE_SL", "TSL", "RISK", "REJECT", "FAILED", "ERROR", "UNCERTAIN_ENTRY",
     }
 
     def append_alert(ts: pd.Timestamp, category: str, message: str) -> None:
@@ -531,11 +624,12 @@ def _load_persisted_alert_rows() -> list[dict[str, object]]:
             message = str(persisted.get("message") or "")
             append_alert(ts, category, message)
 
-    # Setup and signal alerts were originally included only in monitoring rows.
+    # Setup and signal alerts were originally included only in today's monitoring rows.
     # Restore those entries too so a restart does not erase the trigger history.
-    for path in sorted(LOGS_DIR.glob("monitoring_*.csv")):
+    today_path = LOGS_DIR / f"monitoring_{datetime.now(DISPLAY_TZ):%Y%m%d}.csv"
+    for path in (today_path,) if today_path.exists() else ():
         try:
-            monitoring_df = pd.read_csv(path)
+            monitoring_df = pd.read_csv(path, usecols=["timestamp", "message"])
         except (OSError, ValueError, pd.errors.ParserError):
             continue
         if not {"timestamp", "message"}.issubset(monitoring_df.columns):
@@ -603,8 +697,8 @@ def _sync_triggered_alert_rows(engine: BaseStrategyEngine | None) -> pd.DataFram
         return out.sort_values("Timestamp", ascending=False).reset_index(drop=True)
 
     track_categories = {
-        "SIGNAL", "PENDING_ENTRY", "ENTRY", "EXIT", "TARGET", "SL",
-        "ORDER", "RISK", "REJECT", "FAILED", "ERROR",
+        "SIGNAL", "PENDING_ENTRY", "ENTRY", "EXIT", "TARGET", "SL", "CANCEL",
+        "ORDER", "PROTECTIVE_SL", "TSL", "RISK", "REJECT", "FAILED", "ERROR",
     }
 
     for alert_engine in engines:
@@ -665,12 +759,25 @@ last_refresh = st.session_state.get("live_account_updated_at") or "—"
 live_error = st.session_state.get("live_account_error")
 openalgo_log_lines, openalgo_log_error = _load_openalgo_container_logs(source_params)
 today = datetime.now(DISPLAY_TZ).date()
-last_candle_processed_at = st.session_state.get("last_candle_processed_at")
-if not last_candle_processed_at:
-    last_candle_processed_at = _latest_worker_candle_time(today)
+session_candle_time = _normalize_candle_timestamp(
+    st.session_state.get("last_candle_processed_at")
+)
+persisted_candle_times = [
+    value for value in (
+        _latest_worker_candle_time(today),
+        _latest_persisted_candle_time(today),
+    ) if value is not None
+]
+if session_candle_time is not None:
+    persisted_candle_times.append(session_candle_time)
+last_candle_processed_at = max(persisted_candle_times) if persisted_candle_times else None
+if last_candle_processed_at is not None:
+    st.session_state.last_candle_processed_at = last_candle_processed_at
 if not last_candle_time:
     last_candle_time = last_candle_processed_at
-refresh_minutes = 1
+if engine_status == "stopped" and last_candle_processed_at is not None:
+    engine_status = "running"
+refresh_seconds = 30
 _clear_stale_session_logs(today)
 
 # ── 1. Top Status Header ──────────────────────────────────────────────────────
@@ -690,6 +797,7 @@ selected_instruments = list(source_params.get("selected_instruments") or [])
 instrument_configs = source_params.get("instrument_configs") or {}
 spot_symbol = str(source_params.get("openalgo_symbol") or source_params.get("primary_instrument") or "NSE:NIFTY-INDEX")
 instrument_states = st.session_state.get("instrument_states") or {}
+persisted_option_symbols = _latest_persisted_option_symbols(today)
 instrument_symbol_labels: list[str] = []
 for instrument in selected_instruments:
     state = instrument_states.get(instrument) or {}
@@ -705,10 +813,20 @@ for instrument in selected_instruments:
     )
     ce_symbol = state_snapshot.get("ce_symbol")
     pe_symbol = state_snapshot.get("pe_symbol")
+    atm_strike = state_snapshot.get("atm_strike")
+    ce_symbol = ce_symbol or persisted_option_symbols.get("CE")
+    pe_symbol = pe_symbol or persisted_option_symbols.get("PE")
+    if not atm_strike:
+        strike_match = re.search(r"(\d+)(?:CE|PE)$", str(ce_symbol or pe_symbol or ""))
+        if strike_match:
+            atm_strike = int(strike_match.group(1))
     if ce_symbol or pe_symbol:
         instrument_symbol_labels.append(
-            f"{instrument}: {ce_symbol or '-'} CE | {pe_symbol or '-'} PE"
+            f"{instrument}: ATM {int(atm_strike) if atm_strike else '-'} | "
+            f"{ce_symbol or '-'} CE | {pe_symbol or '-'} PE"
         )
+    elif atm_strike:
+        instrument_symbol_labels.append(f"{instrument}: {spot} (ATM {int(atm_strike)})")
     else:
         instrument_symbol_labels.append(f"{instrument}: {spot} (ATM pending)")
 
@@ -776,7 +894,7 @@ with hdr_col:
     render_section_heading("Operations Log", "Daily trade and alert logs",
                            "All trades, alerts, entry/exit prices, and events by date.")
 with refresh_col:
-    st.caption(f"Auto-refresh ({refresh_minutes} min)")
+    st.caption(f"Auto-refresh ({refresh_seconds} sec)")
     st.caption(f"Last refresh: {last_refresh}")
 
 with st.container(border=True):
@@ -827,17 +945,30 @@ with st.container(border=True):
         console_view = console_source_df[[
             "Time", "Side", "Level", "Instrument", "Message",
         ]].fillna("-")
+        completed_candle_view = console_source_df[
+            console_source_df["Message"].str.match(r"^\d+m candle\b", na=False)
+        ][["Time", "Side", "Level", "Message"]].copy()
+        completed_candle_view["CandleTime"] = pd.to_datetime(
+            completed_candle_view["Message"].str.extract(
+                r"^\d+m candle (\d{2}:\d{2}:\d{2})", expand=False
+            ),
+            format="%H:%M:%S",
+            errors="coerce",
+        )
+        completed_candle_view = completed_candle_view[
+            completed_candle_view["CandleTime"].dt.time >= datetime.strptime("09:20:00", "%H:%M:%S").time()
+        ].sort_values("CandleTime", ascending=False)
 
         def _side_panel(side: str, accent: str, title: str) -> str:
             side_view = console_view[console_view["Side"] == side]
             status_rows = side_view[side_view["Level"] == "INFO"]
             status_rows = status_rows[status_rows["Message"].str.contains("EMA21 setup", na=False)]
             latest_status = status_rows.iloc[0] if not status_rows.empty else None
-            side_rows = side_view[~side_view.index.isin(status_rows.index)].head(60)
-            if side_rows.empty:
-                event_html = "<div style='margin-top:.7rem;'>No CE/PE events yet.</div>"
-            else:
-                event_html = ""
+            previous_status = status_rows.iloc[1] if len(status_rows) > 1 else None
+            risk_rows = side_view[side_view["Level"] == "RISK"]
+            latest_risk = risk_rows.iloc[0] if not risk_rows.empty else None
+            latest_status_index = {latest_status.name} if latest_status is not None else set()
+            side_rows = side_view[~side_view.index.isin(latest_status_index)].head(60)
             rows_html = "".join(
                 "<tr>"
                 f"<td style='padding:.48rem .55rem;vertical-align:top;white-space:nowrap;border-bottom:1px solid rgba(86,184,222,.12);'>{escape(str(row['Time']))}</td>"
@@ -846,14 +977,56 @@ with st.container(border=True):
                 "</tr>"
                 for _, row in side_rows.iterrows()
             )
+            candle_view = completed_candle_view[
+                completed_candle_view["Side"] == side
+            ].head(20)
+            candle_rows_html = "".join(
+                "<tr>"
+                f"<td style='padding:.42rem .5rem;vertical-align:top;white-space:nowrap;border-bottom:1px solid rgba(86,184,222,.10);'>{escape(str(row['Time']))}</td>"
+                f"<td style='padding:.42rem .5rem;vertical-align:top;white-space:nowrap;border-bottom:1px solid rgba(86,184,222,.10);'>CANDLE</td>"
+                f"<td style='padding:.42rem .5rem;vertical-align:top;overflow-wrap:anywhere;border-bottom:1px solid rgba(86,184,222,.10);'>{escape(str(row['Message']))}</td>"
+                "</tr>"
+                for _, row in candle_view.iterrows()
+            )
+            empty_candle_row = (
+                '<tr><td colspan="3" style="padding:.6rem;color:#91a3b8;">'
+                "No completed 3-minute candles yet.</td></tr>"
+            )
+            candle_html = (
+                "<div style='padding:.55rem .8rem .2rem;color:#91dfff;font-size:.74rem;"
+                "font-weight:800;text-transform:uppercase;letter-spacing:.05em;'>"
+                "Completed 3-minute candles</div>"
+                "<div style='max-height:220px;overflow-y:auto;'>"
+                "<table style='width:100%;table-layout:fixed;border-collapse:collapse;font-size:.78rem;'>"
+                "<colgroup><col style='width:23%;'><col style='width:20%;'><col style='width:57%;'></colgroup>"
+                "<tbody>"
+                f"{candle_rows_html or empty_candle_row}"
+                "</tbody></table></div>"
+            )
             status_html = ""
-            if latest_status is not None:
+            if latest_risk is not None:
+                risk_message = str(latest_risk["Message"])
+                status_html = (
+                    f"<div style='margin:.7rem .8rem;padding:.65rem .7rem;border-left:3px solid #ffbe32;"
+                    "background:#ffbe3212;color:#e7eef7;overflow-wrap:anywhere;'>"
+                    "<b style='color:#ffbe32;'>Latest order decision</b><br>"
+                    f"<span style='color:#a9b8c9;'>Time: {escape(str(latest_risk['Time']))}</span><br>"
+                    f"{escape(risk_message)}</div>"
+                )
+            elif latest_status is not None:
+                previous_html = ""
+                if previous_status is not None:
+                    previous_html = (
+                        "<br><br><b style='color:#91a3b8;'>Previous setup event</b><br>"
+                        f"<span style='color:#a9b8c9;'>Time: {escape(str(previous_status['Time']))}</span><br>"
+                        f"{escape(str(previous_status['Message']))}"
+                    )
                 status_html = (
                     f"<div style='margin:.7rem .8rem;padding:.65rem .7rem;border-left:3px solid {accent};"
                     f"background:{accent}12;color:#e7eef7;overflow-wrap:anywhere;'>"
                     f"<b style='color:{accent};'>Current setup</b><br>"
                     f"<span style='color:#a9b8c9;'>Monitoring: {escape(str(latest_status['Instrument']))}</span><br>"
-                    f"{escape(str(latest_status['Message']))}</div>"
+                    f"{escape(str(latest_status['Message']))}{previous_html}</div>"
                 )
             elif side_rows.empty:
                 status_html = "<div style='margin:.7rem .8rem;color:#91a3b8;'>No setup status recorded yet.</div>"
@@ -863,6 +1036,7 @@ with st.container(border=True):
                         {title} <span style="float:right;color:#a9b8c9;font-size:.78rem;">{len(side_rows)} latest rows</span>
                     </div>
                     {status_html}
+                    {candle_html}
                     <div style="overflow-y:auto;max-height:360px;">
                         <table style="width:100%;table-layout:fixed;border-collapse:collapse;font-size:.82rem;">
                             <colgroup><col style="width:23%;"><col style="width:20%;"><col style="width:57%;"></colgroup>
@@ -875,7 +1049,10 @@ with st.container(border=True):
                 </div>
             """
 
-        market_rows = console_view[console_view["Side"] == "OTHER"]
+        market_rows = console_view[
+            (console_view["Side"] == "OTHER")
+            & ~console_view["Message"].str.match(r"^\d+m candle\b", na=False)
+        ]
         if not market_rows.empty:
             market_rows_html = "".join(
                 "<tr>"
@@ -903,9 +1080,9 @@ with st.container(border=True):
         st.caption(f"{ce_rows} CE rows | {pe_rows} PE rows | newest events first")
         ce_col, pe_col = st.columns(2)
         with ce_col:
-            st.markdown(_side_panel("CE", "#59d0ff", "CE · Call option"), unsafe_allow_html=True)
+            st.html(_side_panel("CE", "#59d0ff", "CE · Call option"))
         with pe_col:
-            st.markdown(_side_panel("PE", "#ff9f7f", "PE · Put option"), unsafe_allow_html=True)
+            st.html(_side_panel("PE", "#ff9f7f", "PE · Put option"))
 
 with st.container(border=True):
     render_section_heading(
@@ -914,6 +1091,9 @@ with st.container(border=True):
         "Captures actionable triggered alerts with date, time, symbol, category, status, and price.",
     )
     triggered_df = _sync_triggered_alert_rows(engine)
+    render_alert_toasts(
+        triggered_df.to_dict("records") if not triggered_df.empty else None
+    )
     if not triggered_df.empty:
         triggered_df = triggered_df[triggered_df["Date"] == today.isoformat()].reset_index(drop=True)
     if triggered_df.empty:

@@ -1,10 +1,12 @@
 """Focused tests for BaseStrategyEngine tick and square-off behavior."""
 
+import os
 from datetime import date, datetime
+from pathlib import Path
 
 import pandas as pd
 
-from core.broker import ConsoleBroker
+from core.broker import ConsoleBroker, HistoricalReplayBroker
 from core.engine import BaseStrategyEngine
 from core.models import BaseSideState, PendingEntry, Position, RiskConfig, Signal, StrategyConfig
 from strategies.base import SignalProvider
@@ -290,7 +292,7 @@ def test_trailing_status_reports_next_target_after_partial_booking():
         cfg=StrategyConfig(),
         risk=RiskConfig(),
         broker=broker,
-        signal_provider=EMA21StubSignalProvider(),
+        signal_provider=StubSignalProvider(),
     )
     position = Position(
         option_symbol="NIFTY01SEP2624250PE",
@@ -415,7 +417,7 @@ def test_hard_sl_count_is_shared_between_strategy_engines(tmp_path, monkeypatch)
 
     assert first.state.sl_hits_today == 1
     assert second.state.sl_hits_today == 1
-    assert (tmp_path / "logs" / "sl_hits_20260808.json").exists()
+    assert Path(os.environ["SHARED_SL_COUNT_FILE"]).exists()
 
 
 def test_candle_low_hits_trailing_stop_after_same_candle_trail_update():
@@ -495,10 +497,45 @@ def test_force_square_off_side_clears_pending_and_position():
     engine = _make_engine()
     _attach_position(engine, "PE")
     ss = engine.state.pe
-    ss.pending_entry = object()  # type: ignore[assignment]
+    ss.pending_entry = PendingEntry(
+        signal=Signal.BUY_PE,
+        created_at=datetime(2026, 8, 8, 15, 0),
+        option_symbol="NIFTY08AUG2625000PE",
+        quantity=65,
+        option_trigger_level=100.0,
+        option_stop_level=90.0,
+        trigger_candle_high=100.0,
+        trigger_candle_low=90.0,
+    )
     engine.force_square_off_side(ss, datetime(2026, 8, 8, 15, 16))
     assert ss.pending_entry is None
     assert ss.position is None
+
+
+def test_day_transition_resets_daily_entry_count():
+    engine = _make_engine()
+    engine.total_entries = 1
+
+    engine.reset_for_new_day(datetime(2026, 8, 11).date())
+
+    assert engine.total_entries == 0
+
+
+def test_replay_ignores_shared_live_sl_count(tmp_path, monkeypatch):
+    shared_count = tmp_path / "sl_hits.json"
+    shared_count.write_text('{"count": 3}', encoding="utf-8")
+    monkeypatch.setenv("SHARED_SL_COUNT_FILE", str(shared_count))
+    engine = BaseStrategyEngine(
+        StrategyConfig(),
+        RiskConfig(max_sl_per_day=3),
+        HistoricalReplayBroker(),
+        StubSignalProvider(),
+    )
+    engine.state.trading_day = datetime(2026, 9, 11).date()
+
+    engine._sync_shared_sl_count(engine.state.trading_day)
+
+    assert engine.state.sl_hits_today == 0
 
 
 def test_pending_entry_expires_after_3_candles():

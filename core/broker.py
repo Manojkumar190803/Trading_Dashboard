@@ -14,6 +14,12 @@ from core.models import OrderSide
 logger = logging.getLogger("core.broker")
 
 
+def _is_openalgo_auth_failure(response: object, message: str) -> bool:
+    """Identify credential failures that will not recover by retrying."""
+    text = f"{response} {message}".lower()
+    return "403" in text or "invalid openalgo apikey" in text or "invalid api key" in text
+
+
 class BrokerInterface:
     """Abstract broker — subclass and implement for your broker API."""
 
@@ -170,6 +176,7 @@ class OpenAlgoBroker(BrokerInterface):
         self.exchange_options = exchange_options
         self.dry_run = dry_run
         self.position_book_available = False
+        self._positionbook_auth_failed = False
         self._nearest_expiry_cache: dict[tuple[str, str, int, int, str, str], Optional[date]] = {}
         logger.info(
             "OpenAlgoBroker initialized host=%s ws_url=%s product=%s dry_run=%s",
@@ -311,6 +318,8 @@ class OpenAlgoBroker(BrokerInterface):
         return 0.0
 
     def get_position_book(self) -> list[dict[str, object]]:
+        if self._positionbook_auth_failed:
+            return []
         try:
             response = self.client.positionbook()
         except Exception as exc:
@@ -319,7 +328,14 @@ class OpenAlgoBroker(BrokerInterface):
             return []
         if not isinstance(response, dict) or response.get("status") != "success":
             self.position_book_available = False
-            logger.warning("positionbook unexpected response: %s", response)
+            message = str(response.get("message") if isinstance(response, dict) else response)
+            if _is_openalgo_auth_failure(response, message):
+                self._positionbook_auth_failed = True
+                logger.error(
+                    "positionbook authorization failed; update OPENALGO_API_KEY for this OpenAlgo instance"
+                )
+            else:
+                logger.warning("positionbook unexpected response: %s", response)
             return []
         data = response.get("data")
         if not isinstance(data, list):
@@ -503,7 +519,7 @@ class OpenAlgoBroker(BrokerInterface):
         }
         fallback_metadata = {
             "NIFTY": {"strike_step": 50, "option_lot_size": 65, "weekly_expiry_weekday": 1},
-            "BANKNIFTY": {"strike_step": 100, "option_lot_size": 30, "weekly_expiry_weekday": 1},
+            "BANKNIFTY": {"strike_step": 100, "option_lot_size": 30, "weekly_expiry_weekday": 3},
             "SENSEX": {"strike_step": 100, "option_lot_size": 20, "weekly_expiry_weekday": 3},
         }
         spot_exch, opt_exch = default_exchanges.get(canonical, ("NSE_INDEX", self.exchange_options))
@@ -513,10 +529,33 @@ class OpenAlgoBroker(BrokerInterface):
 
         payload, discovery_error = self._discover_payload(canonical, spot_exch, opt_exch)
         if payload is None:
-            raise RuntimeError(
-                f"Could not discover instrument metadata for '{script}' from OpenAlgo"
-                + (f": {discovery_error}" if discovery_error else "")
+            fallback = fallback_metadata.get(canonical)
+            if fallback is None:
+                raise RuntimeError(
+                    f"Could not discover instrument metadata for '{script}' from OpenAlgo"
+                    + (f": {discovery_error}" if discovery_error else "")
+                )
+            logger.warning(
+                "OpenAlgo metadata discovery unavailable for %s; using configured index defaults "
+                "exchange_spot=%s exchange_options=%s strike_step=%s lot_size=%s%s",
+                canonical,
+                spot_exch,
+                opt_exch,
+                os.getenv(f"{env_prefix}_STRIKE_STEP", str(fallback["strike_step"])),
+                os.getenv(f"{env_prefix}_OPTION_LOT_SIZE", str(fallback["option_lot_size"])),
+                f" ({discovery_error})" if discovery_error else "",
             )
+            return {
+                "spot_symbol": canonical,
+                "option_index_symbol": canonical,
+                "exchange_spot": spot_exch,
+                "exchange_options": opt_exch,
+                "strike_step": int(os.getenv(f"{env_prefix}_STRIKE_STEP", fallback["strike_step"])),
+                "option_lot_size": int(os.getenv(f"{env_prefix}_OPTION_LOT_SIZE", fallback["option_lot_size"])),
+                "weekly_expiry_weekday": int(
+                    os.getenv(f"{env_prefix}_EXPIRY_WEEKDAY", fallback["weekly_expiry_weekday"])
+                ),
+            }
 
         numeric = self._extract_numeric_fields(payload)
         discovered_root = self._extract_option_root(payload)
@@ -986,7 +1025,9 @@ class HistoricalReplayBroker(BrokerInterface):
         row = self._bars.get(symbol)
         if row is None or float(row["high"]) < trigger_price:
             return None
-        if float(row["high"]) > limit_price:
+        bar_open = float(row.get("open", row["close"]))
+        bar_low = float(row.get("low", bar_open))
+        if float(row["high"]) > limit_price and min(bar_open, bar_low) > limit_price:
             return None
         return float(trigger_price)
 

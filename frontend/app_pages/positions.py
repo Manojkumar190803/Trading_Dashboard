@@ -1,13 +1,17 @@
 """Positions page — open position and pending entry order."""
 from __future__ import annotations
 
+from datetime import datetime
 from html import escape
+import re
 
 import pandas as pd
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 
 from _shared import (
+    DISPLAY_TZ,
+    LOGS_DIR,
     format_money,
     inject_theme,
     refresh_live_account_metrics,
@@ -16,6 +20,7 @@ from _shared import (
 inject_theme()
 source_params = render_sidebar()
 st_autorefresh(interval=10_000, key="positions-live-refresh")
+st_autorefresh(interval=1_000, key="positions-tick-live-refresh")
 refresh_live_account_metrics(source_params)
 
 st.markdown(
@@ -108,16 +113,50 @@ def _position_table_rows(positions: list[dict[str, object]]) -> list[dict[str, o
     return rows
 
 
+def _load_live_ticks() -> list[dict[str, str]]:
+    path = LOGS_DIR / f"monitoring_{datetime.now(DISPLAY_TZ):%Y%m%d}.csv"
+    if not path.exists():
+        return []
+    try:
+        tick_rows = pd.read_csv(path)
+    except (OSError, ValueError, pd.errors.ParserError):
+        return []
+    if tick_rows.empty or "category" not in tick_rows.columns:
+        return []
+    tick_rows = tick_rows[tick_rows["category"].astype(str).str.upper().eq("TICK")].tail(50)
+    output: list[dict[str, str]] = []
+    for _, row in tick_rows.iloc[::-1].iterrows():
+        timestamp = pd.to_datetime(row.get("timestamp"), errors="coerce")
+        if pd.isna(timestamp):
+            continue
+        timestamp = timestamp.tz_localize(DISPLAY_TZ) if timestamp.tzinfo is None else timestamp.tz_convert(DISPLAY_TZ)
+        message = str(row.get("message") or "")
+        ltp_match = re.search(r"LTP=([0-9]+(?:\.[0-9]+)?)", message)
+        side_match = re.search(r"Tick\s+([^:]+):", message, flags=re.IGNORECASE)
+        output.append(
+            {
+                "time": timestamp.strftime("%H:%M:%S.%f")[:-3],
+                "side": side_match.group(1).strip() if side_match else "-",
+                "symbol": str(row.get("symbol") or "-"),
+                "ltp": ltp_match.group(1) if ltp_match else "-",
+            }
+        )
+    return output
+
+
 broker_open_positions = [
     row for row in live_positions if _position_quantity(row) != 0
 ]
 
 open_positions = 1 if position else len(broker_open_positions)
 
-if snapshot and (snapshot.get("position") or snapshot.get("pending_entry")):
-    total_pnl = float(snapshot.get("total_pnl", 0.0))
+# Prefer the freshly synced OpenAlgo account MTM so this card reflects live
+# broker P&L even when the local strategy snapshot has not recorded a trade.
+live_net_mtm = st.session_state.get("net_mtm")
+if live_net_mtm is not None:
+    total_pnl = float(live_net_mtm or 0.0)
 else:
-    total_pnl = float(st.session_state.get("net_mtm", 0.0) or 0.0)
+    total_pnl = 0.0
 total_pnl_color = "#15c46b" if total_pnl >= 0 else "#ff7a7a"
 
 source_params = st.session_state.get("source_params", {})
@@ -236,3 +275,34 @@ else:
     )
     if updated_at:
         st.caption(f"Synced from OpenAlgo at {updated_at}")
+
+st.markdown("<div style='height:1.1rem;'></div>", unsafe_allow_html=True)
+st.markdown(
+    "<div style='font-size:1.15rem;font-weight:800;color:#e8f4ff;margin-bottom:0.5rem;'>"
+    "Live tick feed</div>",
+    unsafe_allow_html=True,
+)
+live_ticks = _load_live_ticks()
+now = datetime.now(DISPLAY_TZ)
+seconds_to_candle = (3 - (now.minute % 3)) * 60 - now.second
+if seconds_to_candle <= 0:
+    seconds_to_candle = 180
+st.caption(f"Next candle in {seconds_to_candle // 60:02d}:{seconds_to_candle % 60:02d} · updates every second")
+if not live_ticks:
+    st.info("No active-trade ticks received yet.")
+else:
+    tick_rows = "".join(
+        "<tr>"
+        f"<td>{escape(row['time'])}</td>"
+        f"<td>{escape(row['side'])}</td>"
+        f"<td class='pos-symbol'>{escape(row['symbol'])}</td>"
+        f"<td>{escape(row['ltp'])}</td>"
+        "</tr>"
+        for row in live_ticks
+    )
+    st.markdown(
+        "<div class='pos-table' style='max-height:360px;overflow-y:auto;'>"
+        "<table><thead><tr><th>Time</th><th>Side</th><th>Symbol</th><th>LTP</th></tr></thead>"
+        f"<tbody>{tick_rows}</tbody></table></div>",
+        unsafe_allow_html=True,
+    )

@@ -38,7 +38,7 @@ class StrategyConfig:
     timeframe_minutes: int = 3
     market_open: time = time(9, 20)
     market_close: time = time(15, 15)
-    force_square_off: time = time(15, 15)
+    force_square_off: time = time(15, 10)
     signal_cutoff: time = time(15, 0)
     atm_lock_time: time = time(9, 20)
     entry_start: time = time(9, 20)
@@ -56,7 +56,7 @@ class StrategyConfig:
     min_vwap_room_rr: float = 1.5
     pending_entry_expiry_candles: int = 3
     entry_buffer_points: float = 0.0
-    stop_buffer_points: float = 1.0
+    stop_buffer_points: float = 0.0
     entry_limit_buffer_points: float = 0.5
     option_tick_size: float = 0.05
     max_trades_per_day: int = 3
@@ -122,6 +122,7 @@ class BaseSideState:
     position: Optional[Position] = None
     pending_entry: Optional[PendingEntry] = None
     order_submission_uncertain: bool = False
+    entry_block_reason: Optional[str] = None
     last_close: Optional[float] = None
     last_ema21: Optional[float] = None
     last_rsi: Optional[float] = None
@@ -134,6 +135,7 @@ class BaseSideState:
 class DayState:
     trading_day: Optional[date] = None
     atm_locked: bool = False
+    atm_strike: Optional[int] = None
     ce_symbol: Optional[str] = None
     pe_symbol: Optional[str] = None
     sl_hits_today: int = 0

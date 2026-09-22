@@ -9,10 +9,12 @@ import os
 import json
 import re
 import sys
+import csv
 from datetime import date, datetime, time, timedelta
 from dataclasses import dataclass
+from html import escape
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -26,6 +28,109 @@ PREFERENCES_PATH = LOGS_DIR / "dashboard_preferences.json"
 for import_path in (FRONTEND_DIR, PROJECT_ROOT):
     if str(import_path) not in sys.path:
         sys.path.insert(0, str(import_path))
+
+
+def render_alert_toasts(alert_rows: list[dict[str, object]] | None = None) -> None:
+    """Render newly persisted strategy events as upper-right toast alerts."""
+    if alert_rows is None:
+        alert_rows = []
+        path = LOGS_DIR / f"trade_alerts_{datetime.now(DISPLAY_TZ):%Y%m%d}.csv"
+        if path.exists():
+            try:
+                with path.open(newline="", encoding="utf-8") as handle:
+                    for row in csv.DictReader(handle):
+                        category = str(row.get("category") or "").upper()
+                        if category not in {
+                            "SIGNAL", "PENDING_ENTRY", "ENTRY", "EXIT", "TARGET", "SL",
+                            "CANCEL", "ORDER", "PROTECTIVE_SL", "TSL", "RISK", "REJECT", "FAILED", "ERROR", "UNCERTAIN_ENTRY",
+                        }:
+                            continue
+                        alert_rows.append(row)
+            except (OSError, csv.Error):
+                return
+
+    if not alert_rows:
+        return
+    seen = st.session_state.setdefault("toast_alert_seen", set())
+    if not st.session_state.get("toast_alert_initialized", False):
+        for row in alert_rows:
+            timestamp = str(row.get("timestamp") or row.get("Timestamp") or "")
+            category = str(row.get("category") or row.get("Category") or "INFO").upper()
+            message = str(row.get("message") or row.get("Message") or "")
+            if message:
+                seen.add(f"{timestamp}|{category}|{message}")
+        st.session_state.toast_alert_seen = set(list(seen)[-500:])
+        st.session_state.toast_alert_initialized = True
+        return
+    new_rows: list[dict[str, object]] = []
+    for row in alert_rows[-20:]:
+        timestamp = str(row.get("timestamp") or row.get("Timestamp") or "")
+        category = str(row.get("category") or row.get("Category") or "INFO").upper()
+        message = str(row.get("message") or row.get("Message") or "")
+        key = f"{timestamp}|{category}|{message}"
+        if message and key not in seen:
+            seen.add(key)
+            new_rows.append({"category": category, "message": message})
+    st.session_state.toast_alert_seen = set(list(seen)[-500:])
+    if not new_rows:
+        return
+
+    if st.button("×", key="clear_alert_toasts", help="Clear alert messages"):
+        for row in alert_rows:
+            timestamp = str(row.get("timestamp") or row.get("Timestamp") or "")
+            category = str(row.get("category") or row.get("Category") or "INFO").upper()
+            message = str(row.get("message") or row.get("Message") or "")
+            seen.add(f"{timestamp}|{category}|{message}")
+        st.session_state.toast_alert_seen = set(list(seen)[-500:])
+        st.rerun()
+
+    severity = {
+        "ENTRY": ("success", "ENTRY FILLED"),
+        "EXIT": ("success", "EXIT"),
+        "TARGET": ("success", "TARGET"),
+        "PENDING_ENTRY": ("warning", "ENTRY ORDER PLACED"),
+        "ORDER": ("warning", "ORDER UPDATE"),
+        "PROTECTIVE_SL": ("warning", "PROTECTIVE STOP"),
+        "TSL": ("warning", "TRAILING STOP"),
+        "CANCEL": ("danger", "ORDER CANCELLED"),
+        "SL": ("danger", "STOP LOSS"),
+        "RISK": ("danger", "RISK ALERT"),
+        "REJECT": ("danger", "ORDER REJECTED"),
+        "FAILED": ("danger", "ORDER FAILED"),
+        "ERROR": ("danger", "ERROR"),
+        "UNCERTAIN_ENTRY": ("danger", "ORDER UNCERTAIN"),
+        "SIGNAL": ("info", "SIGNAL"),
+    }
+    cards = []
+    for row in new_rows[-4:]:
+        category = str(row["category"])
+        tone, title = severity.get(category, ("info", category))
+        cards.append(
+            f"<div class='oa-toast oa-toast-{tone}'>"
+            f"<div class='oa-toast-title'>{escape(title)}</div>"
+            f"<div class='oa-toast-message'>{escape(str(row['message']))}</div></div>"
+        )
+    st.markdown(
+        "<style>"
+        ".oa-toast-stack{position:fixed;right:1.25rem;top:1.25rem;width:min(390px,calc(100vw - 2rem));"
+        "z-index:999999;display:flex;flex-direction:column;gap:.65rem;pointer-events:none;}"
+        ".st-key-clear_alert_toasts{position:fixed;right:1.15rem;top:.75rem;z-index:1000000;}"
+        ".st-key-clear_alert_toasts button{border:0;border-radius:50%;width:1.65rem;height:1.65rem;"
+        "padding:0;background:rgba(35,45,58,.92);color:#e5eef7;font-size:1.05rem;line-height:1;}"
+        ".oa-toast{pointer-events:auto;border:1px solid rgba(255,255,255,.22);border-left:4px solid;"
+        "border-radius:8px;padding:.75rem .9rem;background:#122332;box-shadow:0 12px 30px rgba(0,0,0,.35);"
+        "animation:oa-toast-in .25s ease-out,oa-toast-out .6s ease-in 11.4s forwards;}"
+        ".oa-toast-title{font-size:.72rem;font-weight:800;letter-spacing:.06em;margin-bottom:.25rem;}"
+        ".oa-toast-message{font-size:.78rem;line-height:1.35;color:#e5eef7;word-break:break-word;}"
+        ".oa-toast-success{border-left-color:#2bd48a}.oa-toast-success .oa-toast-title{color:#2bd48a}"
+        ".oa-toast-warning{border-left-color:#ffc857}.oa-toast-warning .oa-toast-title{color:#ffc857}"
+        ".oa-toast-danger{border-left-color:#ff7180}.oa-toast-danger .oa-toast-title{color:#ff7180}"
+        ".oa-toast-info{border-left-color:#59d0ff}.oa-toast-info .oa-toast-title{color:#59d0ff}"
+        "@keyframes oa-toast-in{from{opacity:0;transform:translateX(18px)}to{opacity:1;transform:translateX(0)}}"
+        "@keyframes oa-toast-out{to{opacity:0;transform:translateX(18px)}}"
+        "</style><div class='oa-toast-stack'>" + "".join(cards) + "</div>",
+        unsafe_allow_html=True,
+    )
 
 # Optional: auto-load .env from the app directory so secrets like
 # OPENALGO_API_KEY never have to be typed into the UI.
@@ -42,6 +147,7 @@ from core.broker import BrokerInterface, OpenAlgoBroker
 from core.indicators import add_indicators
 from core.models import OrderSide, RiskConfig, StrategyConfig
 from core.multi_strategy import MultiStrategyRuntime, STRATEGY_DEFINITIONS
+from core.runner import _restore_open_positions
 
 try:
     from openalgo import api as _openalgo_api
@@ -1029,11 +1135,22 @@ def _process_single_instrument_candle() -> None:
     idx: int = int(st.session_state.index)
     runtime: MultiStrategyRuntime = st.session_state.runtime
     if idx >= len(data):
+        if st.session_state.get("source") == "OPENALGO":
+            # The latest completed candle may already be consumed. Keep the
+            # live loop running so the next rerun can pick up a new candle.
+            st.session_state.running = True
+            st.session_state.engine_status = "running"
+            return
         st.session_state.running = False
         return
 
     processed_now = datetime.now(DISPLAY_TZ)
     row = data.iloc[idx]
+    candle_date = pd.to_datetime(row.get("datetime"), errors="coerce")
+    if pd.isna(candle_date) or candle_date.date() != datetime.now(DISPLAY_TZ).date():
+        st.session_state.running = False
+        st.session_state.engine_status = "paused"
+        return
     prev_row = data.iloc[idx - 1] if idx > 0 else None
     source_params = st.session_state.get("source_params", {}) or {}
     feed_symbol = str(source_params.get("openalgo_symbol") or "NSE:NIFTY-INDEX")
@@ -1065,6 +1182,10 @@ def _process_single_instrument_candle() -> None:
         if strategy_frames:
             option_frames[key] = strategy_frames
 
+    if isinstance(broker, OpenAlgoBroker):
+        for engine in runtime.engines.values():
+            _restore_open_positions(engine, broker, candle_date.date())
+
     runtime.process_candle(row, prev_row, option_frames)
     st.session_state.engines = runtime.engines
     selected_key = runtime.active_keys[0] if runtime.active_keys else "ema21"
@@ -1089,8 +1210,8 @@ def _process_single_instrument_candle() -> None:
     active_parts: list[str] = []
     new_alert_parts: list[str] = []
     actionable_alert_categories = {
-        "SIGNAL", "PENDING_ENTRY", "ENTRY", "EXIT", "TARGET", "SL",
-        "ORDER", "RISK", "REJECT", "FAILED", "ERROR", "UNCERTAIN_ENTRY",
+        "SIGNAL", "PENDING_ENTRY", "ENTRY", "EXIT", "TARGET", "SL", "CANCEL",
+        "ORDER", "PROTECTIVE_SL", "TSL", "RISK", "REJECT", "FAILED", "ERROR", "UNCERTAIN_ENTRY",
     }
     has_actionable_event = False
     for strategy_key, active_engine in runtime.engines.items():
@@ -1163,6 +1284,13 @@ def _process_single_instrument_candle() -> None:
 
 def process_next_candle() -> None:
     """Advance every selected instrument in the single Streamlit process."""
+    market_cfg = st.session_state.get("cfg") or StrategyConfig()
+    now = datetime.now(DISPLAY_TZ)
+    if now.weekday() >= 5 or not (market_cfg.market_open <= now.time() < market_cfg.market_close):
+        st.session_state.running = False
+        st.session_state.engine_status = "paused"
+        return
+
     instrument_states = st.session_state.get("instrument_states")
     if not instrument_states:
         _process_single_instrument_candle()
@@ -1198,6 +1326,20 @@ def process_next_candle() -> None:
 _LIVE_REFRESH_MIN_INTERVAL_SEC = 3.0
 
 
+def _daily_mtm_value(raw_mtm: float, trading_day: str, state: dict[str, Any]) -> float:
+    """Return MTM relative to the first account sync for the IST trading day."""
+    if state.get("_live_mtm_date") != trading_day:
+        state["_live_mtm_date"] = trading_day
+        state["_live_mtm_baseline"] = raw_mtm
+        return 0.0
+
+    baseline = state.get("_live_mtm_baseline")
+    if baseline is None:
+        state["_live_mtm_baseline"] = raw_mtm
+        return 0.0
+    return raw_mtm - float(baseline)
+
+
 def refresh_live_account_metrics(source_params: dict[str, Any] | None = None) -> None:
     """Fetch live funds/positions/orderbook from OpenAlgo and push into session_state.
 
@@ -1216,6 +1358,11 @@ def refresh_live_account_metrics(source_params: dict[str, Any] | None = None) ->
     """
     now = datetime.now()
     display_now = datetime.now(DISPLAY_TZ)
+    trading_day = display_now.date().isoformat()
+    if st.session_state.get("_live_mtm_date") != trading_day:
+        st.session_state["_live_mtm_date"] = trading_day
+        st.session_state["_live_mtm_baseline"] = None
+        st.session_state["net_mtm"] = 0.0
     last_ts = st.session_state.get("_live_refresh_last_ts")
     if isinstance(last_ts, datetime):
         if (now - last_ts).total_seconds() < _LIVE_REFRESH_MIN_INTERVAL_SEC:
@@ -1276,6 +1423,7 @@ def refresh_live_account_metrics(source_params: dict[str, Any] | None = None) ->
     # If broker didn't populate MTM inside funds, fall back to positions P&L.
     if net_mtm == 0.0 and positions_pnl != 0.0:
         net_mtm = positions_pnl
+    net_mtm = _daily_mtm_value(net_mtm, trading_day, st.session_state)
 
     available_margin = funds.get("available_margin", funds.get("availablecash", 0.0))
     st.session_state["available_margin"] = float(available_margin or 0.0)
@@ -1288,13 +1436,18 @@ def refresh_live_account_metrics(source_params: dict[str, Any] | None = None) ->
     st.session_state["live_account_updated_at"] = display_now.strftime("%H:%M:%S IST")
 
 
-def run_premarket_checks(source_params: dict[str, Any] | None = None) -> list[dict[str, str]]:
+def run_premarket_checks(
+    source_params: dict[str, Any] | None = None,
+    on_check: Callable[[list[dict[str, str]]], None] | None = None,
+) -> list[dict[str, str]]:
     """Run read-only readiness checks against the current dashboard state."""
     params = source_params or st.session_state.get("source_params", {}) or {}
     checks: list[dict[str, str]] = []
 
     def add(name: str, status: str, detail: str) -> None:
         checks.append({"name": name, "status": status, "detail": detail})
+        if on_check is not None:
+            on_check(checks.copy())
 
     broker = st.session_state.get("broker")
     data = st.session_state.get("data")
@@ -1361,10 +1514,22 @@ def run_premarket_checks(source_params: dict[str, Any] | None = None) -> list[di
 
 # ── Sidebar (common across all pages) ─────────────────────────────────────────
 
-def render_sidebar() -> dict[str, Any]:
-    """Render sidebar controls and return source_params dict."""
+def render_sidebar(manage_runtime: bool = True) -> dict[str, Any]:
+    """Render sidebar controls and return source_params dict.
+
+    Read-only pages can disable runtime orchestration so a page refresh does
+    not refetch market history or process another strategy candle.
+    """
     # Keep the monitoring loop alive regardless of which page is open.
-    st_autorefresh(interval=60_000, key="shared-monitor-refresh")
+    try:
+        refresh_seconds = max(5, int(os.getenv("DASHBOARD_REFRESH_SECONDS", "10")))
+    except ValueError:
+        refresh_seconds = 10
+    st_autorefresh(
+        interval=refresh_seconds * 1_000,
+        limit=None,
+        key="shared-monitor-refresh",
+    )
     product_type = os.getenv("PRODUCT_TYPE", "INTRADAY").upper()
 
     st.sidebar.markdown(
@@ -1462,7 +1627,7 @@ def render_sidebar() -> dict[str, Any]:
     # ── Lot Size (number of lots — quantity auto-scales per instrument) ─────
     st.sidebar.markdown("### Lot Size")
     if "lots" not in st.session_state:
-        saved_lots = _load_dashboard_preferences().get("lots", 1)
+        saved_lots = _load_dashboard_preferences().get("lots", 2)
         try:
             st.session_state.lots = max(1, min(1000, int(saved_lots)))
         except (TypeError, ValueError):
@@ -1589,6 +1754,10 @@ def render_sidebar() -> dict[str, Any]:
         st.session_state.market_data_logs = market_data_logs
         st.session_state["_market_pause_logged_for"] = today_key
 
+    if not manage_runtime:
+        st.session_state.source_params = source_params
+        return source_params
+
     # ── Auto-start engine: load OpenAlgo data on every rerun until it succeeds
     # ── so the app "just works" as soon as OpenAlgo is reachable. There is no
     # ── manual Start/Pause/Stop button any more.
@@ -1612,10 +1781,28 @@ def render_sidebar() -> dict[str, Any]:
         or symbol_changed
         or instruments_changed
     )
+    load_signature = (
+        openalgo_base_url,
+        openalgo_symbol,
+        tuple(selected_instruments),
+        int(openalgo_resolution),
+        int(openalgo_days),
+    )
+    retry_after = st.session_state.get("_openalgo_load_retry_after")
+    retry_signature = st.session_state.get("_openalgo_load_retry_signature")
+    if (
+        need_reload
+        and retry_signature == load_signature
+        and isinstance(retry_after, datetime)
+        and datetime.now() < retry_after
+    ):
+        need_reload = False
     if need_reload:
         try:
             _data = load_data("OPENALGO", source_params, StrategyConfig())
             init_engine_state(_data, "OPENALGO", source_params)
+            st.session_state.pop("_openalgo_load_retry_after", None)
+            st.session_state.pop("_openalgo_load_retry_signature", None)
             for instrument_state in st.session_state.instrument_states.values():
                 instrument_state["running"] = in_market_window
                 instrument_state["engine_status"] = (
@@ -1630,6 +1817,8 @@ def render_sidebar() -> dict[str, Any]:
                 _log_market_pause_once()
             st.session_state.pop("openalgo_unavailable", None)
         except (OpenAlgoError, RuntimeError, ValueError, FileNotFoundError) as exc:
+            st.session_state["_openalgo_load_retry_signature"] = load_signature
+            st.session_state["_openalgo_load_retry_after"] = datetime.now() + timedelta(seconds=30)
             st.session_state.running = False
             st.session_state.engine_status = "stopped"
             msg = str(exc)
@@ -1649,6 +1838,16 @@ def render_sidebar() -> dict[str, Any]:
                 st.session_state["openalgo_unavailable"] = (
                     f"OPENALGO_API_KEY is not set. Create Trading_Setups/.env with "
                     f"OPENALGO_API_KEY=<your key> and restart the app."
+                )
+            elif (
+                "symbol" in lower_msg
+                and ("not found" in lower_msg or "master contracts" in lower_msg)
+            ):
+                st.session_state["openalgo_unavailable"] = (
+                    f"OpenAlgo is reachable at {openalgo_base_url}, but its broker symbol master "
+                    "is unavailable. Re-authenticate the configured Fyers broker in OpenAlgo, "
+                    "download the NSE master contracts, then refresh this page. "
+                    f"Details: {msg}"
                 )
             else:
                 st.session_state["openalgo_unavailable"] = (

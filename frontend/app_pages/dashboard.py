@@ -5,6 +5,7 @@ import streamlit as st
 from _shared import (
     inject_theme,
     refresh_live_account_metrics,
+    render_alert_toasts,
     render_section_heading,
     render_sidebar,
     run_premarket_checks,
@@ -15,6 +16,7 @@ source_params = render_sidebar()
 
 # ── Live account refresh (works in Paper Mode too — read-only) ────────────────
 refresh_live_account_metrics(source_params)
+render_alert_toasts()
 
 # ── Header + status badge ─────────────────────────────────────────────────────
 net_mtm        = st.session_state.get("net_mtm", 0.0)
@@ -47,7 +49,7 @@ st.html(
     <div class='hd-metrics-grid'>
         <div class='hd-metric-card-v2'>
             <div class='hd-metric-label-v2'>Net MTM (₹)</div>
-            <div class='hd-metric-value-v2' style='color:{mtm_color};'>₹{abs(net_mtm):,.0f}</div>
+            <div class='hd-metric-value-v2' style='color:{mtm_color};'>₹{net_mtm:,.0f}</div>
             <div class='hd-metric-sublabel'>Mark to Market</div>
         </div>
         <div class='hd-metric-card-v2'>
@@ -95,7 +97,27 @@ st.sidebar.markdown(
 )
 st.sidebar.caption(f"Checked: {st.session_state.get('premarket_checked_at', 'not checked')}")
 if st.sidebar.button("Run checks", key="sidebar_run_premarket_checks", use_container_width=True):
-    st.session_state.premarket_checks = run_premarket_checks(source_params)
+    progress = st.sidebar.empty()
+
+    def _show_check_progress(updated_checks: list[dict[str, str]]) -> None:
+        completed = len(updated_checks)
+        rows = "".join(
+            f"<div style='padding:.35rem 0;border-bottom:1px solid rgba(86,184,222,.10);'>"
+            f"<strong style='color:{'#27d48a' if check['status'] == 'READY' else '#ffbe32' if check['status'] == 'WARNING' else '#ff5f6d'};'>"
+            f"{check['status']}</strong><br><span style='font-size:.75rem;'>{check['name']}</span></div>"
+            for check in updated_checks
+        )
+        progress.markdown(
+            f"<div style='margin:.65rem 0;color:#a9b8c9;font-size:.78rem;'>"
+            f"Checking one by one: {completed}/6 complete</div>{rows}",
+            unsafe_allow_html=True,
+        )
+
+    _show_check_progress([])
+    st.session_state.premarket_checks = run_premarket_checks(
+        source_params,
+        on_check=_show_check_progress,
+    )
     st.session_state.premarket_checked_at = updated_at or "now"
     st.rerun()
 

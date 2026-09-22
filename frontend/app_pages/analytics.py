@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import csv
 import re
-from datetime import date
+from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
@@ -31,56 +31,89 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-equity_curve = st.session_state.get("equity_curve", [])
 engine = st.session_state.get("engine")
+ANALYTICS_TRADES_PATH = Path("logs") / "analytics_trades.csv"
+ANALYTICS_RESET_PATH = Path("logs") / "analytics_reset.txt"
+ANALYTICS_COLUMNS = ["timestamp", "strategy", "pnl", "source", "message"]
 
 
-def _load_persisted_alerts() -> list[dict[str, str]]:
-    source_params = st.session_state.get("source_params", {}) or {}
-    instrument = str(source_params.get("option_index_symbol") or "NIFTY").upper()
-    path = Path("logs") / f"trade_alerts_{instrument}_{date.today():%Y%m%d}.csv"
-    if not path.exists():
-        return []
+def _extract_pnl(message: str) -> float | None:
+    match = re.search(r"trade_pnl=([\-0-9]+(?:\.[0-9]+)?)", message, flags=re.IGNORECASE)
+    if not match:
+        return None
     try:
-        with path.open(newline="", encoding="utf-8") as handle:
-            return [row for row in csv.DictReader(handle) if row.get("message")]
-    except (OSError, csv.Error):
-        return []
+        return float(match.group(1))
+    except (TypeError, ValueError):
+        return None
 
 
-persisted_alerts = _load_persisted_alerts()
-
-
-def _extract_trade_pnls() -> list[float]:
-    pnls: list[float] = []
-    alerts = (
-        [
-            {"category": str(alert.category), "message": str(alert.message)}
-            for alert in engine.alerts
-        ]
-        if engine is not None
-        else []
-    )
-    alerts.extend(persisted_alerts)
-    seen: set[tuple[str, str]] = set()
-    for alert in alerts:
-        category = str(alert.get("category") or "").upper()
-        message = str(alert.get("message") or "")
-        key = (category, message)
-        if key in seen or category != "EXIT":
-            continue
-        seen.add(key)
-        match = re.search(r"trade_pnl=([\-0-9]+(?:\.[0-9]+)?)", message, flags=re.IGNORECASE)
-        if not match:
-            continue
+def _load_alert_trades(since: str | None = None) -> list[dict[str, str]]:
+    trades: list[dict[str, str]] = []
+    for path in sorted(Path("logs").glob("trade_alerts_*.csv")):
         try:
-            pnls.append(float(match.group(1)))
-        except (TypeError, ValueError):
+            with path.open(newline="", encoding="utf-8") as handle:
+                for row in csv.DictReader(handle):
+                    timestamp = str(row.get("timestamp") or "")
+                    if since and timestamp < since:
+                        continue
+                    message = str(row.get("message") or "")
+                    if str(row.get("category") or "").upper() != "EXIT":
+                        continue
+                    pnl = _extract_pnl(message)
+                    if pnl is None:
+                        continue
+                    trades.append({
+                        "timestamp": timestamp,
+                        "strategy": str(row.get("strategy") or "Unknown"),
+                        "pnl": str(pnl),
+                        "source": path.name,
+                        "message": message,
+                    })
+        except (OSError, csv.Error):
             continue
-    return pnls
+    return trades
 
 
-trade_pnls = _extract_trade_pnls()
+def _load_analytics_trades() -> pd.DataFrame:
+    reset_at = None
+    if ANALYTICS_RESET_PATH.exists():
+        try:
+            reset_at = ANALYTICS_RESET_PATH.read_text(encoding="utf-8").strip() or None
+        except OSError:
+            reset_at = None
+
+    if not ANALYTICS_TRADES_PATH.exists():
+        rows = _load_alert_trades(since=reset_at)
+        ANALYTICS_TRADES_PATH.parent.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame(rows, columns=ANALYTICS_COLUMNS).to_csv(ANALYTICS_TRADES_PATH, index=False)
+    try:
+        trades = pd.read_csv(ANALYTICS_TRADES_PATH)
+    except (OSError, pd.errors.EmptyDataError):
+        return pd.DataFrame(columns=ANALYTICS_COLUMNS)
+    for column in ANALYTICS_COLUMNS:
+        if column not in trades:
+            trades[column] = ""
+    trades["pnl"] = pd.to_numeric(trades["pnl"], errors="coerce")
+    trades = trades.dropna(subset=["pnl"])
+
+    known_keys = set(zip(trades["timestamp"], trades["message"]))
+    new_rows = [
+        row for row in _load_alert_trades(since=reset_at)
+        if (row["timestamp"], row["message"]) not in known_keys
+    ]
+    if new_rows:
+        trades = pd.concat([trades, pd.DataFrame(new_rows, columns=ANALYTICS_COLUMNS)], ignore_index=True)
+        trades.to_csv(ANALYTICS_TRADES_PATH, index=False)
+    return trades.sort_values("timestamp")
+
+
+analytics_trades = _load_analytics_trades()
+trade_pnls = analytics_trades["pnl"].astype(float).tolist()
+equity_curve: list[dict[str, object]] = []
+running_pnl = 0.0
+for _, trade in analytics_trades.iterrows():
+    running_pnl += float(trade["pnl"])
+    equity_curve.append({"datetime": trade["timestamp"], "total_pnl": running_pnl})
 completed_trades = len(trade_pnls)
 gross_profit = sum(p for p in trade_pnls if p > 0)
 gross_loss_abs = abs(sum(p for p in trade_pnls if p < 0))
@@ -97,6 +130,24 @@ factor_delta = (
     if completed_trades
     else "No completed trades"
 )
+
+toolbar_left, toolbar_download, toolbar_reset = st.columns([5, 1, 1])
+with toolbar_download:
+    st.download_button(
+        "Download CSV",
+        data=analytics_trades[ANALYTICS_COLUMNS].to_csv(index=False),
+        file_name="analytics_trades.csv",
+        mime="text/csv",
+        use_container_width=True,
+    )
+with toolbar_reset:
+    if st.button("Reset data", use_container_width=True):
+        pd.DataFrame(columns=ANALYTICS_COLUMNS).to_csv(ANALYTICS_TRADES_PATH, index=False)
+        ANALYTICS_RESET_PATH.write_text(
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            encoding="utf-8",
+        )
+        st.rerun()
 
 
 def _max_streak(values: list[float], winning: bool) -> int:
@@ -148,36 +199,17 @@ def _strategy_tracking_df() -> pd.DataFrame:
     active_strategy = str(source_params.get("active_strategy", "HD Strategy"))
 
     strategy_enabled = st.session_state.get("strategy_enabled", {})
-    strategy_list = [str(name) for name in strategy_enabled.keys()] or [active_strategy]
+    strategy_list = [str(name) for name in strategy_enabled.keys()]
+    strategy_list.extend(str(name) for name in analytics_trades["strategy"].dropna().unique())
     if active_strategy not in strategy_list:
         strategy_list.append(active_strategy)
 
-    entry_alerts = [
-        row for row in persisted_alerts
-        if str(row.get("category") or "").upper() == "ENTRY"
-    ]
-    if engine is not None:
-        entry_alerts.extend(
-            {"category": str(a.category), "message": str(a.message)}
-            for a in engine.alerts
-            if str(a.category).upper() == "ENTRY"
-        )
-    entry_alerts = list({str(row.get("message") or "") for row in entry_alerts})
-
-    triggers_for_active = len(entry_alerts)
-    wins_for_active = sum(1 for pnl in trade_pnls if pnl > 0)
-    yield_for_active = float(sum(trade_pnls))
-
     rows: list[dict] = []
     for strategy_name in strategy_list:
-        if strategy_name == active_strategy:
-            triggers = triggers_for_active
-            strat_yield = yield_for_active
-            wins = wins_for_active
-        else:
-            triggers = 0
-            strat_yield = 0.0
-            wins = 0
+        strategy_trades = analytics_trades[analytics_trades["strategy"] == strategy_name]
+        triggers = len(strategy_trades)
+        strat_yield = float(strategy_trades["pnl"].sum()) if triggers else 0.0
+        wins = int((strategy_trades["pnl"] > 0).sum())
 
         accuracy = (wins / triggers * 100.0) if triggers else 0.0
         rows.append(

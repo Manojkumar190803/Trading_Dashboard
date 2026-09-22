@@ -9,6 +9,7 @@ import threading
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
@@ -19,6 +20,12 @@ from core.models import PendingEntry, RiskConfig, Signal, StrategyAlert, Strateg
 from strategies.base import SignalProvider
 
 logger = logging.getLogger("core.runner")
+
+
+def _reset_signal_state(engine: BaseStrategyEngine, side_state) -> None:
+    """Reset provider-owned setup state when the engine has one."""
+    if hasattr(side_state, "setup_active"):
+        engine.signal_provider.reset_after_entry(side_state)
 
 
 def _atm_lock_path(trading_day: date, script: str) -> Path:
@@ -108,7 +115,7 @@ def _persist_candle_monitoring(
     timeframe_minutes: int,
     ema21: object = None,
 ) -> None:
-    """Persist one closed spot candle for the dashboard's background feed."""
+    """Persist one closed option candle for the dashboard's background feed."""
     candle_time = pd.to_datetime(candle.get("datetime"), errors="coerce")
     if pd.isna(candle_time):
         return
@@ -383,7 +390,7 @@ def _load_persisted_trade_alerts(
                 if row.get("strategy") == engine.strategy_name
                 and row.get("category") in {
                     "SIGNAL", "PENDING_ENTRY", "ENTRY", "EXIT", "TARGET", "SL",
-                    "ORDER", "RISK", "REJECT", "FAILED", "ERROR", "UNCERTAIN_ENTRY",
+                    "CANCEL", "ORDER", "RISK", "REJECT", "FAILED", "ERROR", "UNCERTAIN_ENTRY",
                 }
             ]
     except (OSError, ValueError) as exc:
@@ -417,6 +424,137 @@ def _restore_open_positions(engine: BaseStrategyEngine, broker: OpenAlgoBroker, 
     except (OSError, ValueError) as exc:
         logger.warning("could not restore persisted positions: %s", exc)
         return
+
+    # A timed-out submission may have been accepted by the broker. Reconcile
+    # matching open BUY orders before deciding that the submission failed.
+    uncertain_details: dict[str, tuple[str, int, float, float, datetime]] = {}
+    uncertain_symbols = {
+        symbol
+        for alert in alerts
+        if alert.get("category") == "UNCERTAIN_ENTRY"
+        for symbol in re.findall(
+            r"\b[A-Z]+\d{2}[A-Z]{3}\d{2}\d+(?:CE|PE)\b",
+            str(alert.get("message") or ""),
+        )
+    }
+    uncertain_pattern = re.compile(
+        r"Uncertain (CE|PE) (\S+) qty=(\d+) trigger=([\d.]+) SL=([\d.]+)"
+    )
+    for alert in alerts:
+        if alert.get("category") != "UNCERTAIN_ENTRY":
+            continue
+        match = uncertain_pattern.search(str(alert.get("message") or ""))
+        if match is None:
+            continue
+        side, symbol, quantity, trigger, stop = match.groups()
+        try:
+            alert_time = datetime.fromisoformat(str(alert["timestamp"]))
+            uncertain_details[symbol] = (
+                side,
+                int(quantity),
+                float(trigger),
+                float(stop),
+                alert_time,
+            )
+        except (KeyError, TypeError, ValueError):
+            continue
+    stale_uncertain_symbols: set[str] = set()
+    for symbol, details in uncertain_details.items():
+        _, _, _, _, uncertain_at = details
+        entry_times = [
+            datetime.fromisoformat(str(alert["timestamp"]))
+            for alert in alerts
+            if alert.get("category") == "ENTRY"
+            and symbol in str(alert.get("message") or "")
+            and str(alert.get("timestamp") or "")
+        ]
+        exit_times = [
+            datetime.fromisoformat(str(alert["timestamp"]))
+            for alert in alerts
+            if alert.get("category") == "EXIT"
+            and symbol in str(alert.get("message") or "")
+            and str(alert.get("timestamp") or "")
+        ]
+        if entry_times and exit_times and max(exit_times) > max(entry_times) > uncertain_at:
+            stale_uncertain_symbols.add(symbol)
+    if uncertain_symbols:
+        adopted_symbols: set[str] = set()
+        if open_orders is not None:
+            for order in open_orders:
+                symbol = str(order.get("symbol") or "")
+                action = str(order.get("action") or order.get("side") or "").upper()
+                order_id = str(order.get("orderid") or order.get("order_id") or "")
+                details = uncertain_details.get(symbol)
+                if symbol not in uncertain_symbols or action != "BUY" or not order_id or details is None:
+                    continue
+                if symbol in stale_uncertain_symbols:
+                    try:
+                        broker.cancel_order(order_id)
+                    except Exception as exc:
+                        logger.warning(
+                            "could not cancel stale uncertain entry %s: %s",
+                            order_id,
+                            exc,
+                        )
+                    engine._record_alert(
+                        datetime.now(), "CANCEL",
+                        f"Cancelled stale uncertain BUY order for {symbol} order_id={order_id}",
+                    )
+                    continue
+                side, alert_quantity, alert_trigger, alert_stop, created_at = details
+                side_state = engine._side_state(side)
+                if side_state.option_symbol != symbol or side_state.position is not None:
+                    continue
+                quantity = int(float(order.get("quantity") or order.get("qty") or alert_quantity))
+                trigger = float(
+                    order.get("trigger_price")
+                    or order.get("trigger")
+                    or order.get("price")
+                    or alert_trigger
+                )
+                side_state.pending_entry = PendingEntry(
+                    signal=Signal.BUY_CE if side == "CE" else Signal.BUY_PE,
+                    created_at=created_at,
+                    option_symbol=symbol,
+                    quantity=quantity,
+                    option_trigger_level=trigger,
+                    option_stop_level=alert_stop,
+                    trigger_candle_high=alert_trigger,
+                    trigger_candle_low=alert_stop,
+                    order_id=order_id,
+                )
+                side_state.order_submission_uncertain = False
+                adopted_symbols.add(symbol)
+                engine._record_alert(
+                    datetime.now(), "PENDING_ENTRY",
+                    f"Reconciled timed-out BUY order for {symbol} order_id={order_id}",
+                )
+        broker_symbols = {
+            str(position.get("symbol") or "")
+            for position in broker_positions
+            if int(float(position.get("quantity") or 0)) > 0
+        }
+        for symbol in sorted(uncertain_symbols - adopted_symbols - broker_symbols):
+            already_cleared = any(
+                alert.category == "CANCEL" and symbol in alert.message
+                for alert in engine.alerts
+            )
+            try:
+                _, _, _, side = _parse_option_symbol(symbol)
+            except ValueError:
+                side = None
+            if side is not None:
+                side_state = engine._side_state(side)
+                if side_state.option_symbol == symbol:
+                    side_state.order_submission_uncertain = False
+                    side_state.pending_entry = None
+                    _reset_signal_state(engine, side_state)
+            if already_cleared:
+                continue
+            engine._record_alert(
+                datetime.now(), "CANCEL",
+                f"Cleared stale uncertain entry state for {symbol}; no broker order or position",
+            )
 
     entry_pattern = re.compile(
         r"(?:Entered|Uncertain) (CE|PE) (\S+)(?: @ ([\d.]+),)? qty=(\d+),?\s+"
@@ -497,8 +635,6 @@ def _restore_open_positions(engine: BaseStrategyEngine, broker: OpenAlgoBroker, 
             engine.total_entries,
             sum(row.get("category") in ("ENTRY", "UNCERTAIN_ENTRY") for row in alerts),
         )
-        if not matching:
-            engine.total_entries += 1
         if open_orders is not None and not already_restored:
             protective_orders = [
                 order for order in open_orders
@@ -617,6 +753,62 @@ def _clear_positions_missing_from_broker(
                         position.protective_stop_order_id, exc,
                     )
             side_state.position = None
+            _reset_signal_state(engine, side_state)
+
+
+def _reconcile_pending_entry_fills(
+    engines: list[BaseStrategyEngine],
+    broker: OpenAlgoBroker,
+    trading_day: date,
+) -> None:
+    """Promote broker-filled pending entries before the next tick is handled."""
+    has_pending_entries = any(
+        engine._side_state(side).pending_entry is not None
+        for engine in engines
+        for side in ("CE", "PE")
+    )
+    if not has_pending_entries:
+        return
+
+    for engine in engines:
+        for side in ("CE", "PE"):
+            pending = engine._side_state(side).pending_entry
+            order_id = getattr(pending, "order_id", None) if pending is not None else None
+            if pending is None or not order_id:
+                continue
+            try:
+                status = broker.get_order_status(order_id)
+            except Exception as exc:
+                logger.warning(
+                    "pending order status failed for %s %s: %s",
+                    side, order_id, exc,
+                )
+                continue
+            order_status = str(
+                status.get("order_status") or status.get("status") or ""
+            ).lower()
+            if order_status in {"cancelled", "rejected", "failed"}:
+                engine._record_alert(
+                    datetime.now(), "CANCEL",
+                    f"{side} entry order {order_status} before tick activation",
+                )
+                side_state = engine._side_state(side)
+                side_state.pending_entry = None
+                _reset_signal_state(engine, side_state)
+                continue
+            if order_status not in {"complete", "filled", "executed"}:
+                continue
+
+            # Reuse broker position reconciliation so the local Position and
+            # protective stop are established before the first live tick.
+            _restore_open_positions(engine, broker, trading_day)
+            if engine._side_state(side).position is not None:
+                engine._side_state(side).pending_entry = None
+                engine._record_alert(
+                    datetime.now(), "ENTRY",
+                    f"{side} entry fill confirmed; tick monitoring activated for "
+                    f"{pending.option_symbol}",
+                )
 
 
 def _seconds_until_market_open(cfg: StrategyConfig, now: Optional[datetime] = None) -> float:
@@ -645,7 +837,10 @@ def _normalize_history_df(df: pd.DataFrame) -> pd.DataFrame:
     if "datetime" not in out.columns:
         raise RuntimeError(f"history frame missing datetime column: {list(out.columns)}")
 
-    out["datetime"] = pd.to_datetime(out["datetime"]).dt.tz_localize(None)
+    timestamps = pd.to_datetime(out["datetime"])
+    if timestamps.dt.tz is not None:
+        timestamps = timestamps.dt.tz_convert(ZoneInfo("Asia/Kolkata"))
+    out["datetime"] = timestamps.dt.tz_localize(None)
     required = {"datetime", "open", "high", "low", "close", "volume"}
     missing = required - set(out.columns)
     if missing:
@@ -828,26 +1023,24 @@ class LiveFeedRunner:
             return
 
         last_ts = self._last_bar_time.get(side)
-        if side not in self._startup_baselined and last_ts is None:
-            latest_ts = closed["datetime"].iloc[-1]
+        if side not in self._startup_baselined:
             _cancel_stale_ema21_pending(self.engine, self.broker, side, closed)
-            self._last_bar_time[side] = (
-                latest_ts.to_pydatetime() if hasattr(latest_ts, "to_pydatetime") else latest_ts
-            )
+            if last_ts is None:
+                warmup = closed.iloc[:-1]
+            else:
+                warmup = closed[closed["datetime"] <= last_ts]
+            for i, (_, row) in enumerate(warmup.iterrows()):
+                pos_in_full = data.index.get_loc(row.name)
+                prev_row = data.iloc[pos_in_full - 1] if pos_in_full > 0 else None
+                self.engine.process_option_candle(side, row, prev_row, allow_entries=False)
             self._startup_baselined.add(side)
-            _save_runner_checkpoint(
-                self._checkpoint_day,
-                self.cfg.option_index_symbol,
-                self.engine.strategy_name,
-                self._last_bar_time,
-            )
             logger.info(
-                "baselined %s at %s; historical bars will not create orders, "
-                "new live signals remain enabled",
+                "warmed %s through %s without entries; processing new closed bars normally",
                 side,
-                self._last_bar_time[side],
+                warmup["datetime"].iloc[-1] if not warmup.empty else "start of session",
             )
-            return
+            if last_ts is None:
+                closed = closed.iloc[-1:]
         if last_ts is not None:
             closed = closed[closed["datetime"] > last_ts]
             if closed.empty:
@@ -864,6 +1057,12 @@ class LiveFeedRunner:
             if pos_in_full > 0:
                 prev_row = data.iloc[pos_in_full - 1]
             self.engine.process_option_candle(side, row, prev_row)
+            _persist_candle_monitoring(
+                str(self.engine._side_state(side).option_symbol or side),
+                row,
+                self.cfg.timeframe_minutes,
+                row.get("ema21"),
+            )
             _persist_setup_status_monitoring(
                 self.engine,
                 side,
@@ -910,13 +1109,7 @@ class LiveFeedRunner:
                 else:
                     latest = None
                     candle_time = None
-                if latest is not None and candle_time.to_pydatetime() != self._last_monitoring_candle:
-                    _persist_candle_monitoring(
-                        self.cfg.spot_symbol,
-                        latest,
-                        self.cfg.timeframe_minutes,
-                        latest.get("ema21"),
-                    )
+                if latest is not None:
                     self._last_monitoring_candle = candle_time.to_pydatetime()
         except Exception as exc:
             logger.warning("spot monitoring history failed: %s", exc)
@@ -940,14 +1133,20 @@ class LiveFeedRunner:
                 continue
             self._process_new_bars_for_side(side, data)
 
-    def _wait_with_countdown(self, seconds: float, label: str = "Next candle") -> bool:
+    def _wait_with_countdown(
+        self,
+        seconds: float,
+        label: str = "Next candle",
+        poll_active_ticks: bool = True,
+    ) -> bool:
         import sys
         deadline = datetime.now() + timedelta(seconds=seconds)
         while not self._stop.is_set():
             remaining = (deadline - datetime.now()).total_seconds()
             if remaining <= 0:
                 break
-            self._poll_active_ticks()
+            if poll_active_ticks:
+                self._poll_active_ticks()
             mins, secs = divmod(int(remaining), 60)
             sys.stdout.write(f"\r⏳ {label} in {mins:02d}:{secs:02d} ")
             sys.stdout.flush()
@@ -960,6 +1159,12 @@ class LiveFeedRunner:
         return False
 
     def _poll_active_ticks(self) -> None:
+        if any(
+            getattr(self.engine._side_state(side), "order_submission_uncertain", False)
+            for side in ("CE", "PE")
+        ):
+            _restore_open_positions(self.engine, self.broker, datetime.now().date())
+        _reconcile_pending_entry_fills([self.engine], self.broker, datetime.now().date())
         _clear_positions_missing_from_broker([self.engine], self.broker)
         active_symbols: dict[str, list[tuple[str, object]]] = {}
         for side in ("CE", "PE"):
@@ -980,9 +1185,15 @@ class LiveFeedRunner:
                 continue
             if ltp > 0:
                 tick_time = datetime.now()
-                labels = ",".join(side for side, _ in subscriptions)
-                print(f"[TICK] {tick_time} side={labels} symbol={symbol} ltp={float(ltp):.2f}")
-                _persist_tick_monitoring(symbol, float(ltp), tick_time, labels)
+                active_subscriptions = [
+                    (side, side_state)
+                    for side, side_state in subscriptions
+                    if side_state.position is not None
+                ]
+                if active_subscriptions:
+                    labels = ",".join(side for side, _ in active_subscriptions)
+                    print(f"[TICK] {tick_time} side={labels} symbol={symbol} ltp={float(ltp):.2f}")
+                    _persist_tick_monitoring(symbol, float(ltp), tick_time, labels)
                 for side, side_state in subscriptions:
                     if side_state.position is not None:
                         self.engine.process_tick(side, float(ltp), tick_time)
@@ -1006,7 +1217,7 @@ class LiveFeedRunner:
             )
             while not self._is_market_open() and not self._stop.is_set():
                 wait = _seconds_until_market_open(self.cfg)
-                if self._wait_with_countdown(wait, "Market opens"):
+                if self._wait_with_countdown(wait, "Market opens", poll_active_ticks=False):
                     break
 
         while not self._stop.is_set():
@@ -1014,7 +1225,7 @@ class LiveFeedRunner:
             if not self._is_market_open():
                 sleep_for = _seconds_until_market_open(self.cfg)
                 logger.debug("market closed — sleeping %.1fs", sleep_for)
-                if self._wait_with_countdown(sleep_for, "Market opens"):
+                if self._wait_with_countdown(sleep_for, "Market opens", poll_active_ticks=False):
                     break
                 continue
             sleep_for = self._seconds_until_next_boundary()
@@ -1281,27 +1492,26 @@ class MultiEngineLiveFeedRunner:
             return
 
         last_ts = self._last_bar_time.get(side)
-        if side not in self._startup_baselined and last_ts is None:
-            latest_ts = closed["datetime"].iloc[-1]
+        if side not in self._startup_baselined:
             for _, engine in self.engines:
                 _cancel_stale_ema21_pending(engine, self.broker, side, closed)
-            self._last_bar_time[side] = (
-                latest_ts.to_pydatetime() if hasattr(latest_ts, "to_pydatetime") else latest_ts
-            )
+            if last_ts is None:
+                warmup = closed.iloc[:-1]
+            else:
+                warmup = closed[closed["datetime"] <= last_ts]
+            for _, row in warmup.iterrows():
+                pos_in_full = data.index.get_loc(row.name)
+                prev_row = data.iloc[pos_in_full - 1] if pos_in_full > 0 else None
+                for _, engine in self.engines:
+                    engine.process_option_candle(side, row, prev_row, allow_entries=False)
             self._startup_baselined.add(side)
-            _save_runner_checkpoint(
-                self._checkpoint_day,
-                self.cfg.option_index_symbol,
-                self._checkpoint_strategy,
-                self._last_bar_time,
-            )
             logger.info(
-                "baselined %s at %s; historical bars will not create orders, "
-                "new live signals remain enabled",
+                "warmed %s through %s without entries; processing new closed bars normally",
                 side,
-                self._last_bar_time[side],
+                warmup["datetime"].iloc[-1] if not warmup.empty else "start of session",
             )
-            return
+            if last_ts is None:
+                closed = closed.iloc[-1:]
         if last_ts is not None:
             closed = closed[closed["datetime"] > last_ts]
             if closed.empty:
@@ -1360,14 +1570,20 @@ class MultiEngineLiveFeedRunner:
                 continue
             self._process_new_bars_for_side(side, data)
 
-    def _wait_with_countdown(self, seconds: float, label: str = "Next candle") -> bool:
+    def _wait_with_countdown(
+        self,
+        seconds: float,
+        label: str = "Next candle",
+        poll_active_ticks: bool = True,
+    ) -> bool:
         import sys
         deadline = datetime.now() + timedelta(seconds=seconds)
         while not self._stop.is_set():
             remaining = (deadline - datetime.now()).total_seconds()
             if remaining <= 0:
                 break
-            self._poll_active_ticks()
+            if poll_active_ticks:
+                self._poll_active_ticks()
             mins, secs = divmod(int(remaining), 60)
             sys.stdout.write(f"\r⏳ {label} in {mins:02d}:{secs:02d} ")
             sys.stdout.flush()
@@ -1380,6 +1596,11 @@ class MultiEngineLiveFeedRunner:
         return False
 
     def _poll_active_ticks(self) -> None:
+        _reconcile_pending_entry_fills(
+            [engine for _, engine in self.engines],
+            self.broker,
+            datetime.now().date(),
+        )
         _clear_positions_missing_from_broker([engine for _, engine in self.engines], self.broker)
         now = datetime.now()
         active_symbols: dict[str, list[tuple[BaseStrategyEngine, str, object]]] = {}
@@ -1401,8 +1622,14 @@ class MultiEngineLiveFeedRunner:
                 logger.warning("tick quote failed for %s: %s", symbol, exc)
                 continue
             if ltp > 0:
-                print(f"[TICK] {now} symbol={symbol} ltp={float(ltp):.2f}")
-                _persist_tick_monitoring(symbol, float(ltp), now)
+                active_subscriptions = [
+                    (active_engine, active_side, side_state)
+                    for active_engine, active_side, side_state in subscriptions
+                    if side_state.position is not None
+                ]
+                if active_subscriptions:
+                    print(f"[TICK] {now} symbol={symbol} ltp={float(ltp):.2f}")
+                    _persist_tick_monitoring(symbol, float(ltp), now)
                 for active_engine, active_side, side_state in subscriptions:
                     if side_state.position is not None:
                         active_engine.process_tick(active_side, float(ltp), now)
@@ -1428,7 +1655,7 @@ class MultiEngineLiveFeedRunner:
             )
             while not self._is_market_open() and not self._stop.is_set():
                 wait = _seconds_until_market_open(self.cfg)
-                if self._wait_with_countdown(wait, "Market opens"):
+                if self._wait_with_countdown(wait, "Market opens", poll_active_ticks=False):
                     break
 
         while not self._stop.is_set():
@@ -1436,7 +1663,7 @@ class MultiEngineLiveFeedRunner:
             if not self._is_market_open():
                 sleep_for = _seconds_until_market_open(self.cfg)
                 logger.debug("market closed — sleeping %.1fs", sleep_for)
-                if self._wait_with_countdown(sleep_for, "Market opens"):
+                if self._wait_with_countdown(sleep_for, "Market opens", poll_active_ticks=False):
                     break
                 continue
 
@@ -1679,19 +1906,61 @@ def run_historical_replay(
         ce_day = _warmup_and_slice(ce_raw, day, cfg)
         pe_day = _warmup_and_slice(pe_raw, day, cfg)
 
-        ce_events = [("CE", row) for _, row in ce_day.iterrows()]
-        pe_events = [("PE", row) for _, row in pe_day.iterrows()]
-        spot_events = [("SPOT", row) for _, row in spot_day.iterrows()]
-        events = ce_events + pe_events + spot_events
-        events.sort(key=lambda ev: ev[1]["datetime"])
+        try:
+            ce_fill_raw = _fetch_history_df(
+                history_broker,
+                ce_sym,
+                cfg.exchange_options,
+                "1m",
+                day_str,
+                day_str,
+            )
+            pe_fill_raw = _fetch_history_df(
+                history_broker,
+                pe_sym,
+                cfg.exchange_options,
+                "1m",
+                day_str,
+                day_str,
+            )
+        except Exception as exc:
+            logger.warning(
+                "replay %s: 1m fill history fetch failed (%s); using %sm bars",
+                day,
+                exc,
+                cfg.timeframe_minutes,
+            )
+            ce_fill_raw = pd.DataFrame()
+            pe_fill_raw = pd.DataFrame()
+
+        ce_fill_day = _slice_session(ce_fill_raw, day, cfg)
+        pe_fill_day = _slice_session(pe_fill_raw, day, cfg)
+
+        ce_events = [("CE", row, 0) for _, row in ce_day.iterrows()]
+        pe_events = [("PE", row, 0) for _, row in pe_day.iterrows()]
+        ce_fill_events = [("CE_FILL", row, 1) for _, row in ce_fill_day.iterrows()]
+        pe_fill_events = [("PE_FILL", row, 1) for _, row in pe_fill_day.iterrows()]
+        spot_events = [("SPOT", row, 0) for _, row in spot_day.iterrows()]
+        events = ce_events + pe_events + ce_fill_events + pe_fill_events + spot_events
+        events.sort(key=lambda ev: (ev[1]["datetime"], ev[2]))
 
         prev_by_side: dict[str, Optional[pd.Series]] = {"CE": None, "PE": None}
-        for side, row in events:
-            if side == "SPOT":
+        for event_type, row, _ in events:
+            if event_type == "SPOT":
                 broker.set_current_bar(cfg.spot_symbol, row)
                 continue
+            side = event_type.split("_", 1)[0]
             symbol = ce_sym if side == "CE" else pe_sym
             broker.set_current_bar(symbol, row)
+            if event_type.endswith("_FILL"):
+                pending = engine._side_state(side).pending_entry
+                if pending is not None and row["datetime"] > pending.created_at:
+                    engine.try_fill_pending_entry(side, engine._side_state(side), row["datetime"], row)
+                side_state = engine._side_state(side)
+                if side_state.position is not None:
+                    engine.last_processed_candle_time = row["datetime"]
+                    engine.monitor_open_position(side_state, row)
+                continue
             engine.process_option_candle(side, row, prev_by_side[side])
             prev_by_side[side] = row
             total_bars += 1
@@ -1717,12 +1986,31 @@ def run_historical_replay(
 
     entries = [a for a in engine.alerts if a.category == "ENTRY"]
     exits = [a for a in engine.alerts if a.category == "EXIT"]
+    order_placed = [
+        a for a in engine.alerts
+        if a.category in {"PENDING_ENTRY", "UNCERTAIN_ENTRY"}
+    ]
+    order_outcomes = [
+        a for a in engine.alerts
+        if a.category in {"CANCEL", "RISK", "REJECT", "FAILED", "ERROR"}
+        and any(
+            term in a.message.lower()
+            for term in ("entry", "order", "trade skipped", "trade cancelled")
+        )
+    ]
+    pending_orders = [
+        (side, side_state.pending_entry)
+        for side, side_state in (("CE", engine.state.ce), ("PE", engine.state.pe))
+        if side_state.pending_entry is not None
+    ]
     management_events = [a for a in engine.alerts if a.category in {"TARGET", "TSL"}]
 
     print("\n─── Trade Log ─────────────────────────────────────────────")
     trade_events = sorted(
         [(evt.timestamp, "ENTRY", i + 1, evt) for i, evt in enumerate(entries)]
         + [(evt.timestamp, "EXIT", i + 1, evt) for i, evt in enumerate(exits)]
+        + [(evt.timestamp, "ORDER PLACED", None, evt) for evt in order_placed]
+        + [(evt.timestamp, evt.category, None, evt) for evt in order_outcomes]
         + [(evt.timestamp, evt.category, None, evt) for evt in management_events],
         key=lambda event: event[0],
     )
@@ -1741,9 +2029,25 @@ def run_historical_replay(
                 display_type = "HARD SL"
         print(f"  [{ts}] {display_type}{number}  {msg}")
 
+    for side, pending in pending_orders:
+        print(
+            f"  [{pending.created_at.strftime('%H:%M:%S')}] PENDING ORDER  "
+            f"{side} {pending.option_symbol} qty={pending.quantity} "
+            f"trigger={pending.option_trigger_level:.2f} "
+            f"SL={pending.option_stop_level:.2f} | "
+            "not executed: replay ended before trigger/fill"
+        )
+
     print("\n─── Summary ───────────────────────────────────────────────")
     print(f"Total entries     : {len(entries)}")
     print(f"Total exits       : {len(exits)}")
+    print(f"Orders placed     : {len(order_placed)}")
+    print(f"Unexecuted orders : {len(order_placed) - len(entries)}")
+    print(f"Pending at end    : {len(pending_orders)}")
+    if order_outcomes:
+        print("Non-execution reasons:")
+        for event in order_outcomes:
+            print(f"  - [{event.timestamp.strftime('%H:%M:%S')}] {event.message}")
     print("=" * 72)
 
     if verbose_csv_path:

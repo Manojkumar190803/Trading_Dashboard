@@ -283,7 +283,7 @@ def _render_live_order_rows(df: pd.DataFrame, source_params: dict[str, object]) 
 
 def _load_persisted_order_events() -> pd.DataFrame:
     rows: list[dict[str, object]] = []
-    categories = {"ORDER", "ENTRY", "EXIT", "SL", "REJECT", "ERROR", "UNCERTAIN_ENTRY"}
+    categories = {"ORDER", "ENTRY", "EXIT", "SL", "REJECT", "ERROR"}
     for path in sorted(LOGS_DIR.glob("trade_alerts_*.csv")):
         try:
             persisted = pd.read_csv(path)

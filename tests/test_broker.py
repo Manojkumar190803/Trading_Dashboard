@@ -132,6 +132,26 @@ def test_openalgo_broker_get_ltp_paths(fake_openalgo):
     assert broker.get_ltp("NIFTY") == 0.0
 
 
+def test_openalgo_broker_latches_positionbook_auth_failure(fake_openalgo, caplog):
+    broker = OpenAlgoBroker(api_key="k", host="h")
+    client = fake_openalgo["client"]
+    calls = 0
+
+    def _positionbook():
+        nonlocal calls
+        calls += 1
+        return {"status": "error", "message": 'HTTP 403: {"message":"Invalid openalgo apikey"}'}
+
+    client.positionbook = _positionbook
+    with caplog.at_level("ERROR"):
+        assert broker.get_position_book() == []
+        assert broker.get_position_book() == []
+
+    assert calls == 1
+    assert broker.position_book_available is False
+    assert caplog.text.count("positionbook authorization failed") == 1
+
+
 def test_openalgo_broker_live_order_and_extract_paths(fake_openalgo):
     broker = OpenAlgoBroker(api_key="k", host="h", dry_run=False)
     client = fake_openalgo["client"]
@@ -238,13 +258,21 @@ def test_discover_index_profile_alias_banknifty(fake_openalgo):
     assert profile["weekly_expiry_weekday"] == 3
 
 
-def test_discover_index_profile_fails_when_payload_not_found(fake_openalgo):
+def test_discover_index_profile_uses_known_defaults_when_payload_not_found(fake_openalgo, caplog):
     broker = OpenAlgoBroker(api_key="k", host="h", dry_run=True)
     client = fake_openalgo["client"]
     client.optionchain_response = {"status": "error", "message": "missing"}
 
-    with pytest.raises(RuntimeError, match="Could not discover instrument metadata"):
-        broker.discover_index_profile("NIFTY")
+    with caplog.at_level("WARNING"):
+        profile = broker.discover_index_profile("NIFTY")
+
+    assert profile["spot_symbol"] == "NIFTY"
+    assert profile["option_index_symbol"] == "NIFTY"
+    assert profile["exchange_spot"] == "NSE_INDEX"
+    assert profile["exchange_options"] == "NFO"
+    assert profile["strike_step"] == 50
+    assert profile["option_lot_size"] == 65
+    assert "metadata discovery unavailable" in caplog.text
 
 
 def test_discover_index_profile_falls_back_when_strike_missing_for_known_script(fake_openalgo):
@@ -441,3 +469,15 @@ def test_historical_replay_broker_paths():
     assert broker.get_ltp("SYM") == 123.4
     assert broker.place_market_order("SYM", OrderSide.BUY, 2) == "BT-MKT-SYM-BUY-2"
     assert broker.place_stop_limit_order("SYM", OrderSide.SELL, 3, 10.0, 9.5) == "BT-SL-L-SYM-SELL-3"
+
+    broker.set_current_bar(
+        "SYM",
+        pd.Series({"open": 145.8, "high": 153.0, "low": 145.8, "close": 151.95}),
+    )
+    assert broker.simulate_stop_limit_fill("SYM", 148.35, 148.85) == 148.35
+
+    broker.set_current_bar(
+        "SYM",
+        pd.Series({"open": 149.0, "high": 153.0, "low": 149.0, "close": 151.95}),
+    )
+    assert broker.simulate_stop_limit_fill("SYM", 148.35, 148.85) is None

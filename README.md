@@ -220,8 +220,16 @@ docker compose down
 From the project root, run:
 
 ```bash
+# Run in the foreground
 python3 -m streamlit run frontend/strategy_dashboard.py
+
+# Or run in the background with start/stop/status support
+./run_dashboard.sh start
+./run_dashboard.sh status
+./run_dashboard.sh stop
 ```
+
+The background launcher writes its PID to `logs/dashboard.pid` and Streamlit output to `logs/dashboard.log`. Set `STREAMLIT_SERVER_PORT` to use a different port. For a containerized background dashboard, use `docker compose up -d --build --force-recreate streamlit_interface` instead.
 
 The dashboard runs in a separate image built from `Dockerfile.streamlit`. It is independent of the strategy containers, so strategy start/stop controls can be added to the interface later. The Docker service is named `streamlit_interface` because Docker names cannot contain spaces; its display label is `Streamlit interface`.
 

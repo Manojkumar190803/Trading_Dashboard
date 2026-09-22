@@ -47,6 +47,20 @@ class CancelTrackingBroker(ConsoleBroker):
         return True
 
 
+class OpenOrderBroker(PositionBookBroker):
+    def __init__(self, orders):
+        super().__init__([])
+        self.orders = orders
+        self.cancelled = []
+
+    def get_open_orders(self):
+        return self.orders
+
+    def cancel_order(self, order_id):
+        self.cancelled.append(order_id)
+        return True
+
+
 def _engine_with_position():
     engine = BaseStrategyEngine(
         cfg=StrategyConfig(),
@@ -120,6 +134,80 @@ def test_startup_cancels_pending_order_on_any_later_ema21_failure():
     assert runner._cancel_stale_ema21_pending(engine, broker, "PE", candles)
     assert broker.cancelled == ["stale-order"]
     assert engine.state.pe.pending_entry is None
+
+
+def test_restore_clears_confirmed_flat_uncertain_entry_state(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    alert_path = logs / "trade_alerts_NIFTY_20260908.csv"
+    alert_path.write_text(
+        "timestamp,strategy,category,message\n"
+        "2026-09-08 12:48:00,EMA21SignalProvider,UNCERTAIN_ENTRY,"
+        "Uncertain PE NIFTY15SEP2623700PE qty=130 trigger=128.70 SL=118.30\n",
+        encoding="utf-8",
+    )
+
+    broker = PositionBookBroker([])
+    provider = EMA21SignalProvider()
+    engine = BaseStrategyEngine(
+        StrategyConfig(option_index_symbol="NIFTY"),
+        RiskConfig(),
+        broker,
+        provider,
+    )
+    engine.state.pe = provider.create_side_state()
+    state = engine.state.pe
+    state.option_symbol = "NIFTY15SEP2623700PE"
+    state.order_submission_uncertain = True
+    state.setup_active = True
+
+    runner._restore_open_positions(engine, broker, datetime(2026, 9, 8).date())
+
+    assert state.order_submission_uncertain is False
+    assert state.setup_active is False
+
+
+def test_restore_adopts_open_order_after_timeout_instead_of_cancelling(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    alert_path = logs / "trade_alerts_NIFTY_20260908.csv"
+    alert_path.write_text(
+        "timestamp,strategy,category,message\n"
+        "2026-09-08 12:36:00,EMA21SignalProvider,UNCERTAIN_ENTRY,"
+        "Uncertain CE NIFTY15SEP2623700CE qty=130 trigger=171.75 SL=156.30\n",
+        encoding="utf-8",
+    )
+
+    broker = OpenOrderBroker(
+        [{
+            "symbol": "NIFTY15SEP2623700CE",
+            "action": "BUY",
+            "quantity": 130,
+            "trigger_price": 171.75,
+            "orderid": "broker-order-1",
+        }]
+    )
+    provider = EMA21SignalProvider()
+    engine = BaseStrategyEngine(
+        StrategyConfig(option_index_symbol="NIFTY"),
+        RiskConfig(),
+        broker,
+        provider,
+    )
+    engine.state.ce = provider.create_side_state()
+    state = engine.state.ce
+    state.option_symbol = "NIFTY15SEP2623700CE"
+    state.order_submission_uncertain = True
+
+    runner._restore_open_positions(engine, broker, datetime(2026, 9, 8).date())
+
+    assert state.order_submission_uncertain is False
+    assert state.pending_entry is not None
+    assert state.pending_entry.order_id == "broker-order-1"
+    assert state.pending_entry.quantity == 130
+    assert broker.cancelled == []
 
 
 def test_parse_option_symbol():
@@ -384,3 +472,97 @@ def test_live_tick_poll_includes_pending_entry_symbol():
     live_runner._poll_active_ticks()
 
     assert live_runner.broker.quoted == ["NIFTY01SEP2624250PE"]
+
+
+def test_live_tick_poll_does_not_create_entries_from_setup_ticks(monkeypatch):
+    side_state = SimpleNamespace(
+        position=None,
+        pending_entry=None,
+        setup_active=True,
+        option_symbol="NIFTY01SEP2624250PE",
+    )
+    setup_ticks = []
+    persisted_ticks = []
+    engine = SimpleNamespace(
+        _side_state=lambda side: side_state,
+        process_setup_tick=lambda *args: setup_ticks.append(args),
+    )
+    live_runner = runner.LiveFeedRunner.__new__(runner.LiveFeedRunner)
+    live_runner.engine = engine
+    live_runner.broker = ConsoleBroker(ltp_fallback=116.5)
+    monkeypatch.setattr(runner, "_persist_tick_monitoring", lambda *args: persisted_ticks.append(args))
+
+    live_runner._poll_active_ticks()
+
+    assert setup_ticks == []
+    assert persisted_ticks == []
+
+
+def test_live_tick_poll_keeps_pending_entry_ticks_out_of_active_monitoring(monkeypatch):
+    side_state = SimpleNamespace(
+        position=None,
+        pending_entry=SimpleNamespace(option_symbol="NIFTY01SEP2624250PE"),
+    )
+    persisted_ticks = []
+    engine = SimpleNamespace(
+        _side_state=lambda side: side_state,
+        process_tick=lambda *args: (_ for _ in ()).throw(
+            AssertionError("pending order cannot process risk ticks")
+        ),
+    )
+    live_runner = runner.LiveFeedRunner.__new__(runner.LiveFeedRunner)
+    live_runner.engine = engine
+    live_runner.broker = ConsoleBroker(ltp_fallback=116.5)
+    monkeypatch.setattr(runner, "_persist_tick_monitoring", lambda *args: persisted_ticks.append(args))
+
+    live_runner._poll_active_ticks()
+
+    assert persisted_ticks == []
+
+
+def test_live_tick_poll_activates_monitoring_after_entry_fill():
+    class FilledEntryBroker(ConsoleBroker):
+        requires_position_reconciliation = True
+
+        def get_order_status(self, order_id):
+            return {"order_status": "complete", "orderid": order_id, "average_price": 116.25}
+
+        def get_position_book(self):
+            return [{
+                "symbol": "NIFTY01SEP2624250PE",
+                "quantity": 130,
+                "average_price": 116.25,
+            }]
+
+        def get_open_orders(self):
+            return []
+
+        def get_ltp(self, symbol):
+            return 116.5
+
+    broker = FilledEntryBroker()
+    engine = BaseStrategyEngine(
+        StrategyConfig(), RiskConfig(), broker, EMA21SignalProvider()
+    )
+    engine.state.pe.option_symbol = "NIFTY01SEP2624250PE"
+    engine.state.pe.pending_entry = PendingEntry(
+        signal=Signal.BUY_PE,
+        created_at=datetime(2026, 9, 1, 10, 0),
+        option_symbol="NIFTY01SEP2624250PE",
+        quantity=130,
+        option_trigger_level=116.0,
+        option_stop_level=106.0,
+        trigger_candle_high=116.0,
+        trigger_candle_low=110.0,
+        order_id="ENTRY-1",
+    )
+    live_runner = runner.LiveFeedRunner.__new__(runner.LiveFeedRunner)
+    live_runner.engine = engine
+    live_runner.broker = broker
+
+    live_runner._poll_active_ticks()
+
+    assert engine.state.pe.position is not None
+    assert engine.state.pe.position.current_price == 116.5
+    assert engine.state.pe.pending_entry is None
+    assert any("tick monitoring activated" in alert.message for alert in engine.alerts)

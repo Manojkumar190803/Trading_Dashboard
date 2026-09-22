@@ -244,13 +244,15 @@ class BaseStrategyEngine:
         if len(self.alerts) > 500:
             self.alerts = self.alerts[-500:]
         if self.persist_alerts and category in (
-            "SIGNAL", "PENDING_ENTRY", "ENTRY", "EXIT", "TARGET", "SL",
-            "ORDER", "RISK", "REJECT", "FAILED", "ERROR", "UNCERTAIN_ENTRY",
+            "SIGNAL", "PENDING_ENTRY", "ENTRY", "EXIT", "TARGET", "SL", "CANCEL",
+            "ORDER", "PROTECTIVE_SL", "TSL", "RISK", "REJECT", "FAILED", "ERROR", "UNCERTAIN_ENTRY",
         ):
             self._persist_trade_alert(ts, category, message)
         print(f"[ENGINE][{category}] {message}")
 
     def _sync_shared_sl_count(self, trading_day: date) -> None:
+        if self.broker.is_replay:
+            return
         self.state.sl_hits_today = max(
             self.state.sl_hits_today,
             _read_shared_sl_count(trading_day),
@@ -560,7 +562,28 @@ class BaseStrategyEngine:
             return
 
         exit_ltp = self.broker.get_ltp(pos.option_symbol)
-        self.broker.place_market_order(pos.option_symbol, OrderSide.SELL, qty)
+        self._record_alert(
+            ts,
+            "ORDER",
+            f"{pos.option_type} exit order placed for {pos.option_symbol} "
+            f"qty={qty} reason={reason}",
+        )
+        try:
+            exit_order_id = self.broker.place_market_order(pos.option_symbol, OrderSide.SELL, qty)
+        except Exception as exc:
+            self._record_alert(
+                ts,
+                "ERROR",
+                f"{pos.option_type} exit order failed for {pos.option_symbol} "
+                f"qty={qty}: {exc}",
+            )
+            return
+        self._record_alert(
+            ts,
+            "ORDER",
+            f"{pos.option_type} exit order accepted for {pos.option_symbol} "
+            f"qty={qty} order_id={exit_order_id}",
+        )
 
         pnl_entry_price = self._pnl_entry_price(pos)
         trade_pnl = (exit_ltp - pnl_entry_price) * qty
@@ -581,6 +604,8 @@ class BaseStrategyEngine:
             if pos.protective_stop_order_id:
                 self.broker.cancel_order(pos.protective_stop_order_id)
             side_state.position = None
+            if hasattr(side_state, "setup_active"):
+                self.signal_provider.reset_after_entry(side_state)
         elif pos.protective_stop_order_id and refresh_protection:
             self._refresh_protective_stop(pos.option_type, pos, ts)
 
@@ -634,6 +659,7 @@ class BaseStrategyEngine:
         return {
             "trading_day": self.state.trading_day,
             "atm_locked": self.state.atm_locked,
+            "atm_strike": self.state.atm_strike,
             "ce_symbol": self.state.ce_symbol,
             "pe_symbol": self.state.pe_symbol,
             "sl_hits_today": self.state.sl_hits_today,
@@ -656,6 +682,7 @@ class BaseStrategyEngine:
             ce=self.signal_provider.create_side_state(),
             pe=self.signal_provider.create_side_state(),
         )
+        self.total_entries = 0
         reset_ts = datetime.combine(new_day, self.cfg.market_open)
         print(f"\n{'='*60}")
         print(f"  NEW SESSION: {new_day}  |  Max SL/day: {self.risk.max_sl_per_day}")
@@ -706,6 +733,7 @@ class BaseStrategyEngine:
         pe_symbol = build_option_symbol(self.cfg.option_index_symbol, expiry_code, strike, "PE")
         self.state.ce_symbol = ce_symbol
         self.state.pe_symbol = pe_symbol
+        self.state.atm_strike = strike
         self.state.ce.option_symbol = ce_symbol
         self.state.pe.option_symbol = pe_symbol
         self.state.atm_locked = True
@@ -744,6 +772,55 @@ class BaseStrategyEngine:
             f"{side} pending order {order_id} cancellation failed; keeping it tracked",
         )
         return False
+
+    def _cancel_pending_entry_with_reason(
+        self,
+        side: str,
+        side_state: BaseSideState,
+        ts: datetime,
+        reason: str,
+        order_already_closed: bool = False,
+    ) -> bool:
+        pending = side_state.pending_entry
+        if pending is None:
+            return True
+        if not order_already_closed and not self._cancel_pending_entry_order(side, pending, ts):
+            return False
+        side_state.pending_entry = None
+        self.signal_provider.reset_after_entry(side_state)
+        alert_time = pending.created_at.strftime("%H:%M")
+        self._record_alert(
+            ts,
+            "CANCEL",
+            f"{side} alert at {alert_time}; entry missed: {reason}. "
+            "Pending order cancelled; waiting for next alert candle.",
+        )
+        return True
+
+    def _cancel_uncertain_entry_order(self, side: str, side_state: BaseSideState, ts: datetime) -> bool:
+        if self.broker.is_replay or not side_state.order_submission_uncertain:
+            return True
+        try:
+            open_orders = self.broker.get_open_orders()
+        except Exception as exc:
+            self._record_alert(ts, "RISK", f"{side} uncertain entry cancellation check failed: {exc}")
+            return False
+        if open_orders is None:
+            self._record_alert(ts, "RISK", f"{side} uncertain entry cancellation check unavailable")
+            return False
+        matching_orders = [
+            order for order in open_orders
+            if str(order.get("symbol") or "") == str(side_state.option_symbol or "")
+            and str(order.get("action") or order.get("side") or "").upper() == "BUY"
+        ]
+        for order in matching_orders:
+            order_id = str(order.get("orderid") or order.get("order_id") or "")
+            if order_id and not self.broker.cancel_order(order_id):
+                self._record_alert(ts, "RISK", f"{side} uncertain BUY order cancellation failed: {order_id}")
+                return False
+            if order_id:
+                self._record_alert(ts, "CANCEL", f"{side} cancelled uncertain BUY order order_id={order_id}")
+        return True
 
     def place_pending_entry(
         self,
@@ -810,6 +887,11 @@ class BaseStrategyEngine:
 
         if self._is_ema21_strategy():
             if ts.time() < self.cfg.entry_start or ts.time() >= self.cfg.entry_cutoff:
+                self._record_alert(
+                    ts,
+                    "RISK",
+                    f"{side} entry blocked: outside EMA21 entry window",
+                )
                 return
             if any(
                 other.position is not None or other.pending_entry is not None
@@ -819,6 +901,7 @@ class BaseStrategyEngine:
                 self._record_alert(ts, "RISK", f"{side} trade skipped: another side is active")
                 return
             if self.total_entries >= self.cfg.max_trades_per_day:
+                side_state.entry_block_reason = "daily-filled-entry-cap"
                 self._record_alert(ts, "RISK", "Trade skipped: daily filled-entry cap reached")
                 return
 
@@ -847,10 +930,7 @@ class BaseStrategyEngine:
             )
             return
 
-        if self._is_ema21_strategy():
-            entry_level = float(getattr(side_state, "first_red_high"))
-        else:
-            entry_level = float(row["high"] + 1.0)
+        entry_level = self.signal_provider.compute_entry_trigger_level(side_state, row)
         stop_level = self.signal_provider.compute_stop_level(side_state, row)
         if self._is_ema21_strategy():
             entry_level = self._round_option_price(entry_level)
@@ -865,7 +945,7 @@ class BaseStrategyEngine:
                 return
 
         # Legacy strategies retain the existing VWAP room filter.
-        if not self._is_ema21_strategy():
+        if self.signal_provider.applies_vwap_room_filter():
             # VWAP room filter: entry below VWAP must have at least 1.5 RR of headroom.
             vwap = float(row["vwap"]) if not pd.isna(row["vwap"]) else None
             if vwap is not None and entry_level < vwap:
@@ -877,16 +957,13 @@ class BaseStrategyEngine:
                         f"{side} trade cancelled: VWAP room {room:.2f} < {self.cfg.min_vwap_room_rr} RR ({required:.2f})",
                     )
                     return
-        else:
-            vwap = None
-
         lots = self.signal_provider.compute_entry_lots(row, self.cfg)
         quantity = lots * self.cfg.option_lot_size
 
         trigger_level = entry_level
 
-        if self._is_ema21_strategy():
-            limit_level = trigger_level + self.cfg.entry_limit_buffer_points
+        if self.signal_provider.submit_stop_limit_on_signal():
+            limit_level = trigger_level + self.signal_provider.entry_limit_buffer(self.cfg)
             print(
                 f"[TRADE PREVIEW] ABOUT TO PLACE ENTRY ORDER "
                 f"side={side} symbol={side_state.option_symbol} qty={quantity} "
@@ -940,27 +1017,6 @@ class BaseStrategyEngine:
             f"option_risk={risk_points:.2f}",
         )
         print(self._fmt_candle_context(row, side_state.option_symbol, self._is_ema21_strategy()))
-        if self._is_ema21_strategy() and self.broker.is_replay and float(row["high"]) >= trigger_level:
-            side_state.position = Position(
-                option_symbol=side_state.option_symbol,
-                option_type=side,
-                quantity=quantity,
-                initial_quantity=quantity,
-                entry_price=trigger_level,
-                entry_time=ts,
-                option_stop_level=stop_level,
-                option_entry_trigger=trigger_level,
-                option_risk_points=risk_points,
-            )
-            side_state.pending_entry = None
-            self.total_entries += 1
-            self.signal_provider.reset_after_entry(side_state)
-            self._record_alert(
-                ts, "ENTRY",
-                f"Entered {side} {side_state.option_symbol} @ {trigger_level:.2f}, "
-                f"qty={quantity}, trigger={trigger_level:.2f}, SL={stop_level:.2f}, "
-                f"option_risk={risk_points:.2f}",
-            )
 
     def try_fill_pending_entry(
         self,
@@ -975,12 +1031,53 @@ class BaseStrategyEngine:
         if pending is None:
             return
 
+        candle_seconds = max(1, self.cfg.timeframe_minutes * 60)
+        elapsed_seconds = max(0.0, (ts - pending.created_at).total_seconds())
+        candles_elapsed = int(elapsed_seconds // candle_seconds)
+        if candles_elapsed > self.cfg.pending_entry_expiry_candles:
+            self._cancel_pending_entry_with_reason(
+                side,
+                side_state,
+                ts,
+                f"entry window expired after {candles_elapsed} candles "
+                f"(limit={self.cfg.pending_entry_expiry_candles})",
+            )
+            return
+
+        if float(row["low"]) <= pending.option_stop_level:
+            self._cancel_pending_entry_with_reason(
+                side,
+                side_state,
+                ts,
+                f"SL breached (low={float(row['low']):.2f} <= SL={pending.option_stop_level:.2f})",
+            )
+            return
+
+        if float(row["high"]) >= pending.option_trigger_level:
+            limit_price = (
+                pending.option_trigger_level
+                + self.signal_provider.entry_limit_buffer(self.cfg)
+            )
+            if float(row["low"]) > limit_price:
+                self._cancel_pending_entry_with_reason(
+                    side,
+                    side_state,
+                    ts,
+                    f"trigger missed in gap (low={float(row['low']):.2f} > limit={limit_price:.2f})",
+                )
+                return
+
         if self._is_ema21_strategy() and not self.broker.is_replay:
             status = self.broker.get_order_status(pending.order_id or "")
             order_status = str(status.get("order_status") or status.get("status") or "").lower()
             if order_status in {"cancelled", "rejected", "failed"}:
-                self._record_alert(ts, "CANCEL", f"{side} EMA21 entry order {order_status}")
-                side_state.pending_entry = None
+                self._cancel_pending_entry_with_reason(
+                    side,
+                    side_state,
+                    ts,
+                    f"broker order was {order_status}",
+                    order_already_closed=True,
+                )
             elif order_status in {"complete", "filled", "executed"}:
                 broker_quantity = self._broker_quantity(pending.option_symbol)
                 if broker_quantity == 0:
@@ -1005,6 +1102,31 @@ class BaseStrategyEngine:
                 option_ltp = float(
                     status.get("average_price") or status.get("price") or pending.option_trigger_level
                 )
+                actual_risk = option_ltp - pending.option_stop_level
+                if actual_risk > self.cfg.max_option_risk_points:
+                    self._record_alert(
+                        ts,
+                        "RISK",
+                        f"{side} fill risk {actual_risk:.2f} exceeds limit "
+                        f"{self.cfg.max_option_risk_points:.2f}; exiting {pending.option_symbol}",
+                    )
+                    try:
+                        self.broker.place_market_order(
+                            pending.option_symbol,
+                            OrderSide.SELL,
+                            pending.quantity,
+                        )
+                    except Exception as exc:
+                        self._record_alert(
+                            ts,
+                            "ERROR",
+                            f"{side} risk-breach exit failed for {pending.option_symbol}: {exc}",
+                        )
+                        side_state.order_submission_uncertain = True
+                        return
+                    side_state.pending_entry = None
+                    self.signal_provider.reset_after_entry(side_state)
+                    return
                 side_state.position = Position(
                     option_symbol=pending.option_symbol,
                     option_type=side,
@@ -1030,30 +1152,6 @@ class BaseStrategyEngine:
             return
 
         # Cancel pending after configured number of candles from setup bar.
-        candle_seconds = max(1, self.cfg.timeframe_minutes * 60)
-        elapsed_seconds = max(0.0, (ts - pending.created_at).total_seconds())
-        candles_elapsed = int(elapsed_seconds // candle_seconds)
-        if candles_elapsed > self.cfg.pending_entry_expiry_candles:
-            self._record_alert(
-                ts,
-                "CANCEL",
-                f"{side} pending cancelled: expired after {candles_elapsed} candles "
-                f"(limit={self.cfg.pending_entry_expiry_candles})",
-            )
-            if self._cancel_pending_entry_order(side, pending, ts):
-                side_state.pending_entry = None
-            return
-
-        # Cancel pending if SL level is breached before entry triggers.
-        if float(row["low"]) <= pending.option_stop_level:
-            self._record_alert(
-                ts, "CANCEL",
-                f"{side} pending cancelled: SL breached (low={row['low']:.2f} <= SL={pending.option_stop_level:.2f})",
-            )
-            if self._cancel_pending_entry_order(side, pending, ts):
-                side_state.pending_entry = None
-            return
-
         if float(row["high"]) < pending.option_trigger_level:
             return
 
@@ -1061,7 +1159,6 @@ class BaseStrategyEngine:
         risk_points = abs(pending.option_trigger_level - pending.option_stop_level)
 
         # FRD §5.1: entry via STOP_LIMIT (trigger + 0.5 limit buffer).
-        limit_price = pending.option_trigger_level + self.cfg.entry_limit_buffer_points
         simulated_fill = self.broker.simulate_stop_limit_fill(
             option_symbol,
             pending.option_trigger_level,
@@ -1070,17 +1167,12 @@ class BaseStrategyEngine:
         if simulated_fill is not None:
             option_ltp = simulated_fill
         else:
-            option_ltp = self.broker.get_ltp(option_symbol)
             if self.broker.is_replay:
-                self._record_alert(
-                    ts,
-                    "CANCEL",
-                    f"{side} pending cancelled: stop-limit trigger exceeded limit or no replay fill",
-                )
-                side_state.pending_entry = None
-                if self._is_ema21_strategy():
-                    self.signal_provider.reset_after_entry(side_state)
+                # A stop-limit order remains working when a candle gaps above
+                # its limit; expiry, EMA failure, cutoff, or stop breach owns
+                # cancellation. Do not invent a fill or cancel the order here.
                 return
+            option_ltp = self.broker.get_ltp(option_symbol)
 
         try:
             print(
@@ -1200,7 +1292,12 @@ class BaseStrategyEngine:
             )
 
         # Phase 3: At 2.0 RR — partial exit 1 lot.
-        if pos.initial_quantity > partial_qty and rr >= self.cfg.t2_rr and not pos.t2_done:
+        if (
+            not self._is_ema21_strategy()
+            and pos.initial_quantity > partial_qty
+            and rr >= self.cfg.t2_rr
+            and not pos.t2_done
+        ):
             self.execute_partial_exit(
                 side_state, partial_qty,
                 f"2.0 RR hit — booked 1 lot",
@@ -1214,13 +1311,13 @@ class BaseStrategyEngine:
                 f"looking for {side_state.position.next_target_rr:.1f}R"
             )
 
-        # Step-trailing: advance SL every 0.5 RR above 1.5.
+        # Step-trailing: at 2R, protect 1.5R, then advance by 0.5R.
         if pos.breakeven_armed and ir > 0:
             step = max(self.cfg.trailing_step_rr, 0.01)
             current_step = int(rr / step) * step  # floor to the configured step
             if current_step > pos.highest_rr_step:
-                # SL trails 1.5 RR behind the current step.
-                new_sl = pos.entry_price + (current_step - self.cfg.t1_rr) * ir
+                trail_offset = step if self._is_ema21_strategy() else self.cfg.t1_rr
+                new_sl = pos.entry_price + (current_step - trail_offset) * ir
                 if pos.trailing_sl_level is None or new_sl > pos.trailing_sl_level:
                     pos.trailing_sl_level = new_sl
                     pos.option_stop_level = new_sl
@@ -1290,6 +1387,12 @@ class BaseStrategyEngine:
             side = "CE" if side_state is self.state.ce else "PE"
             if self._cancel_pending_entry_order(side, pending, ts):
                 side_state.pending_entry = None
+                self._record_alert(
+                    ts,
+                    "CANCEL",
+                    f"{side} pending entry cancelled at replay end: trigger/fill not reached "
+                    f"for {pending.option_symbol} (trigger={pending.option_trigger_level:.2f})",
+                )
         pos = side_state.position
         if pos is None:
             return
@@ -1350,7 +1453,12 @@ class BaseStrategyEngine:
                 self._record_alert(ts, "TSL", f"{pos.option_type} 1.5 RR (tick) — SL to entry")
 
         # Phase 3: 2.0 RR — partial exit.
-        if pos.initial_quantity > lot_qty and rr >= self.cfg.t2_rr and not pos.t2_done:
+        if (
+            not self._is_ema21_strategy()
+            and pos.initial_quantity > lot_qty
+            and rr >= self.cfg.t2_rr
+            and not pos.t2_done
+        ):
             self.execute_partial_exit(side_state, lot_qty, f"2.0 RR (tick) — booked 1 lot")
             if side_state.position is None:
                 return
@@ -1362,12 +1470,13 @@ class BaseStrategyEngine:
             )
             pos = side_state.position
 
-        # Step-trailing SL advancement.
+        # Step-trailing: at 2R, protect 1.5R, then advance by 0.5R.
         if pos.breakeven_armed and ir > 0:
             step = max(self.cfg.trailing_step_rr, 0.01)
             current_step = int(rr / step) * step
             if current_step > pos.highest_rr_step:
-                new_sl = pos.entry_price + (current_step - self.cfg.t1_rr) * ir
+                trail_offset = step if self._is_ema21_strategy() else self.cfg.t1_rr
+                new_sl = pos.entry_price + (current_step - trail_offset) * ir
                 if pos.trailing_sl_level is None or new_sl > pos.trailing_sl_level:
                     pos.trailing_sl_level = new_sl
                     pos.option_stop_level = new_sl
@@ -1397,6 +1506,7 @@ class BaseStrategyEngine:
         side: str,
         row: pd.Series,
         prev_row: Optional[pd.Series],
+        allow_entries: bool = True,
     ) -> None:
         ts = row["datetime"]
         self.last_processed_candle_time = ts
@@ -1438,19 +1548,36 @@ class BaseStrategyEngine:
 
         if not self.in_signal_window(ts):
             if side_state.pending_entry is not None:
-                pending = side_state.pending_entry
-                if self._cancel_pending_entry_order(side, pending, ts):
-                    side_state.pending_entry = None
-                    self._record_alert(ts, "SESSION", f"{side} pending entry cancelled at signal cutoff")
+                self._cancel_pending_entry_with_reason(
+                    side,
+                    side_state,
+                    ts,
+                    f"entry cutoff reached at {self.cfg.signal_cutoff.strftime('%H:%M')}",
+                )
             self.monitor_open_position(side_state, row)
             remark = "OUTSIDE_SIGNAL_WINDOW"
             self._record_trace_row(side, side_state, row, signal, False, remark)
             return
 
-        # An EMA21 stop-entry is valid only while the confirmation candle
-        # remains above EMA21. Cancel it before checking the trigger so a
-        # broken follow-up candle cannot leave a stale broker order open.
-        pending_ema_failure = False
+        if not allow_entries:
+            self.monitor_open_position(side_state, row)
+            if (
+                self._is_ema21_strategy()
+                and side_state.position is not None
+                and float(row["close"]) < float(row["ema21"])
+            ):
+                self._exit_position(
+                    side_state,
+                    ts,
+                    side_state.position.quantity,
+                    "EMA-21 close exit",
+                    is_hard_sl=False,
+                    row=row,
+                )
+            self.signal_provider.update_state(side_state, row, prev_row)
+            self._record_trace_row(side, side_state, row, signal, False, "STATE_WARMUP")
+            return
+
         if (
             self._is_ema21_strategy()
             and side_state.pending_entry is not None
@@ -1458,19 +1585,38 @@ class BaseStrategyEngine:
             and not pd.isna(row.get("ema21"))
             and float(row["close"]) <= float(row["ema21"])
         ):
-            pending = side_state.pending_entry
-            if self._cancel_pending_entry_order(side, pending, ts):
-                side_state.pending_entry = None
-                pending_ema_failure = True
+            self._cancel_pending_entry_with_reason(
+                side,
+                side_state,
+                ts,
+                f"EMA21 close failure (close={float(row['close']):.2f} <= EMA21={float(row['ema21']):.2f})",
+            )
+        if (
+            self._is_ema21_strategy()
+            and side_state.order_submission_uncertain
+            and side_state.option_symbol
+            and row.get("ema21") is not None
+            and not pd.isna(row.get("ema21"))
+            and float(row["close"]) <= float(row["ema21"])
+        ):
+            if self._cancel_uncertain_entry_order(side, side_state, ts):
+                side_state.order_submission_uncertain = False
+                self.signal_provider.reset_after_entry(side_state)
                 self._record_alert(
                     ts,
                     "CANCEL",
-                    f"{side} pending cancelled: EMA21 close failure "
+                    f"{side} uncertain entry cancelled: EMA21 close failure "
                     f"(close={float(row['close']):.2f} <= EMA21={float(row['ema21']):.2f})",
                 )
-        if not pending_ema_failure:
+                return
+        if side_state.pending_entry is not None:
             self.try_fill_pending_entry(side, side_state, ts, row)
         self.monitor_open_position(side_state, row)
+
+        if had_position_before and side_state.position is None:
+            self.signal_provider.reset_after_entry(side_state)
+            self._record_trace_row(side, side_state, row, signal, False, "POSITION_EXITED_NO_REENTRY")
+            return
 
         # Delegate signal generation to the strategy provider.
         setup_was_active = getattr(side_state, "setup_active", False)
@@ -1508,6 +1654,7 @@ class BaseStrategyEngine:
             remark = "EMA_FAILURE_CLEANUP"
             self._record_trace_row(side, side_state, row, signal, False, remark)
             return
+
         if (
             self._is_ema21_strategy()
             and side_state.position is not None
@@ -1546,6 +1693,13 @@ class BaseStrategyEngine:
                 remark = "POSITION_OPENED"
             else:
                 remark = "SIGNAL_REJECTED_BY_RISK_OR_STATE"
+                if self._is_ema21_strategy() and not side_state.order_submission_uncertain:
+                    self.signal_provider.reset_after_entry(side_state)
+                    self._record_alert(
+                        ts,
+                        "CANCEL",
+                        f"{side} EMA21 setup reset after entry was rejected; waiting for new setup",
+                    )
         elif self.diagnose:
             self._diagnose_side(side, side_state, ts, row, prev_row)
             reason = self.signal_provider.diagnose_no_signal(side, side_state, row, prev_row)

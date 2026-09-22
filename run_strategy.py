@@ -215,11 +215,11 @@ def _apply_ema21_policy(cfg: StrategyConfig, script: str) -> None:
     except (OSError, TypeError, ValueError, json.JSONDecodeError):
         pass
     cfg.trailing_step_rr = _env_float("EMA21_TRAILING_STEP_RR", 0.5)
-    cfg.t1_rr = _env_float("EMA21_BREAKEVEN_RR", 1.5)
+    cfg.t1_rr = _env_float("EMA21_BREAKEVEN_RR", 1.0)
     cfg.t2_rr = _env_float("EMA21_PARTIAL_EXIT_RR", 2.0)
     cfg.pending_entry_expiry_candles = _env_int("EMA21_PENDING_ENTRY_EXPIRY_CANDLES", 3)
     cfg.entry_limit_buffer_points = _env_float("EMA21_ENTRY_LIMIT_BUFFER_POINTS", 0.5)
-    cfg.stop_buffer_points = _env_float("EMA21_PROTECTIVE_SL_BUFFER_POINTS", 1.0)
+    cfg.stop_buffer_points = _env_float("EMA21_PROTECTIVE_SL_BUFFER_POINTS", 0.0)
     cfg.option_tick_size = _env_float("EMA21_OPTION_TICK_SIZE", 0.05)
 
 

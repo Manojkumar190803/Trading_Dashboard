@@ -70,6 +70,22 @@ class SignalProvider(ABC):
         """Reset setup state after an entry is placed (avoid re-triggering)."""
         ...
 
+    def compute_entry_trigger_level(
+        self,
+        side_state: BaseSideState,
+        row: pd.Series,
+    ) -> float:
+        return float(row["high"] + 1.0)
+
+    def entry_limit_buffer(self, cfg: StrategyConfig) -> float:
+        return float(cfg.entry_limit_buffer_points)
+
+    def applies_vwap_room_filter(self) -> bool:
+        return getattr(self, "strategy_key", None) != "ema21"
+
+    def submit_stop_limit_on_signal(self) -> bool:
+        return getattr(self, "strategy_key", None) == "ema21"
+
     def format_setup_status(self, side_state: BaseSideState) -> str:
         """Return a human-readable string describing the current setup state."""
         return ""
