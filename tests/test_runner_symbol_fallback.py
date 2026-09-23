@@ -474,7 +474,7 @@ def test_live_tick_poll_includes_pending_entry_symbol():
     assert live_runner.broker.quoted == ["NIFTY01SEP2624250PE"]
 
 
-def test_live_tick_poll_does_not_create_entries_from_setup_ticks(monkeypatch):
+def test_live_tick_poll_processes_setup_ticks_without_position_monitoring(monkeypatch):
     side_state = SimpleNamespace(
         position=None,
         pending_entry=None,
@@ -494,8 +494,36 @@ def test_live_tick_poll_does_not_create_entries_from_setup_ticks(monkeypatch):
 
     live_runner._poll_active_ticks()
 
-    assert setup_ticks == []
+    assert len(setup_ticks) == 2
+    assert {args[0] for args in setup_ticks} == {"CE", "PE"}
+    assert all(args[1] == 116.5 for args in setup_ticks)
     assert persisted_ticks == []
+
+
+def test_live_setup_status_uses_candle_start_time(monkeypatch):
+    from datetime import datetime
+
+    captured = []
+    engine = SimpleNamespace(
+        cfg=SimpleNamespace(timeframe_minutes=3),
+        signal_provider=SimpleNamespace(format_setup_status=lambda _state: "CONFIRMING candles=1/3 waiting-red"),
+    )
+    side_state = SimpleNamespace(option_symbol="NIFTY01SEP2624250PE")
+
+    monkeypatch.setattr(
+        runner,
+        "_persist_setup_status_monitoring",
+        lambda _engine, _side, _state, candle: captured.append(candle["datetime"]),
+    )
+
+    runner._persist_live_setup_status_monitoring(
+        engine,
+        "PE",
+        side_state,
+        datetime(2026, 9, 23, 13, 32, 3, 123456),
+    )
+
+    assert captured == [datetime(2026, 9, 23, 13, 30)]
 
 
 def test_live_tick_poll_keeps_pending_entry_ticks_out_of_active_monitoring(monkeypatch):

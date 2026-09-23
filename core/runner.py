@@ -194,6 +194,23 @@ def _persist_setup_status_monitoring(
     _persist_monitoring_row(row)
 
 
+def _persist_live_setup_status_monitoring(
+    engine: BaseStrategyEngine,
+    side: str,
+    side_state: object,
+    timestamp: datetime,
+) -> None:
+    """Persist setup status while its confirmation candle is still forming."""
+    timeframe_minutes = int(getattr(engine.cfg, "timeframe_minutes", 3))
+    candle_start = timestamp.replace(
+        minute=timestamp.minute - (timestamp.minute % timeframe_minutes),
+        second=0,
+        microsecond=0,
+    )
+    candle = pd.Series({"datetime": candle_start})
+    _persist_setup_status_monitoring(engine, side, side_state, candle)
+
+
 def _cancel_stale_ema21_pending(
     engine: BaseStrategyEngine,
     broker: OpenAlgoBroker,
@@ -1173,7 +1190,11 @@ class LiveFeedRunner:
                 symbol = side_state.position.option_symbol
             elif side_state.pending_entry is not None:
                 symbol = side_state.pending_entry.option_symbol
+            elif getattr(side_state, "setup_active", False):
+                symbol = side_state.option_symbol
             else:
+                continue
+            if not symbol:
                 continue
             active_symbols.setdefault(symbol, []).append((side, side_state))
 
@@ -1197,6 +1218,12 @@ class LiveFeedRunner:
                 for side, side_state in subscriptions:
                     if side_state.position is not None:
                         self.engine.process_tick(side, float(ltp), tick_time)
+                    elif getattr(side_state, "setup_active", False):
+                        self.engine.process_setup_tick(side, float(ltp), tick_time)
+                        if hasattr(self.engine, "signal_provider"):
+                            _persist_live_setup_status_monitoring(
+                                self.engine, side, side_state, tick_time
+                            )
 
     def run_forever(self) -> None:
         logger.info(
@@ -1611,7 +1638,11 @@ class MultiEngineLiveFeedRunner:
                     symbol = side_state.position.option_symbol
                 elif side_state.pending_entry is not None:
                     symbol = side_state.pending_entry.option_symbol
+                elif getattr(side_state, "setup_active", False):
+                    symbol = side_state.option_symbol
                 else:
+                    continue
+                if not symbol:
                     continue
                 active_symbols.setdefault(symbol, []).append((engine, side, side_state))
 
@@ -1633,6 +1664,12 @@ class MultiEngineLiveFeedRunner:
                 for active_engine, active_side, side_state in subscriptions:
                     if side_state.position is not None:
                         active_engine.process_tick(active_side, float(ltp), now)
+                    elif getattr(side_state, "setup_active", False):
+                        active_engine.process_setup_tick(active_side, float(ltp), now)
+                        if hasattr(active_engine, "signal_provider"):
+                            _persist_live_setup_status_monitoring(
+                                active_engine, active_side, side_state, now
+                            )
 
     def run_forever(self) -> None:
         names = ", ".join(n for n, _ in self.engines)

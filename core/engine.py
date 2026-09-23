@@ -1404,6 +1404,48 @@ class BaseStrategyEngine:
 
     # ── tick-level monitoring (FRD §5.2 / §6) ──────────────────────
 
+    def process_setup_tick(self, side: str, ltp: float, ts: datetime) -> bool:
+        """Update a forming EMA21 confirmation candle and submit a new signal."""
+        side_state = self._side_state(side)
+        process_setup_tick = getattr(self.signal_provider, "process_setup_tick", None)
+        if (
+            not callable(process_setup_tick)
+            or side_state.position is not None
+            or side_state.pending_entry is not None
+            or not getattr(side_state, "setup_active", False)
+        ):
+            return False
+
+        armed = bool(process_setup_tick(side_state, float(ltp), ts))
+        if not armed:
+            return False
+
+        live_high = float(side_state.live_confirmation_high or ltp)
+        live_low = float(side_state.live_confirmation_low or ltp)
+        row = pd.Series(
+            {
+                "datetime": ts,
+                "open": float(side_state.live_confirmation_open or ltp),
+                "high": live_high,
+                "low": live_low,
+                "close": float(ltp),
+                "ema21": side_state.last_ema21,
+            }
+        )
+        signal = self.signal_provider.generate_signal(side, side_state, row, None)
+        if signal not in (Signal.BUY_CE, Signal.BUY_PE):
+            return False
+
+        self._record_alert(
+            ts,
+            "SIGNAL",
+            f"{side} {signal.value} signal during live red confirmation "
+            f"at LTP={float(ltp):.2f} symbol={side_state.option_symbol or '-'}",
+        )
+        had_pending = side_state.pending_entry is not None
+        self.place_pending_entry(side, side_state, ts, row)
+        return not had_pending and side_state.pending_entry is not None
+
     def process_tick(self, side: str, ltp: float, ts: datetime) -> None:
         """Called on every WebSocket tick for a side with an active position.
 
@@ -1574,7 +1616,7 @@ class BaseStrategyEngine:
                     is_hard_sl=False,
                     row=row,
                 )
-            self.signal_provider.update_state(side_state, row, prev_row)
+            self.signal_provider.reset_after_entry(side_state)
             self._record_trace_row(side, side_state, row, signal, False, "STATE_WARMUP")
             return
 

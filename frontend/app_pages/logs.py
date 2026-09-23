@@ -211,6 +211,43 @@ def _market_data_logs_df() -> pd.DataFrame:
     df = df.dropna(subset=["Timestamp"])
     if df.empty:
         return df
+    setup_mask = df["Category"].astype(str).str.upper().eq("SETUP_STATUS")
+    if setup_mask.any():
+        setup_indexes = df.index[setup_mask]
+        normalized_messages = [
+            _normalize_setup_status_message(message, timestamp)
+            for message, timestamp in zip(
+                df.loc[setup_mask, "Message"],
+                df.loc[setup_mask, "Timestamp"],
+            )
+        ]
+        candle_timestamps = [
+            _setup_candle_timestamp(message, timestamp)
+            for message, timestamp in zip(
+                normalized_messages,
+                df.loc[setup_mask, "Timestamp"],
+            )
+        ]
+        df.loc[setup_mask, "Message"] = pd.Series(
+            normalized_messages,
+            index=setup_indexes,
+            dtype="string",
+        )
+        df["Candle Timestamp"] = pd.Series(
+            pd.NaT,
+            index=df.index,
+            dtype="datetime64[ns, Asia/Kolkata]",
+        )
+        df.loc[setup_mask, "Candle Timestamp"] = pd.Series(
+            candle_timestamps,
+            index=setup_indexes,
+        )
+        setup_rows = df.loc[setup_mask].sort_values("Timestamp")
+        setup_rows = setup_rows.drop_duplicates(
+            subset=["Candle Timestamp", "Symbol", "Message"],
+            keep="last",
+        )
+        df = pd.concat([df.loc[~setup_mask], setup_rows], ignore_index=True)
     local_ts = df["Timestamp"].dt.tz_convert(DISPLAY_TZ)
     df["Date"] = local_ts.dt.date
     df["Time"] = local_ts.dt.strftime("%H:%M:%S")
@@ -226,6 +263,35 @@ def _market_data_logs_df() -> pd.DataFrame:
         "Date", "Time", "Timestamp", "Category", "Status", "Symbol",
         "Entry Price", "Exit Price", "Trade P&L", "Message",
     ]].sort_values("Timestamp", ascending=False)
+
+
+def _setup_candle_timestamp(message: object, timestamp: pd.Timestamp) -> pd.Timestamp:
+    match = re.search(r"candle=(\d{2}):(\d{2}):(\d{2})", str(message), re.IGNORECASE)
+    if not match:
+        return timestamp.replace(second=0, microsecond=0)
+    return timestamp.replace(
+        hour=int(match.group(1)),
+        minute=int(match.group(2)),
+        second=int(match.group(3)),
+        microsecond=0,
+    )
+
+
+def _normalize_setup_status_message(message: object, timestamp: pd.Timestamp) -> str:
+    text = str(message)
+    if not re.search(r"candle=\d{2}:\d{2}:\d{2}", text, re.IGNORECASE):
+        return text
+    candle_timestamp = timestamp.replace(
+        minute=timestamp.minute - (timestamp.minute % 3),
+        second=0,
+        microsecond=0,
+    )
+    return re.sub(
+        r"candle=\d{2}:\d{2}:\d{2}",
+        f"candle={candle_timestamp:%H:%M:%S}",
+        text,
+        flags=re.IGNORECASE,
+    )
 
 
 def _latest_persisted_option_symbols(target_date: date) -> dict[str, str]:

@@ -185,6 +185,7 @@ class EMA21SignalProvider(SignalProvider):
             side_state.live_confirmation_open is not None
             and float(ltp) < side_state.live_confirmation_open
         ):
+            side_state.confirmation_count = max(1, side_state.confirmation_count)
             side_state.first_red_high = side_state.live_confirmation_high
             side_state.first_red_low = side_state.live_confirmation_low
             side_state.first_red_time = ts

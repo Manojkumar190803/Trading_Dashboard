@@ -317,6 +317,32 @@ def test_provider_arms_entry_on_live_red_confirmation_tick():
     assert state.first_red_time == red_tick
 
 
+def test_engine_processes_live_red_confirmation_tick():
+    provider = EMA21SignalProvider()
+    engine = BaseStrategyEngine(
+        StrategyConfig(max_option_risk_points=20.0),
+        RiskConfig(max_sl_per_day=3),
+        HistoricalReplayBroker(),
+        provider,
+    )
+    engine.state.trading_day = datetime(2026, 8, 10).date()
+    engine.state.atm_locked = True
+    engine.state.ce = provider.create_side_state()
+    engine.state.ce.option_symbol = "NIFTY12AUG2625000CE"
+    state = engine.state.ce
+    state.setup_active = True
+    state.setup_candle_time = datetime(2026, 8, 10, 10, 0)
+    state.setup_candle_low = 95.0
+    state.last_ema21 = 101.0
+
+    assert engine.process_setup_tick("CE", 105.0, datetime(2026, 8, 10, 10, 3, 1)) is False
+    assert engine.process_setup_tick("CE", 103.0, datetime(2026, 8, 10, 10, 3, 20)) is True
+    assert state.confirmation_count == 1
+    assert provider.format_setup_status(state) == "ENTRY_PENDING broker-trigger confirmations=1/3"
+    assert state.pending_entry is not None
+    assert state.pending_entry.option_trigger_level == 105.0
+
+
 def test_engine_places_ema21_stop_entry_at_red_high():
     provider = EMA21SignalProvider()
     engine = BaseStrategyEngine(
@@ -468,6 +494,40 @@ def test_ema21_exits_active_position_below_ema_during_warmup():
         alert.category == "EXIT" and "EMA-21 close exit" in alert.message
         for alert in engine.alerts
     )
+
+
+def test_ema21_warmup_does_not_leave_stale_entry_setup():
+    provider = EMA21SignalProvider()
+    engine = BaseStrategyEngine(
+        StrategyConfig(max_option_risk_points=20.0),
+        RiskConfig(max_sl_per_day=3),
+        HistoricalReplayBroker(),
+        provider,
+    )
+    engine.state.trading_day = datetime(2026, 8, 10).date()
+    engine.state.atm_locked = True
+    engine.state.ce = provider.create_side_state()
+    engine.state.ce.option_symbol = "NIFTY12AUG2625000CE"
+
+    previous = _row(0, open_=100, high=101, low=98, close=99, ema=100)
+    setup = _row(1, open_=99, high=103, low=95, close=101, ema=100)
+    first_red = _row(2, open_=105, high=108, low=100, close=102, ema=101)
+
+    engine.process_option_candle("CE", setup, previous, allow_entries=False)
+    engine.process_option_candle("CE", first_red, setup, allow_entries=False)
+
+    state = engine.state.ce
+    assert state.setup_active is False
+    assert state.first_red_high is None
+    assert state.entry_ready is False
+    assert state.pending_entry is None
+
+    live_row = _row(3, open_=102, high=104, low=101, close=103, ema=102)
+    engine.process_option_candle("CE", live_row, first_red)
+
+    assert state.pending_entry is None
+    assert state.position is None
+    assert not any(alert.category == "SIGNAL" for alert in engine.alerts)
 
 
 def test_ema21_does_not_reenter_after_same_candle_position_exit():
