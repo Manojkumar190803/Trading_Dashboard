@@ -1340,6 +1340,23 @@ def _daily_mtm_value(raw_mtm: float, trading_day: str, state: dict[str, Any]) ->
     return raw_mtm - float(baseline)
 
 
+def _select_live_pnl(
+    funds: dict[str, Any],
+    open_positions: list[dict[str, Any]],
+) -> float:
+    """Select the broker P&L displayed by the live dashboard."""
+    positions_pnl = sum(float(position.get("pnl", 0.0) or 0.0) for position in open_positions)
+    if open_positions:
+        return positions_pnl
+
+    realized_mtm = funds.get("realized_mtm", funds.get("m2mrealized", 0.0))
+    unrealized_mtm = funds.get("unrealized_mtm", funds.get("m2munrealized", 0.0))
+    net_mtm = float(realized_mtm or 0.0) + float(unrealized_mtm or 0.0)
+    if net_mtm == 0.0 and funds.get("totalpnl") is not None:
+        net_mtm = float(funds.get("totalpnl") or 0.0)
+    return net_mtm
+
+
 def refresh_live_account_metrics(source_params: dict[str, Any] | None = None) -> None:
     """Fetch live funds/positions/orderbook from OpenAlgo and push into session_state.
 
@@ -1414,16 +1431,14 @@ def refresh_live_account_metrics(source_params: dict[str, Any] | None = None) ->
         return
 
     open_positions = [p for p in positions if int(p.get("quantity", 0) or 0) != 0]
-    positions_pnl = sum(float(p.get("pnl", 0.0) or 0.0) for p in open_positions)
-    realized_mtm = funds.get("realized_mtm", funds.get("m2mrealized", 0.0))
-    unrealized_mtm = funds.get("unrealized_mtm", funds.get("m2munrealized", 0.0))
-    net_mtm = float(realized_mtm or 0.0) + float(unrealized_mtm or 0.0)
-    if net_mtm == 0.0 and funds.get("totalpnl") is not None:
-        net_mtm = float(funds.get("totalpnl") or 0.0)
-    # If broker didn't populate MTM inside funds, fall back to positions P&L.
-    if net_mtm == 0.0 and positions_pnl != 0.0:
-        net_mtm = positions_pnl
-    net_mtm = _daily_mtm_value(net_mtm, trading_day, st.session_state)
+    raw_net_mtm = _select_live_pnl(funds, open_positions)
+    # Active exposure uses position-book P&L directly. Account-level MTM keeps
+    # the existing daily baseline behavior when no positions are open.
+    net_mtm = (
+        raw_net_mtm
+        if open_positions
+        else _daily_mtm_value(raw_net_mtm, trading_day, st.session_state)
+    )
 
     available_margin = funds.get("available_margin", funds.get("availablecash", 0.0))
     st.session_state["available_margin"] = float(available_margin or 0.0)

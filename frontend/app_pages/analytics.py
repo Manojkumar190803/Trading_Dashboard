@@ -9,10 +9,16 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
-from _shared import inject_theme, render_section_heading, render_sidebar
+from _shared import (
+    inject_theme,
+    refresh_live_account_metrics,
+    render_section_heading,
+    render_sidebar,
+)
 
 inject_theme()
-render_sidebar()
+source_params = render_sidebar()
+refresh_live_account_metrics(source_params)
 
 st.markdown(
     """
@@ -35,6 +41,18 @@ engine = st.session_state.get("engine")
 ANALYTICS_TRADES_PATH = Path("logs") / "analytics_trades.csv"
 ANALYTICS_RESET_PATH = Path("logs") / "analytics_reset.txt"
 ANALYTICS_COLUMNS = ["timestamp", "strategy", "pnl", "source", "message"]
+
+STRATEGY_LABELS = {
+    "HDSignalProvider": "HD Strategy",
+    "CDSignalProvider": "CD Strategy",
+    "TCSignalProvider": "TC Strategy",
+    "EMA21SignalProvider": "21EMA Strategy",
+}
+
+
+def _display_strategy_name(strategy: object) -> str:
+    name = str(strategy or "").strip()
+    return STRATEGY_LABELS.get(name, name or "Unknown")
 
 
 def _extract_pnl(message: str) -> float | None:
@@ -196,26 +214,29 @@ if equity_curve:
 
 def _strategy_tracking_df() -> pd.DataFrame:
     source_params = st.session_state.get("source_params", {})
-    active_strategy = str(source_params.get("active_strategy", "HD Strategy"))
+    active_strategy = str(source_params.get("active_strategy", "21EMA Strategy"))
 
-    strategy_enabled = st.session_state.get("strategy_enabled", {})
-    strategy_list = [str(name) for name in strategy_enabled.keys()]
-    strategy_list.extend(str(name) for name in analytics_trades["strategy"].dropna().unique())
-    if active_strategy not in strategy_list:
-        strategy_list.append(active_strategy)
+    strategy_list = [
+        _display_strategy_name(name)
+        for name in analytics_trades["strategy"].dropna().unique()
+    ]
+    if not strategy_list and active_strategy:
+        strategy_list.append(_display_strategy_name(active_strategy))
 
     rows: list[dict] = []
     for strategy_name in strategy_list:
-        strategy_trades = analytics_trades[analytics_trades["strategy"] == strategy_name]
-        triggers = len(strategy_trades)
-        strat_yield = float(strategy_trades["pnl"].sum()) if triggers else 0.0
+        strategy_trades = analytics_trades[
+            analytics_trades["strategy"].map(_display_strategy_name) == strategy_name
+        ]
+        completed = len(strategy_trades)
+        strat_yield = float(strategy_trades["pnl"].sum()) if completed else 0.0
         wins = int((strategy_trades["pnl"] > 0).sum())
 
-        accuracy = (wins / triggers * 100.0) if triggers else 0.0
+        accuracy = (wins / completed * 100.0) if completed else 0.0
         rows.append(
             {
                 "Strategy": strategy_name,
-                "Triggers": int(triggers),
+                "Completed trades": int(completed),
                 "Yield": float(strat_yield),
                 "Accuracy %": float(accuracy),
                 "Wins": int(wins),
@@ -227,7 +248,9 @@ def _strategy_tracking_df() -> pd.DataFrame:
         df["Rank"] = (
             df["Yield"].rank(method="dense", ascending=False).astype(int)
         )
-        df = df.sort_values(["Rank", "Yield", "Triggers"], ascending=[True, False, False])
+        df = df.sort_values(
+            ["Rank", "Yield", "Completed trades"], ascending=[True, False, False]
+        )
     return df
 
 
@@ -237,14 +260,16 @@ with st.container(border=True):
     render_section_heading(
         "Performance",
         "Performance analytics",
-        "Curve, expectancy, win-rate, and profit factor for the full trading session.",
+        "Historical realized P&L from completed strategy trades. Live broker P&L is shown separately.",
     )
 
-    m1, m2, m3, m4 = st.columns(4)
+    live_pnl = float(st.session_state.get("net_mtm", 0.0) or 0.0)
+    m1, m2, m3, m4, m5 = st.columns(5)
     m1.metric("Expectancy", f"₹ {expectancy:,.2f}", delta=f"Across {completed_trades} trades", delta_color=expectancy_color)
     m2.metric("Win-rate", f"{win_rate:.2f}%", delta=win_rate_delta)
     m3.metric("Factor", factor_display, delta=factor_delta)
     m4.metric("Completed trades", str(completed_trades))
+    m5.metric("Live broker P&L", f"₹ {live_pnl:,.2f}", delta="Current account MTM")
 
     if not equity_curve:
         st.info(
@@ -273,32 +298,32 @@ with st.container(border=True):
     render_section_heading(
         "Strategy tracking",
         "Strategy tracking dashboard",
-        "Triggers, yield, accuracy, leaderboard, and distribution by strategy.",
+        "Completed trades, realized yield, accuracy, leaderboard, and distribution by strategy.",
     )
 
     if strategy_df.empty:
         st.info("No strategy tracking data yet.", icon=":material/tune:")
     else:
         st.dataframe(
-            strategy_df[["Rank", "Strategy", "Triggers", "Yield", "Accuracy %"]],
+            strategy_df[["Rank", "Strategy", "Completed trades", "Yield", "Accuracy %"]],
             hide_index=True,
             use_container_width=True,
         )
 
         top_strategy = str(strategy_df.iloc[0]["Strategy"])
         top_yield = float(strategy_df.iloc[0]["Yield"])
-        total_triggers = int(strategy_df["Triggers"].sum())
+        total_completed = int(strategy_df["Completed trades"].sum())
 
         s1, s2, s3 = st.columns(3)
         s1.metric("Leaderboard", top_strategy)
         s2.metric("Best yield", f"₹ {top_yield:,.2f}")
-        s3.metric("Total triggers", str(total_triggers))
+        s3.metric("Total completed trades", str(total_completed))
 
         dist_cols = st.columns(2)
         with dist_cols[0]:
-            st.markdown("##### Distribution: trade triggers by strategy")
-            trigger_dist = strategy_df.set_index("Strategy")[["Triggers"]]
-            st.bar_chart(trigger_dist, use_container_width=True, height=260)
+            st.markdown("##### Distribution: completed trades by strategy")
+            completed_dist = strategy_df.set_index("Strategy")[["Completed trades"]]
+            st.bar_chart(completed_dist, use_container_width=True, height=260)
 
         with dist_cols[1]:
             st.markdown("##### Distribution: net yield by strategy")
