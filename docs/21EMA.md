@@ -84,7 +84,7 @@ ticks.
 | `atm_lock_time` | 09:20 IST | Time when the ATM strike and CE/PE contracts are calculated and locked |
 | `expiry_policy` | Current weekly | Use current weekly expiry; use the immediately following weekly expiry when today is expiry day |
 | `entry_start` | 09:20 IST | Earliest time the strategy may scan for a new setup or trigger an entry |
-| `entry_cutoff` | 14:45 IST | No new entry may be accepted at or after this time |
+| `entry_cutoff` | 14:40 IST | No new entry may be accepted at or after this time |
 | `force_square_off` | 15:10 IST | Mandatory exit time for every open position |
 | `entry_buffer_points` | 0.0 | No EMA21 entry buffer; retained for legacy strategies |
 | `stop_buffer_points` | 0.0 | EMA21 uses the setup candle low directly; legacy strategies may configure a buffer |
@@ -123,7 +123,7 @@ ticks.
 | FR-13 | The setup shall be cancelled if no red candle occurs in the three-candle window. | Must |
 | FR-14 | The system shall place one pending stop-limit entry at the first valid red candle high and activate the position only after broker fill confirmation. | Must |
 | FR-15 | The system shall discard the setup when `entry_trigger - initial_stop > 20.0` option-premium points, where `initial_stop` is the low of the setup candle. | Must |
-| FR-16 | A setup or pending entry shall be cancelled when its entry window reaches 14:45 IST without a confirmed fill. | Must |
+| FR-16 | A setup or pending entry shall be cancelled when its entry window reaches 14:40 IST without a confirmed fill. | Must |
 
 ### 5.3 Entry Execution
 
@@ -157,7 +157,7 @@ ticks.
 |---|---|---|
 | FR-33 | At or after 15:10 IST, the system shall cancel all outstanding CE and PE strategy orders and submit an exit for every remaining position quantity. | Must |
 | FR-34 | The 15:10 IST exit shall apply regardless of profit, loss, EMA position, or trailing-stop state. | Must |
-| FR-35 | The system shall not submit a new entry at or after 14:45 IST, including an entry trigger observed after the cutoff. | Must |
+| FR-35 | The system shall not submit a new entry at or after 14:40 IST, including an entry trigger observed after the cutoff. | Must |
 | FR-36 | The system shall persist the final option-premium exit price, exit timestamp, exit reason, realized P&L, order IDs, and cleanup result. | Must |
 | FR-37 | The system shall record the broker-confirmed stop-limit fill price for execution audit and use that price for EMA21 P&L calculations. | Must |
 | FR-38 | If an entry or exit order fails, the system shall record the failure and reconcile broker state before retrying. | Must |
@@ -232,7 +232,7 @@ The system shall record:
 | TC-09 | Price reaches 1.5R | Stop moves to 110 for the TC-07 example |
 | TC-10 | A candle closes below EMA-21 while position is active | Position exits |
 | TC-11 | Three filled trades have already occurred | No fourth entry is accepted |
-| TC-12 | A pending trigger appears at 14:45 | It is rejected and no entry is placed |
+| TC-12 | A pending trigger appears at 14:40 | It is rejected and no entry is placed |
 | TC-13 | Position remains active at 15:10 | All remaining quantity is force-exited |
 | TC-14 | Trading day is the current weekly expiry day | Next available weekly expiry is selected for both ATM options |
 | TC-15 | First red candle closes with high 100 | Stop-limit trigger is exactly 100 and its configured limit buffer is applied |

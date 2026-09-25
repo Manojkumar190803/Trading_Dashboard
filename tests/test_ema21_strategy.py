@@ -52,7 +52,7 @@ def test_provider_captures_first_red_within_three_candles():
     provider.update_state(state, third_green, first_red)
 
     assert state.entry_ready is True
-    assert provider.generate_signal("CE", state, third_green, first_red) == Signal.BUY_CE
+    assert provider.generate_signal("CE", state, third_green, first_red) == Signal.NONE
 
 
 def test_provider_keeps_valid_setup_after_red_candle_above_ema():
@@ -72,7 +72,7 @@ def test_provider_keeps_valid_setup_after_red_candle_above_ema():
     assert state.confirmation_count == 2
     assert state.first_red_high == 63.90
     assert state.entry_ready is True
-    assert provider.format_setup_status(state) == "ENTRY_READY confirmations=2/3"
+    assert provider.format_setup_status(state) == "ENTRY_READY confirmations=2/3 alert-candle-triggered"
 
 
 def test_provider_emits_signal_on_red_within_three_candles():
@@ -121,6 +121,32 @@ def test_provider_continues_confirmation_count_after_red_trigger():
     assert state.first_red_high == 108.0
 
 
+def test_provider_keeps_setup_active_past_max_confirmations_once_red_found():
+    """Regression: once a red confirmation candle is found, the setup must not
+    be cleared just because confirmation_count reaches confirmation_candles on
+    a later, unrelated candle (this previously wiped valid entry-ready setups
+    awaiting fill)."""
+    provider = EMA21SignalProvider()
+    state = provider.create_side_state()
+    previous = _row(0, open_=100, high=101, low=98, close=99, ema=100)
+    setup = _row(1, open_=99, high=103, low=95, close=101, ema=100)
+    first_red = _row(2, open_=105, high=108, low=100, close=102, ema=101)
+    provider.update_state(state, setup, previous)
+    provider.update_state(state, first_red, setup)
+
+    assert state.entry_ready is True
+    assert state.confirmation_count == 1
+
+    for offset in (3, 4, 5):
+        green = _row(offset, open_=102, high=110, low=101, close=108, ema=102)
+        provider.update_state(state, green, first_red)
+
+    assert state.setup_active is True
+    assert state.entry_ready is True
+    assert state.first_red_high == 108.0
+    assert provider.generate_signal("CE", state, green, first_red) == Signal.NONE
+
+
 def test_provider_resets_after_three_green_confirmation_candles():
     provider = EMA21SignalProvider()
     state = provider.create_side_state()
@@ -151,6 +177,18 @@ def test_provider_rejects_setup_without_red_within_three_candles():
     assert state.setup_active is False
     assert state.entry_ready is False
     assert provider.generate_signal("CE", state, green, setup) == Signal.NONE
+
+
+def test_provider_accepts_setup_when_previous_close_is_within_display_precision_of_ema():
+    provider = EMA21SignalProvider()
+    state = provider.create_side_state()
+    previous = _row(0, open_=122.90, high=123.10, low=122.70, close=122.805, ema=122.80)
+    setup = _row(1, open_=123.00, high=127.85, low=121.65, close=124.95, ema=122.99)
+
+    provider.update_state(state, setup, previous)
+
+    assert state.setup_active is True
+    assert state.setup_candle_time == setup["datetime"]
 
 
 def test_provider_reports_broker_state_before_setup_state():
@@ -271,13 +309,13 @@ def test_provider_formats_all_setup_statuses():
     state.entry_block_reason = None
     state.entry_ready = True
     state.confirmation_count = 2
-    assert provider.format_setup_status(state) == "ENTRY_READY confirmations=2/3"
+    assert provider.format_setup_status(state) == "ENTRY_READY confirmations=2/3 alert-candle-triggered"
 
     state.entry_ready = False
     state.setup_active = True
     state.confirmation_count = 1
     state.first_red_high = 123.45
-    assert provider.format_setup_status(state) == "ENTRY_READY confirmations=1/3"
+    assert provider.format_setup_status(state) == "ENTRY_READY confirmations=1/3 alert-candle-triggered"
 
     state.first_red_high = None
     state.setup_active = False
@@ -293,11 +331,12 @@ def test_provider_recovers_entry_ready_from_red_confirmation():
     state.entry_ready = False
 
     row = _row(2, open_=123.95, high=124.40, low=120.0, close=122.50, ema=121.59)
-    assert provider.format_setup_status(state) == "ENTRY_READY confirmations=1/3"
+    state.first_red_time = row["datetime"]
+    assert provider.format_setup_status(state) == "ENTRY_READY confirmations=1/3 alert-candle-triggered"
     assert provider.generate_signal("PE", state, row, None) == Signal.BUY_PE
 
 
-def test_provider_arms_entry_on_live_red_confirmation_tick():
+def test_provider_does_not_arm_entry_on_live_red_confirmation_tick():
     provider = EMA21SignalProvider()
     state = provider.create_side_state()
     state.setup_active = True
@@ -310,14 +349,14 @@ def test_provider_arms_entry_on_live_red_confirmation_tick():
     assert provider.process_setup_tick(state, 105.0, first_tick) is False
 
     red_tick = datetime(2026, 8, 10, 10, 3, 20)
-    assert provider.process_setup_tick(state, 103.0, red_tick) is True
-    assert state.entry_ready is True
-    assert state.first_red_high == 105.0
-    assert state.first_red_low == 103.0
-    assert state.first_red_time == red_tick
+    assert provider.process_setup_tick(state, 103.0, red_tick) is False
+    assert state.entry_ready is False
+    assert state.first_red_high is None
+    assert state.first_red_low is None
+    assert state.first_red_time is None
 
 
-def test_engine_processes_live_red_confirmation_tick():
+def test_engine_does_not_process_live_red_confirmation_tick():
     provider = EMA21SignalProvider()
     engine = BaseStrategyEngine(
         StrategyConfig(max_option_risk_points=20.0),
@@ -336,11 +375,35 @@ def test_engine_processes_live_red_confirmation_tick():
     state.last_ema21 = 101.0
 
     assert engine.process_setup_tick("CE", 105.0, datetime(2026, 8, 10, 10, 3, 1)) is False
-    assert engine.process_setup_tick("CE", 103.0, datetime(2026, 8, 10, 10, 3, 20)) is True
-    assert state.confirmation_count == 1
-    assert provider.format_setup_status(state) == "ENTRY_PENDING broker-trigger confirmations=1/3"
-    assert state.pending_entry is not None
-    assert state.pending_entry.option_trigger_level == 105.0
+    assert engine.process_setup_tick("CE", 103.0, datetime(2026, 8, 10, 10, 3, 20)) is False
+    assert state.confirmation_count == 0
+    assert provider.format_setup_status(state) == "CONFIRMING candles=0/3 waiting-red"
+    assert state.pending_entry is None
+
+
+def test_engine_does_not_enter_when_intrabar_red_tick_recovers_green():
+    provider = EMA21SignalProvider()
+    engine = BaseStrategyEngine(
+        StrategyConfig(max_option_risk_points=20.0),
+        RiskConfig(max_sl_per_day=3),
+        HistoricalReplayBroker(),
+        provider,
+    )
+    engine.state.trading_day = datetime(2026, 8, 10).date()
+    engine.state.atm_locked = True
+    engine.state.ce = provider.create_side_state()
+    engine.state.ce.option_symbol = "NIFTY12AUG2625000CE"
+    state = engine.state.ce
+    state.setup_active = True
+    state.setup_candle_time = datetime(2026, 8, 10, 10, 0)
+    state.setup_candle_low = 95.0
+    state.last_ema21 = 101.0
+
+    assert engine.process_setup_tick("CE", 105.0, datetime(2026, 8, 10, 10, 3, 1)) is False
+    assert engine.process_setup_tick("CE", 103.0, datetime(2026, 8, 10, 10, 3, 20)) is False
+    assert engine.process_setup_tick("CE", 106.0, datetime(2026, 8, 10, 10, 4, 0)) is False
+    assert state.pending_entry is None
+    assert state.entry_ready is False
 
 
 def test_engine_places_ema21_stop_entry_at_red_high():
@@ -528,6 +591,65 @@ def test_ema21_warmup_does_not_leave_stale_entry_setup():
     assert state.pending_entry is None
     assert state.position is None
     assert not any(alert.category == "SIGNAL" for alert in engine.alerts)
+
+
+def test_ema21_warmup_can_preserve_setup_for_next_closed_candle():
+    provider = EMA21SignalProvider()
+    engine = BaseStrategyEngine(
+        StrategyConfig(max_option_risk_points=20.0),
+        RiskConfig(max_sl_per_day=3),
+        HistoricalReplayBroker(),
+        provider,
+    )
+    engine.state.trading_day = datetime(2026, 8, 10).date()
+    engine.state.atm_locked = True
+    engine.state.ce = provider.create_side_state()
+    engine.state.ce.option_symbol = "NIFTY12AUG2625000CE"
+
+    previous = _row(0, open_=100, high=101, low=98, close=99, ema=100)
+    setup = _row(1, open_=99, high=103, low=95, close=101, ema=100)
+    first_red = _row(2, open_=105, high=108, low=100, close=102, ema=101)
+
+    engine.process_option_candle(
+        "CE", setup, previous, allow_entries=False, preserve_setup_state=True
+    )
+    engine.process_option_candle(
+        "CE", first_red, setup, allow_entries=False, preserve_setup_state=True
+    )
+
+    state = engine.state.ce
+    assert state.setup_active is True
+    assert state.confirmation_count == 1
+    assert state.entry_ready is True
+    assert provider.generate_signal("CE", state, first_red, setup) == Signal.BUY_CE
+
+
+def test_ema21_preserves_setup_when_daily_entry_cap_rejects_signal():
+    provider = EMA21SignalProvider()
+    engine = BaseStrategyEngine(
+        StrategyConfig(max_option_risk_points=20.0),
+        RiskConfig(max_sl_per_day=3),
+        HistoricalReplayBroker(),
+        provider,
+    )
+    engine.state.trading_day = datetime(2026, 8, 10).date()
+    engine.state.atm_locked = True
+    engine.total_entries = engine.cfg.max_trades_per_day
+    engine.state.ce = provider.create_side_state()
+    engine.state.ce.option_symbol = "NIFTY12AUG2625000CE"
+
+    previous = _row(0, open_=100, high=101, low=98, close=99, ema=100)
+    setup = _row(1, open_=99, high=103, low=95, close=101, ema=100)
+    first_red = _row(2, open_=105, high=108, low=100, close=102, ema=101)
+
+    engine.process_option_candle("CE", setup, previous)
+    engine.process_option_candle("CE", first_red, setup)
+
+    state = engine.state.ce
+    assert state.entry_ready is True
+    assert state.first_red_high == 108.0
+    assert state.entry_block_reason == "daily-filled-entry-cap"
+    assert provider.format_setup_status(state).startswith("ENTRY_BLOCKED")
 
 
 def test_ema21_does_not_reenter_after_same_candle_position_exit():
@@ -793,7 +915,7 @@ def test_engine_skips_live_entry_when_broker_position_already_exists():
     assert any("broker position already exists" in alert.message for alert in engine.alerts)
 
 
-def test_engine_ema21_one_lot_trails_after_one_and_half_rr():
+def test_engine_ema21_one_lot_trails_at_documented_rr_milestone():
     provider = EMA21SignalProvider()
     engine = BaseStrategyEngine(
         StrategyConfig(max_option_risk_points=20.0),
@@ -819,7 +941,7 @@ def test_engine_ema21_one_lot_trails_after_one_and_half_rr():
     assert position is not None
     assert position.quantity == 65
     assert position.breakeven_armed is True
-    assert position.trailing_sl_level == pytest.approx(139.5)
+    assert position.trailing_sl_level == pytest.approx(133.0)
     assert not any("full exit (1-lot)" in alert.message for alert in engine.alerts)
 
 
@@ -886,7 +1008,7 @@ def test_engine_ema21_candle_low_breach_exits_position(tmp_path, monkeypatch):
     assert "option low 128.50 <= SL 128.55" in engine.alerts[-1].message
 
 
-def test_engine_ema21_moves_to_breakeven_at_one_and_half_rr():
+def test_engine_ema21_trails_at_one_and_half_rr():
     provider = EMA21SignalProvider()
     engine = BaseStrategyEngine(
         StrategyConfig(),
@@ -914,7 +1036,7 @@ def test_engine_ema21_moves_to_breakeven_at_one_and_half_rr():
     assert engine.state.ce.position is not None
     assert engine.state.ce.position.quantity == 130
     assert engine.state.ce.position.breakeven_armed is True
-    assert engine.state.ce.position.trailing_sl_level == pytest.approx(57.10)
+    assert engine.state.ce.position.trailing_sl_level == pytest.approx(62.225)
 
 
 def test_engine_ema21_keeps_full_position_and_trails_at_two_rr():
@@ -946,7 +1068,7 @@ def test_engine_ema21_keeps_full_position_and_trails_at_two_rr():
     assert position is not None
     assert position.quantity == 130
     assert position.t2_done is False
-    assert position.trailing_sl_level == pytest.approx(72.475)
+    assert position.trailing_sl_level == pytest.approx(67.35)
 
 
 def test_replay_stop_limit_fill_uses_trigger_not_candle_close():

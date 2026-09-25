@@ -86,6 +86,15 @@ class SignalProvider(ABC):
     def submit_stop_limit_on_signal(self) -> bool:
         return getattr(self, "strategy_key", None) == "ema21"
 
+    def pending_entry_cancellation_reason(
+        self,
+        side: str,
+        side_state: BaseSideState,
+        row: pd.Series,
+        prev_row: Optional[pd.Series],
+    ) -> Optional[str]:
+        return None
+
     def format_setup_status(self, side_state: BaseSideState) -> str:
         """Return a human-readable string describing the current setup state."""
         return ""

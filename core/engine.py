@@ -1031,6 +1031,15 @@ class BaseStrategyEngine:
         if pending is None:
             return
 
+        if self._is_ema21_strategy() and ts.time() >= self.cfg.entry_cutoff:
+            self._cancel_pending_entry_with_reason(
+                side,
+                side_state,
+                ts,
+                f"entry cutoff reached at {self.cfg.entry_cutoff.strftime('%H:%M')}",
+            )
+            return
+
         candle_seconds = max(1, self.cfg.timeframe_minutes * 60)
         elapsed_seconds = max(0.0, (ts - pending.created_at).total_seconds())
         candles_elapsed = int(elapsed_seconds // candle_seconds)
@@ -1260,7 +1269,7 @@ class BaseStrategyEngine:
     def manage_targets(self, side_state: BaseSideState, row: pd.Series) -> None:
         """FRD §6: Step-trailing SL logic.
 
-                - At 1.5 RR arm breakeven for every position size.
+                - At 1.0 RR arm breakeven for every position size.
                 - 2-lot: at 2.0 RR book 1 lot, then trail the remaining lot every
                     0.5 RR indefinitely.
                 - 1-lot: keep the lot open and trail it until the trailing SL hits.
@@ -1274,13 +1283,13 @@ class BaseStrategyEngine:
         partial_qty = self.cfg.half_size_lots * lot_qty
         ir = pos.option_risk_points
 
-        # At 1.5 RR — arm breakeven for both 1-lot and 2-lot positions.
+        # At 1.0 RR — arm breakeven for both 1-lot and 2-lot positions.
         if rr >= self.cfg.t1_rr and not pos.t1_done:
             pos.breakeven_armed = True
             pos.t1_done = True
             pos.trailing_sl_level = pos.entry_price
             pos.option_stop_level = pos.entry_price
-            pos.highest_rr_step = 1.5
+            pos.highest_rr_step = self.cfg.t1_rr
             pos.next_target_rr = self.cfg.t2_rr
             pos.progress_status = f"{self.cfg.t1_rr:.1f}R reached - looking for {self.cfg.t2_rr:.1f}R"
             if rr < self.cfg.t2_rr:
@@ -1288,7 +1297,7 @@ class BaseStrategyEngine:
             self._record_alert(
                 self.last_processed_candle_time or pos.entry_time,
                 "TARGET",
-                f"{pos.option_type} 1.5 RR hit — SL moved to entry (breakeven)",
+                f"{pos.option_type} {self.cfg.t1_rr:.1f} RR hit — SL moved to entry (breakeven)",
             )
 
         # Phase 3: At 2.0 RR — partial exit 1 lot.
@@ -1311,12 +1320,12 @@ class BaseStrategyEngine:
                 f"looking for {side_state.position.next_target_rr:.1f}R"
             )
 
-        # Step-trailing: at 2R, protect 1.5R, then advance by 0.5R.
+        # Step-trailing: at 1.5R protect 0.5R, then advance by 0.5R.
         if pos.breakeven_armed and ir > 0:
             step = max(self.cfg.trailing_step_rr, 0.01)
             current_step = int(rr / step) * step  # floor to the configured step
             if current_step > pos.highest_rr_step:
-                trail_offset = step if self._is_ema21_strategy() else self.cfg.t1_rr
+                trail_offset = self.cfg.t1_rr if self._is_ema21_strategy() else 1.5
                 new_sl = pos.entry_price + (current_step - trail_offset) * ir
                 if pos.trailing_sl_level is None or new_sl > pos.trailing_sl_level:
                     pos.trailing_sl_level = new_sl
@@ -1405,7 +1414,7 @@ class BaseStrategyEngine:
     # ── tick-level monitoring (FRD §5.2 / §6) ──────────────────────
 
     def process_setup_tick(self, side: str, ltp: float, ts: datetime) -> bool:
-        """Update a forming EMA21 confirmation candle and submit a new signal."""
+        """Process a setup tick; EMA21 entries are confirmed on closed candles only."""
         side_state = self._side_state(side)
         process_setup_tick = getattr(self.signal_provider, "process_setup_tick", None)
         if (
@@ -1481,18 +1490,22 @@ class BaseStrategyEngine:
         rr = (ltp - rr_entry) / ir
         lot_qty = self.cfg.option_lot_size
 
-        # At 1.5 RR — arm breakeven for both 1-lot and 2-lot positions.
+        # At 1.0 RR — arm breakeven for both 1-lot and 2-lot positions.
         if rr >= self.cfg.t1_rr and not pos.t1_done:
             pos.breakeven_armed = True
             pos.t1_done = True
             pos.trailing_sl_level = pos.entry_price
             pos.option_stop_level = pos.entry_price
-            pos.highest_rr_step = 1.5
+            pos.highest_rr_step = self.cfg.t1_rr
             pos.next_target_rr = self.cfg.t2_rr
             pos.progress_status = f"{self.cfg.t1_rr:.1f}R reached - looking for {self.cfg.t2_rr:.1f}R"
             if rr < self.cfg.t2_rr:
                 self._refresh_protective_stop(pos.option_type, pos, ts)
-                self._record_alert(ts, "TSL", f"{pos.option_type} 1.5 RR (tick) — SL to entry")
+                self._record_alert(
+                    ts,
+                    "TSL",
+                    f"{pos.option_type} {self.cfg.t1_rr:.1f} RR (tick) — SL to entry",
+                )
 
         # Phase 3: 2.0 RR — partial exit.
         if (
@@ -1512,12 +1525,12 @@ class BaseStrategyEngine:
             )
             pos = side_state.position
 
-        # Step-trailing: at 2R, protect 1.5R, then advance by 0.5R.
+        # Step-trailing: at 1.5R protect 0.5R, then advance by 0.5R.
         if pos.breakeven_armed and ir > 0:
             step = max(self.cfg.trailing_step_rr, 0.01)
             current_step = int(rr / step) * step
             if current_step > pos.highest_rr_step:
-                trail_offset = step if self._is_ema21_strategy() else self.cfg.t1_rr
+                trail_offset = self.cfg.t1_rr if self._is_ema21_strategy() else 1.5
                 new_sl = pos.entry_price + (current_step - trail_offset) * ir
                 if pos.trailing_sl_level is None or new_sl > pos.trailing_sl_level:
                     pos.trailing_sl_level = new_sl
@@ -1549,6 +1562,7 @@ class BaseStrategyEngine:
         row: pd.Series,
         prev_row: Optional[pd.Series],
         allow_entries: bool = True,
+        preserve_setup_state: bool = False,
     ) -> None:
         ts = row["datetime"]
         self.last_processed_candle_time = ts
@@ -1559,6 +1573,7 @@ class BaseStrategyEngine:
         signal: Signal = Signal.NONE
         remark = "NO_ENTRY"
         trade_initiated = False
+        state_updated = False
         had_pending_before = side_state.pending_entry is not None
         had_position_before = side_state.position is not None
 
@@ -1588,6 +1603,19 @@ class BaseStrategyEngine:
             self._record_trace_row(side, side_state, row, signal, False, remark)
             return
 
+        if self._is_ema21_strategy() and ts.time() >= self.cfg.entry_cutoff:
+            if side_state.pending_entry is not None:
+                self._cancel_pending_entry_with_reason(
+                    side,
+                    side_state,
+                    ts,
+                    f"entry cutoff reached at {self.cfg.entry_cutoff.strftime('%H:%M')}",
+                )
+            self.monitor_open_position(side_state, row)
+            remark = "OUTSIDE_ENTRY_WINDOW"
+            self._record_trace_row(side, side_state, row, signal, False, remark)
+            return
+
         if not self.in_signal_window(ts):
             if side_state.pending_entry is not None:
                 self._cancel_pending_entry_with_reason(
@@ -1602,6 +1630,9 @@ class BaseStrategyEngine:
             return
 
         if not allow_entries:
+            if preserve_setup_state:
+                self.signal_provider.update_state(side_state, row, prev_row)
+                state_updated = True
             self.monitor_open_position(side_state, row)
             if (
                 self._is_ema21_strategy()
@@ -1616,7 +1647,8 @@ class BaseStrategyEngine:
                     is_hard_sl=False,
                     row=row,
                 )
-            self.signal_provider.reset_after_entry(side_state)
+            if not preserve_setup_state:
+                self.signal_provider.reset_after_entry(side_state)
             self._record_trace_row(side, side_state, row, signal, False, "STATE_WARMUP")
             return
 
@@ -1662,7 +1694,20 @@ class BaseStrategyEngine:
 
         # Delegate signal generation to the strategy provider.
         setup_was_active = getattr(side_state, "setup_active", False)
-        self.signal_provider.update_state(side_state, row, prev_row)
+        if not state_updated:
+            self.signal_provider.update_state(side_state, row, prev_row)
+        if side_state.pending_entry is not None:
+            cancellation_reason = self.signal_provider.pending_entry_cancellation_reason(
+                side, side_state, row, prev_row
+            )
+            if cancellation_reason:
+                self._cancel_pending_entry_with_reason(
+                    side, side_state, ts, cancellation_reason
+                )
+                self._record_trace_row(
+                    side, side_state, row, signal, False, "PENDING_ENTRY_CANCELLED"
+                )
+                return
         if (
             self._is_ema21_strategy()
             and not setup_was_active
@@ -1736,11 +1781,10 @@ class BaseStrategyEngine:
             else:
                 remark = "SIGNAL_REJECTED_BY_RISK_OR_STATE"
                 if self._is_ema21_strategy() and not side_state.order_submission_uncertain:
-                    self.signal_provider.reset_after_entry(side_state)
                     self._record_alert(
                         ts,
                         "CANCEL",
-                        f"{side} EMA21 setup reset after entry was rejected; waiting for new setup",
+                        f"{side} EMA21 entry rejected; preserving setup state for visibility",
                     )
         elif self.diagnose:
             self._diagnose_side(side, side_state, ts, row, prev_row)

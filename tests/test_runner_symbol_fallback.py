@@ -25,6 +25,28 @@ def _sample_df() -> pd.DataFrame:
     )
 
 
+def test_normalize_history_drops_invalid_ohlc_rows_and_fills_volume():
+    raw = pd.DataFrame(
+        {
+            "datetime": [
+                datetime(2026, 8, 8, 9, 20),
+                datetime(2026, 8, 8, 9, 25),
+                datetime(2026, 8, 8, 9, 30),
+            ],
+            "open": [100.0, None, 102.0],
+            "high": [101.0, 103.0, 103.0],
+            "low": [99.0, 101.0, 101.0],
+            "close": [100.5, 102.0, float("inf")],
+            "volume": [1000.0, None, 1200.0],
+        }
+    )
+
+    normalized = runner._normalize_history_df(raw)
+
+    assert normalized["datetime"].tolist() == [datetime(2026, 8, 8, 9, 20)]
+    assert normalized["volume"].tolist() == [1000.0]
+
+
 class PositionBookBroker(ConsoleBroker):
     requires_position_reconciliation = True
 
@@ -166,6 +188,56 @@ def test_restore_clears_confirmed_flat_uncertain_entry_state(tmp_path, monkeypat
 
     assert state.order_submission_uncertain is False
     assert state.setup_active is False
+
+
+def test_restore_does_not_reclear_setup_formed_after_stale_uncertain_entry_resolved(
+    tmp_path, monkeypatch
+):
+    """Regression: a setup that forms later in the day must not be wiped by
+    every subsequent poll just because the (day-fixed) option symbol matches
+    an already-resolved UNCERTAIN_ENTRY alert from earlier in the session."""
+    monkeypatch.chdir(tmp_path)
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    alert_path = logs / "trade_alerts_NIFTY_20260908.csv"
+    alert_path.write_text(
+        "timestamp,strategy,category,message\n"
+        "2026-09-08 09:30:00,EMA21SignalProvider,UNCERTAIN_ENTRY,"
+        "Uncertain CE NIFTY15SEP2623700CE qty=130 trigger=177.80 SL=159.55\n",
+        encoding="utf-8",
+    )
+
+    broker = PositionBookBroker([])
+    provider = EMA21SignalProvider()
+    engine = BaseStrategyEngine(
+        StrategyConfig(option_index_symbol="NIFTY"),
+        RiskConfig(),
+        broker,
+        provider,
+    )
+    engine.state.ce = provider.create_side_state()
+    state = engine.state.ce
+    state.option_symbol = "NIFTY15SEP2623700CE"
+    state.order_submission_uncertain = True
+    state.setup_active = True
+
+    # First poll resolves the stale uncertain entry (legitimate one-time cleanup).
+    runner._restore_open_positions(engine, broker, datetime(2026, 9, 8).date())
+    assert state.setup_active is False
+
+    # A brand-new, unrelated setup forms on a later candle within the same day.
+    state.setup_active = True
+    state.confirmation_count = 1
+    state.entry_ready = True
+    state.first_red_high = 200.0
+
+    # A later poll cycle must not wipe the new setup just because the symbol
+    # matches an old, already-resolved UNCERTAIN_ENTRY alert.
+    runner._restore_open_positions(engine, broker, datetime(2026, 9, 8).date())
+
+    assert state.setup_active is True
+    assert state.entry_ready is True
+    assert state.first_red_high == 200.0
 
 
 def test_restore_adopts_open_order_after_timeout_instead_of_cancelling(tmp_path, monkeypatch):

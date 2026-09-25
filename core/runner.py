@@ -6,11 +6,12 @@ import json
 import os
 import re
 import threading
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from typing import Optional
 from zoneinfo import ZoneInfo
 
+import numpy as np
 import pandas as pd
 
 from core.broker import HistoricalReplayBroker, OpenAlgoBroker
@@ -20,6 +21,15 @@ from core.models import PendingEntry, RiskConfig, Signal, StrategyAlert, Strateg
 from strategies.base import SignalProvider
 
 logger = logging.getLogger("core.runner")
+_IST = ZoneInfo("Asia/Kolkata")
+
+
+def _now_ist() -> datetime:
+    return datetime.now(_IST)
+
+
+def _now_ist_naive() -> datetime:
+    return _now_ist().replace(tzinfo=None)
 
 
 def _reset_signal_state(engine: BaseStrategyEngine, side_state) -> None:
@@ -556,6 +566,8 @@ def _restore_open_positions(engine: BaseStrategyEngine, broker: OpenAlgoBroker, 
                 alert.category == "CANCEL" and symbol in alert.message
                 for alert in engine.alerts
             )
+            if already_cleared:
+                continue
             try:
                 _, _, _, side = _parse_option_symbol(symbol)
             except ValueError:
@@ -566,8 +578,6 @@ def _restore_open_positions(engine: BaseStrategyEngine, broker: OpenAlgoBroker, 
                     side_state.order_submission_uncertain = False
                     side_state.pending_entry = None
                     _reset_signal_state(engine, side_state)
-            if already_cleared:
-                continue
             engine._record_alert(
                 datetime.now(), "CANCEL",
                 f"Cleared stale uncertain entry state for {symbol}; no broker order or position",
@@ -691,6 +701,14 @@ def _restore_open_positions(engine: BaseStrategyEngine, broker: OpenAlgoBroker, 
         except ValueError:
             continue
         side_state = engine._side_state(side)
+        owned_symbols = {
+            getattr(side_state, "option_symbol", None),
+            engine.state.ce_symbol if side == "CE" else engine.state.pe_symbol,
+        }
+        owned_symbols.discard(None)
+        if not owned_symbols or symbol not in owned_symbols:
+            logger.warning("ignoring unrelated open BUY order during restore: %s", symbol)
+            continue
         if side_state.position is not None or side_state.pending_entry is not None:
             continue
 
@@ -793,6 +811,19 @@ def _reconcile_pending_entry_fills(
             order_id = getattr(pending, "order_id", None) if pending is not None else None
             if pending is None or not order_id:
                 continue
+            now = _now_ist_naive()
+            if engine._is_ema21_strategy() and now.time() >= engine.cfg.entry_cutoff:
+                if engine._cancel_pending_entry_order(side, pending, now):
+                    side_state = engine._side_state(side)
+                    side_state.pending_entry = None
+                    _reset_signal_state(engine, side_state)
+                    engine._record_alert(
+                        now,
+                        "CANCEL",
+                        f"{side} pending entry cancelled at entry cutoff "
+                        f"{engine.cfg.entry_cutoff.strftime('%H:%M')}",
+                    )
+                continue
             try:
                 status = broker.get_order_status(order_id)
             except Exception as exc:
@@ -870,6 +901,12 @@ def _normalize_history_df(df: pd.DataFrame) -> pd.DataFrame:
     out[["open", "high", "low", "close", "volume"]] = out[
         ["open", "high", "low", "close", "volume"]
     ].apply(pd.to_numeric, errors="coerce")
+    ohlc = ["open", "high", "low", "close"]
+    valid = out["datetime"].notna() & np.isfinite(out[ohlc]).all(axis=1)
+    valid &= out["high"].ge(out[["open", "close"]].max(axis=1))
+    valid &= out["low"].le(out[["open", "close"]].min(axis=1))
+    out = out.loc[valid]
+    out["volume"] = out["volume"].fillna(0.0)
     return out.sort_values("datetime").reset_index(drop=True)
 
 
@@ -1049,7 +1086,13 @@ class LiveFeedRunner:
             for i, (_, row) in enumerate(warmup.iterrows()):
                 pos_in_full = data.index.get_loc(row.name)
                 prev_row = data.iloc[pos_in_full - 1] if pos_in_full > 0 else None
-                self.engine.process_option_candle(side, row, prev_row, allow_entries=False)
+                self.engine.process_option_candle(
+                    side,
+                    row,
+                    prev_row,
+                    allow_entries=False,
+                    preserve_setup_state=True,
+                )
             self._startup_baselined.add(side)
             logger.info(
                 "warmed %s through %s without entries; processing new closed bars normally",
@@ -1176,12 +1219,20 @@ class LiveFeedRunner:
         return False
 
     def _poll_active_ticks(self) -> None:
+        now = _now_ist_naive()
+        engine_cfg = getattr(self.engine, "cfg", None)
+        force_square_off = getattr(engine_cfg, "force_square_off", time(15, 10))
+        if now.time() >= force_square_off:
+            for side in ("CE", "PE"):
+                self.engine.force_square_off_side(
+                    self.engine._side_state(side), now
+                )
         if any(
             getattr(self.engine._side_state(side), "order_submission_uncertain", False)
             for side in ("CE", "PE")
         ):
-            _restore_open_positions(self.engine, self.broker, datetime.now().date())
-        _reconcile_pending_entry_fills([self.engine], self.broker, datetime.now().date())
+            _restore_open_positions(self.engine, self.broker, now.date())
+        _reconcile_pending_entry_fills([self.engine], self.broker, now.date())
         _clear_positions_missing_from_broker([self.engine], self.broker)
         active_symbols: dict[str, list[tuple[str, object]]] = {}
         for side in ("CE", "PE"):
@@ -1205,7 +1256,7 @@ class LiveFeedRunner:
                 logger.warning("tick quote failed for %s: %s", symbol, exc)
                 continue
             if ltp > 0:
-                tick_time = datetime.now()
+                tick_time = now
                 active_subscriptions = [
                     (side, side_state)
                     for side, side_state in subscriptions
@@ -1530,7 +1581,13 @@ class MultiEngineLiveFeedRunner:
                 pos_in_full = data.index.get_loc(row.name)
                 prev_row = data.iloc[pos_in_full - 1] if pos_in_full > 0 else None
                 for _, engine in self.engines:
-                    engine.process_option_candle(side, row, prev_row, allow_entries=False)
+                    engine.process_option_candle(
+                        side,
+                        row,
+                        prev_row,
+                        allow_entries=False,
+                        preserve_setup_state=True,
+                    )
             self._startup_baselined.add(side)
             logger.info(
                 "warmed %s through %s without entries; processing new closed bars normally",
@@ -1629,7 +1686,13 @@ class MultiEngineLiveFeedRunner:
             datetime.now().date(),
         )
         _clear_positions_missing_from_broker([engine for _, engine in self.engines], self.broker)
-        now = datetime.now()
+        now = _now_ist_naive()
+        if now.time() >= self.cfg.force_square_off:
+            for _, engine in self.engines:
+                for side in ("CE", "PE"):
+                    engine.force_square_off_side(
+                        engine._side_state(side), now
+                    )
         active_symbols: dict[str, list[tuple[BaseStrategyEngine, str, object]]] = {}
         for _, engine in self.engines:
             for side in ("CE", "PE"):

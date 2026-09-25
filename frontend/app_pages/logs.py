@@ -214,25 +214,19 @@ def _market_data_logs_df() -> pd.DataFrame:
     setup_mask = df["Category"].astype(str).str.upper().eq("SETUP_STATUS")
     if setup_mask.any():
         setup_indexes = df.index[setup_mask]
-        normalized_messages = [
-            _normalize_setup_status_message(message, timestamp)
+        # Keep the backend's own "candle=" reference intact: it legitimately
+        # differs between a closed-candle confirmation (the candle just
+        # evaluated) and a live tick update (the candle currently forming).
+        # Rewriting it to the write-time's 3-minute floor previously made
+        # closed-candle rows collide with unrelated live-tick rows below,
+        # silently dropping the real confirmation event as a "duplicate".
+        candle_timestamps = [
+            _setup_candle_timestamp(message, timestamp)
             for message, timestamp in zip(
                 df.loc[setup_mask, "Message"],
                 df.loc[setup_mask, "Timestamp"],
             )
         ]
-        candle_timestamps = [
-            _setup_candle_timestamp(message, timestamp)
-            for message, timestamp in zip(
-                normalized_messages,
-                df.loc[setup_mask, "Timestamp"],
-            )
-        ]
-        df.loc[setup_mask, "Message"] = pd.Series(
-            normalized_messages,
-            index=setup_indexes,
-            dtype="string",
-        )
         df["Candle Timestamp"] = pd.Series(
             pd.NaT,
             index=df.index,
@@ -274,23 +268,6 @@ def _setup_candle_timestamp(message: object, timestamp: pd.Timestamp) -> pd.Time
         minute=int(match.group(2)),
         second=int(match.group(3)),
         microsecond=0,
-    )
-
-
-def _normalize_setup_status_message(message: object, timestamp: pd.Timestamp) -> str:
-    text = str(message)
-    if not re.search(r"candle=\d{2}:\d{2}:\d{2}", text, re.IGNORECASE):
-        return text
-    candle_timestamp = timestamp.replace(
-        minute=timestamp.minute - (timestamp.minute % 3),
-        second=0,
-        microsecond=0,
-    )
-    return re.sub(
-        r"candle=\d{2}:\d{2}:\d{2}",
-        f"candle={candle_timestamp:%H:%M:%S}",
-        text,
-        flags=re.IGNORECASE,
     )
 
 

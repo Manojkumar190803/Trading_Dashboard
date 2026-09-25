@@ -42,7 +42,7 @@ class StrategyConfig:
     signal_cutoff: time = time(15, 0)
     atm_lock_time: time = time(9, 20)
     entry_start: time = time(9, 20)
-    entry_cutoff: time = time(14, 45)
+    entry_cutoff: time = time(14, 40)
 
     # ── Indicators (applied to the option premium chart) ─────────────
     ema_fast: int = 13
@@ -62,7 +62,7 @@ class StrategyConfig:
     max_trades_per_day: int = 3
 
     # ── Targets (RR multiples) ───────────────────────────────────────
-    t1_rr: float = 1.5
+    t1_rr: float = 1.0
     t2_rr: float = 2.0
 
 
