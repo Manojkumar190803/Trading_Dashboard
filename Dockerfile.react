@@ -1,0 +1,35 @@
+# React Dashboard Container
+# Serves the React trading dashboard on port 3000
+FROM node:18-alpine
+
+LABEL maintainer="Trading Strategy"
+LABEL description="React Trading Dashboard"
+
+# Set working directory
+WORKDIR /app
+
+# Copy package files
+COPY frontend-react/package*.json ./
+
+# Install dependencies
+RUN npm ci
+
+# Copy React source code
+COPY frontend-react/src ./src
+COPY frontend-react/public ./public
+COPY frontend-react/index.html ./
+COPY frontend-react/vite.config.ts ./
+COPY frontend-react/tsconfig.json ./
+COPY frontend-react/tsconfig.node.json ./
+COPY frontend-react/tailwind.config.ts ./
+COPY frontend-react/postcss.config.js ./
+
+# Expose port
+EXPOSE 3000
+
+# Set environment for development
+ENV VITE_APP_TITLE="Trading Strategy Dashboard" \
+    NODE_ENV=development
+
+# Start development server with HMR support
+CMD ["npm", "run", "dev"]

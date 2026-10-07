@@ -1,0 +1,256 @@
+@import 'tailwindcss/base';
+@import 'tailwindcss/components';
+@import 'tailwindcss/utilities';
+
+/* ==================== Custom Global Styles ==================== */
+
+* {
+  @apply transition-colors duration-200;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  @apply bg-bg-primary text-text-primary antialiased;
+  font-feature-settings: 'rlig' 1, 'calt' 1;
+}
+
+/* Scrollbar Styling */
+::-webkit-scrollbar {
+  @apply w-2 h-2;
+}
+
+::-webkit-scrollbar-track {
+  @apply bg-bg-secondary;
+}
+
+::-webkit-scrollbar-thumb {
+  @apply bg-bg-tertiary rounded hover:bg-bg-surface;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  @apply bg-bg-surface;
+}
+
+/* Selection Styling */
+::selection {
+  @apply bg-accent-cyan/30 text-text-primary;
+}
+
+/* Focus Styles */
+:focus-visible {
+  @apply outline-none ring-2 ring-accent-cyan ring-offset-2 ring-offset-bg-primary rounded;
+}
+
+/* Links */
+a {
+  @apply text-accent-cyan hover:text-accent-cyan/80 transition-colors;
+}
+
+/* Buttons */
+button {
+  @apply focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-cyan focus-visible:ring-offset-2 focus-visible:ring-offset-bg-primary;
+}
+
+/* Form Elements */
+input,
+textarea,
+select {
+  @apply bg-bg-surface border border-bg-tertiary rounded text-text-primary placeholder-text-tertiary focus:outline-none focus:ring-2 focus:ring-accent-cyan focus:border-transparent;
+}
+
+input:disabled,
+textarea:disabled,
+select:disabled {
+  @apply bg-bg-secondary text-text-tertiary cursor-not-allowed;
+}
+
+/* Code Blocks */
+code {
+  @apply font-mono text-sm bg-bg-surface text-accent-cyan px-2 py-1 rounded;
+}
+
+pre {
+  @apply bg-bg-surface border border-bg-tertiary rounded p-4 overflow-auto;
+}
+
+pre code {
+  @apply bg-transparent p-0;
+}
+
+/* Tables */
+table {
+  @apply w-full border-collapse;
+}
+
+th {
+  @apply bg-bg-secondary text-text-secondary text-xs uppercase tracking-wider font-semibold;
+}
+
+td {
+  @apply border-b border-bg-tertiary;
+}
+
+/* ==================== Component Utilities ==================== */
+
+/* Glass Effect */
+.glass {
+  @apply bg-bg-primary/80 backdrop-blur-md border border-bg-tertiary/50;
+}
+
+/* Gradient Text */
+.gradient-text {
+  @apply bg-gradient-to-r from-accent-cyan to-accent-blue bg-clip-text text-transparent;
+}
+
+/* Shadow Utilities */
+.shadow-glow {
+  box-shadow: 0 0 20px rgba(89, 208, 255, 0.3);
+}
+
+.shadow-glow-green {
+  box-shadow: 0 0 20px rgba(39, 212, 138, 0.3);
+}
+
+.shadow-glow-red {
+  box-shadow: 0 0 20px rgba(255, 95, 109, 0.3);
+}
+
+/* Status Indicator */
+.status-indicator {
+  @apply inline-flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs font-medium;
+}
+
+.status-indicator.success {
+  @apply bg-accent-green/10 text-accent-green border border-accent-green/30;
+}
+
+.status-indicator.warning {
+  @apply bg-accent-yellow/10 text-accent-yellow border border-accent-yellow/30;
+}
+
+.status-indicator.error {
+  @apply bg-accent-red/10 text-accent-red border border-accent-red/30;
+}
+
+.status-indicator.info {
+  @apply bg-accent-cyan/10 text-accent-cyan border border-accent-cyan/30;
+}
+
+/* Card Styling */
+.card {
+  @apply bg-gradient-to-br from-bg-surface to-bg-tertiary border border-bg-tertiary/50 rounded-xl p-4 shadow-card hover:shadow-card-hover transition-all duration-300;
+}
+
+.card-hover {
+  @apply cursor-pointer hover:border-accent-cyan/50 hover:shadow-glow;
+}
+
+/* Metric Display */
+.metric-card {
+  @apply card space-y-1;
+}
+
+.metric-label {
+  @apply text-xs uppercase tracking-wider text-text-secondary font-semibold;
+}
+
+.metric-value {
+  @apply text-2xl font-bold text-text-primary;
+}
+
+.metric-sublabel {
+  @apply text-xs text-text-tertiary;
+}
+
+/* Loading Animation */
+.loading-skeleton {
+  @apply bg-gradient-to-r from-bg-surface via-bg-tertiary to-bg-surface bg-[length:200%_100%] animate-pulse;
+  animation: shimmer 2s infinite;
+}
+
+@keyframes shimmer {
+  0% {
+    background-position: -200% 0;
+  }
+  100% {
+    background-position: 200% 0;
+  }
+}
+
+/* Tooltip */
+.tooltip {
+  @apply absolute hidden group-hover:block bg-bg-tertiary border border-bg-surface text-text-secondary text-xs rounded px-2 py-1 whitespace-nowrap z-50;
+}
+
+/* Badge */
+.badge {
+  @apply inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium;
+}
+
+.badge-primary {
+  @apply bg-accent-cyan/10 text-accent-cyan border border-accent-cyan/30;
+}
+
+.badge-success {
+  @apply bg-accent-green/10 text-accent-green border border-accent-green/30;
+}
+
+.badge-warning {
+  @apply bg-accent-yellow/10 text-accent-yellow border border-accent-yellow/30;
+}
+
+.badge-danger {
+  @apply bg-accent-red/10 text-accent-red border border-accent-red/30;
+}
+
+/* Divider */
+.divider {
+  @apply border-t border-bg-tertiary/50;
+}
+
+/* Animation Classes */
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes slideInUp {
+  from {
+    transform: translateY(10px);
+    opacity: 0;
+  }
+  to {
+    transform: translateY(0);
+    opacity: 1;
+  }
+}
+
+@keyframes slideInLeft {
+  from {
+    transform: translateX(-10px);
+    opacity: 0;
+  }
+  to {
+    transform: translateX(0);
+    opacity: 1;
+  }
+}
+
+.animate-fade-in {
+  animation: fadeIn 0.3s ease-in-out;
+}
+
+.animate-slide-in-up {
+  animation: slideInUp 0.4s ease-out;
+}
+
+.animate-slide-in-left {
+  animation: slideInLeft 0.4s ease-out;
+}

@@ -236,11 +236,15 @@ class EMA21SignalProvider(SignalProvider):
         assert isinstance(side_state, EMA21SideState)
         if side_state.position is not None:
             return "POSITION_ACTIVE"
+        # Counting intentionally keeps advancing past the window once a red
+        # trigger is found (see test_provider_keeps_setup_active_past_max_
+        # confirmations_once_red_found) so it must be capped for display only.
+        displayed_count = min(side_state.confirmation_count, self.ema21_cfg.confirmation_candles)
         if side_state.pending_entry is not None:
             alert = " alert-candle-triggered" if side_state.first_red_time is not None else ""
             return (
                 f"ENTRY_PENDING broker-trigger confirmations="
-                f"{side_state.confirmation_count}/{self.ema21_cfg.confirmation_candles}"
+                f"{displayed_count}/{self.ema21_cfg.confirmation_candles}"
                 f"{alert}"
             )
         if side_state.order_submission_uncertain:
@@ -249,7 +253,7 @@ class EMA21SignalProvider(SignalProvider):
             return f"ENTRY_BLOCKED {side_state.entry_block_reason}"
         if side_state.entry_ready or side_state.first_red_high is not None:
             return (
-                f"ENTRY_READY confirmations={side_state.confirmation_count}/"
+                f"ENTRY_READY confirmations={displayed_count}/"
                 f"{self.ema21_cfg.confirmation_candles} alert-candle-triggered"
             )
         if side_state.setup_active:

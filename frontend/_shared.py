@@ -112,9 +112,11 @@ def render_alert_toasts(alert_rows: list[dict[str, object]] | None = None) -> No
         )
     st.markdown(
         "<style>"
-        ".oa-toast-stack{position:fixed;right:1.25rem;top:1.25rem;width:min(390px,calc(100vw - 2rem));"
+        # top offsets keep the stack and its clear button below Streamlit's
+        # own fixed header (Deploy button / app menu) so neither overlaps it.
+        ".oa-toast-stack{position:fixed;right:1.25rem;top:4.5rem;width:min(390px,calc(100vw - 2rem));"
         "z-index:999999;display:flex;flex-direction:column;gap:.65rem;pointer-events:none;}"
-        ".st-key-clear_alert_toasts{position:fixed;right:1.15rem;top:.75rem;z-index:1000000;}"
+        ".st-key-clear_alert_toasts{position:fixed;right:1.15rem;top:4rem;z-index:1000000;}"
         ".st-key-clear_alert_toasts button{border:0;border-radius:50%;width:1.65rem;height:1.65rem;"
         "padding:0;background:rgba(35,45,58,.92);color:#e5eef7;font-size:1.05rem;line-height:1;}"
         ".oa-toast{pointer-events:auto;border:1px solid rgba(255,255,255,.22);border-left:4px solid;"

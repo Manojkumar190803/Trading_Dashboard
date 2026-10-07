@@ -797,6 +797,31 @@ class BaseStrategyEngine:
         )
         return True
 
+    def _clear_stale_entry_ready(
+        self,
+        side: str,
+        side_state: BaseSideState,
+        ts: datetime,
+        reason: str,
+    ) -> None:
+        """Clear a completed setup that never got a live generate_signal() call.
+
+        Covers the case where entry_ready/first_red_high was set by a warmup
+        replay (allow_entries=False) or the setup outlived the entry/signal
+        window before a real order was ever attempted - without this, the
+        side would show ENTRY_READY forever with no chance to place an order.
+        """
+        if side_state.position is not None or side_state.pending_entry is not None:
+            return
+        if not getattr(side_state, "entry_ready", False):
+            return
+        self.signal_provider.reset_after_entry(side_state)
+        self._record_alert(
+            ts,
+            "CANCEL",
+            f"{side} entry-ready setup cleared: {reason}",
+        )
+
     def _cancel_uncertain_entry_order(self, side: str, side_state: BaseSideState, ts: datetime) -> bool:
         if self.broker.is_replay or not side_state.order_submission_uncertain:
             return True
@@ -942,6 +967,11 @@ class BaseStrategyEngine:
                     f"{side} trade cancelled before order: entry-SL gap {risk_points:.2f} "
                     f"> {self.cfg.max_option_risk_points:.2f} points",
                 )
+                # This trigger/stop pair is permanently invalid (same setup_low
+                # and first_red_high would keep failing), so reset the
+                # confirmation candle instead of leaving the side stuck in
+                # ENTRY_READY waiting for an expiry timeout.
+                self.signal_provider.reset_after_entry(side_state)
                 return
 
         # Legacy strategies retain the existing VWAP room filter.
@@ -1041,7 +1071,10 @@ class BaseStrategyEngine:
             return
 
         candle_seconds = max(1, self.cfg.timeframe_minutes * 60)
-        elapsed_seconds = max(0.0, (ts - pending.created_at).total_seconds())
+        # Normalize datetimes to handle timezone-aware vs timezone-naive mismatch
+        ts_normalized = ts.replace(tzinfo=None) if ts.tzinfo else ts
+        created_at_normalized = pending.created_at.replace(tzinfo=None) if pending.created_at.tzinfo else pending.created_at
+        elapsed_seconds = max(0.0, (ts_normalized - created_at_normalized).total_seconds())
         candles_elapsed = int(elapsed_seconds // candle_seconds)
         if candles_elapsed > self.cfg.pending_entry_expiry_candles:
             self._cancel_pending_entry_with_reason(
@@ -1611,6 +1644,11 @@ class BaseStrategyEngine:
                     ts,
                     f"entry cutoff reached at {self.cfg.entry_cutoff.strftime('%H:%M')}",
                 )
+            else:
+                self._clear_stale_entry_ready(
+                    side, side_state, ts,
+                    f"entry cutoff reached at {self.cfg.entry_cutoff.strftime('%H:%M')}",
+                )
             self.monitor_open_position(side_state, row)
             remark = "OUTSIDE_ENTRY_WINDOW"
             self._record_trace_row(side, side_state, row, signal, False, remark)
@@ -1622,6 +1660,11 @@ class BaseStrategyEngine:
                     side,
                     side_state,
                     ts,
+                    f"entry cutoff reached at {self.cfg.signal_cutoff.strftime('%H:%M')}",
+                )
+            else:
+                self._clear_stale_entry_ready(
+                    side, side_state, ts,
                     f"entry cutoff reached at {self.cfg.signal_cutoff.strftime('%H:%M')}",
                 )
             self.monitor_open_position(side_state, row)
@@ -1758,6 +1801,35 @@ class BaseStrategyEngine:
             remark = "EMA_CLOSE_EXIT"
             self._record_trace_row(side, side_state, row, signal, False, remark)
             return
+
+        first_red_time = getattr(side_state, "first_red_time", None)
+        if (
+            self._is_ema21_strategy()
+            and side_state.position is None
+            and side_state.pending_entry is None
+            and getattr(side_state, "entry_ready", False)
+            and first_red_time is not None
+        ):
+            # A restart's warmup replay runs with entries disabled, so a setup
+            # that completes there freezes first_red_time on a stale candle
+            # that never got a live generate_signal() call - it would
+            # otherwise sit in ENTRY_READY forever. Expire it like a normal
+            # pending order instead of leaving the side permanently stuck.
+            candle_seconds = max(1, self.cfg.timeframe_minutes * 60)
+            # Normalize datetimes to handle timezone-aware vs timezone-naive mismatch
+            row_datetime_normalized = row["datetime"].replace(tzinfo=None) if row["datetime"].tzinfo else row["datetime"]
+            first_red_time_normalized = first_red_time.replace(tzinfo=None) if first_red_time.tzinfo else first_red_time
+            elapsed_seconds = max(0.0, (row_datetime_normalized - first_red_time_normalized).total_seconds())
+            if elapsed_seconds // candle_seconds > self.cfg.pending_entry_expiry_candles:
+                self._clear_stale_entry_ready(
+                    side, side_state, ts,
+                    f"entry window expired ({int(elapsed_seconds // candle_seconds)} candles "
+                    f"since first_red={first_red_time.strftime('%H:%M')})",
+                )
+                remark = "ENTRY_READY_EXPIRED"
+                self._record_trace_row(side, side_state, row, signal, False, remark)
+                return
+
         signal = self.signal_provider.generate_signal(side, side_state, row, prev_row)
 
         if signal in (Signal.BUY_CE, Signal.BUY_PE):
@@ -1781,11 +1853,18 @@ class BaseStrategyEngine:
             else:
                 remark = "SIGNAL_REJECTED_BY_RISK_OR_STATE"
                 if self._is_ema21_strategy() and not side_state.order_submission_uncertain:
-                    self._record_alert(
-                        ts,
-                        "CANCEL",
-                        f"{side} EMA21 entry rejected; preserving setup state for visibility",
-                    )
+                    if getattr(side_state, "entry_ready", False):
+                        self._record_alert(
+                            ts,
+                            "CANCEL",
+                            f"{side} EMA21 entry rejected; preserving setup state for visibility",
+                        )
+                    else:
+                        self._record_alert(
+                            ts,
+                            "CANCEL",
+                            f"{side} EMA21 entry rejected; confirmation candle reset",
+                        )
         elif self.diagnose:
             self._diagnose_side(side, side_state, ts, row, prev_row)
             reason = self.signal_provider.diagnose_no_signal(side, side_state, row, prev_row)

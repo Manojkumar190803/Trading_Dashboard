@@ -1,0 +1,51 @@
+version: '3.8'
+
+# Development overrides for docker-compose.yml
+# This file is automatically loaded by docker-compose if it exists
+# Use this for local development with live code reloading
+
+services:
+  react_dashboard:
+    # Mount local source for live reloading
+    volumes:
+      - ./frontend-react/src:/app/src
+      - ./frontend-react/public:/app/public
+      - ./logs:/app/logs:ro
+    
+    # Keep dev server running and restart on failure
+    restart: on-failure:3
+    
+    # Enable HMR for Vite
+    environment:
+      NODE_ENV: development
+
+  strategy_worker:
+    # Mount local code for live reloading
+    volumes:
+      - ./core:/app/core
+      - ./strategies:/app/strategies
+      - ./run_strategy.py:/app/run_strategy.py
+      - ./logs:/app/logs
+      - ./data:/app/data
+    
+    # More verbose logging
+    environment:
+      LOG_LEVEL: DEBUG
+      PYTHONUNBUFFERED: 1
+    
+    # Restart on failure for development
+    restart: on-failure:3
+
+  streamlit_interface:
+    # Mount local frontend code
+    volumes:
+      - ./frontend:/app/frontend
+      - ./logs:/app/logs
+      - ./data:/app/data
+    
+    environment:
+      STREAMLIT_SERVER_RUNONSAVE: "true"
+      STREAMLIT_CLIENT_LOGGER_LEVEL: "debug"
+      LOG_LEVEL: DEBUG
+    
+    restart: on-failure:3

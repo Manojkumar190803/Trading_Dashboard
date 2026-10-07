@@ -446,6 +446,7 @@ def _restore_open_positions(engine: BaseStrategyEngine, broker: OpenAlgoBroker, 
         if path.exists():
             with path.open(newline="", encoding="utf-8") as handle:
                 alerts = [row for row in csv.DictReader(handle) if row.get("strategy") == engine.strategy_name]
+        print(f"[RESTORE-START] _restore_open_positions called: path exists={path.exists()}, alerts_count={len(alerts)}")
         broker_positions = broker.get_position_book()
         open_orders = broker.get_open_orders()
     except (OSError, ValueError) as exc:
@@ -454,16 +455,21 @@ def _restore_open_positions(engine: BaseStrategyEngine, broker: OpenAlgoBroker, 
 
     # A timed-out submission may have been accepted by the broker. Reconcile
     # matching open BUY orders before deciding that the submission failed.
+    # An UNCERTAIN_ENTRY record is only "live" if that specific attempt (same
+    # side + created_at minute) was never resolved by a later CANCEL - otherwise
+    # it is a stale record from an earlier, already-closed attempt and must not
+    # be matched against a fresh open order for the same option symbol.
+    cancel_pattern = re.compile(r"(CE|PE) alert at (\d{2}:\d{2}); entry missed")
+    resolved_alert_keys: set[tuple[str, str]] = set()
+    for alert in alerts:
+        if alert.get("category") != "CANCEL":
+            continue
+        match = cancel_pattern.search(str(alert.get("message") or ""))
+        if match is None:
+            continue
+        resolved_alert_keys.add((match.group(1), match.group(2)))
+
     uncertain_details: dict[str, tuple[str, int, float, float, datetime]] = {}
-    uncertain_symbols = {
-        symbol
-        for alert in alerts
-        if alert.get("category") == "UNCERTAIN_ENTRY"
-        for symbol in re.findall(
-            r"\b[A-Z]+\d{2}[A-Z]{3}\d{2}\d+(?:CE|PE)\b",
-            str(alert.get("message") or ""),
-        )
-    }
     uncertain_pattern = re.compile(
         r"Uncertain (CE|PE) (\S+) qty=(\d+) trigger=([\d.]+) SL=([\d.]+)"
     )
@@ -476,15 +482,20 @@ def _restore_open_positions(engine: BaseStrategyEngine, broker: OpenAlgoBroker, 
         side, symbol, quantity, trigger, stop = match.groups()
         try:
             alert_time = datetime.fromisoformat(str(alert["timestamp"]))
-            uncertain_details[symbol] = (
-                side,
-                int(quantity),
-                float(trigger),
-                float(stop),
-                alert_time,
-            )
         except (KeyError, TypeError, ValueError):
             continue
+        if (side, alert_time.strftime("%H:%M")) in resolved_alert_keys:
+            # This attempt was already cancelled; a later, unrelated open order
+            # for the same symbol must not inherit its stale created_at/SL.
+            continue
+        uncertain_details[symbol] = (
+            side,
+            int(quantity),
+            float(trigger),
+            float(stop),
+            alert_time,
+        )
+    uncertain_symbols = set(uncertain_details.keys())
     stale_uncertain_symbols: set[str] = set()
     for symbol, details in uncertain_details.items():
         _, _, _, _, uncertain_at = details
@@ -592,19 +603,76 @@ def _restore_open_positions(engine: BaseStrategyEngine, broker: OpenAlgoBroker, 
         quantity = int(float(position.get("quantity") or 0))
         if not symbol or quantity <= 0:
             continue
-        matching = [
-            row for row in alerts
-            if row.get("category") in ("ENTRY", "UNCERTAIN_ENTRY")
-            and symbol in str(row.get("message") or "")
-        ]
-        if matching:
+
+        # An option symbol is reused across many setup attempts in one day, so
+        # matching historical ENTRY/UNCERTAIN_ENTRY alert text by substring can
+        # pick up an older, unrelated (and already-cancelled) attempt's trigger
+        # and SL. The in-memory pending entry for this fill, when present, is
+        # the authoritative source and must be preferred over that alert scan.
+        live_pending: Optional[PendingEntry] = None
+        live_side: Optional[str] = None
+        for candidate_side in ("CE", "PE"):
+            candidate_state = engine._side_state(candidate_side)
+            candidate_pending = candidate_state.pending_entry
+            if candidate_pending is not None and candidate_pending.option_symbol == symbol:
+                live_pending = candidate_pending
+                live_side = candidate_side
+                break
+
+        if live_pending is not None:
+            side = live_side
+            avg_price_raw = position.get("average_price")
+            try:
+                avg_price = float(avg_price_raw) if avg_price_raw else None
+            except (ValueError, TypeError):
+                avg_price = None
+            if avg_price is None or avg_price <= 0:
+                logger.warning(
+                    "position restore: broker missing/invalid average_price for %s; "
+                    "broker returned: %s; using order trigger %.2f as fallback (verify manually!)",
+                    symbol, avg_price_raw, live_pending.option_trigger_level,
+                )
+                entry_price = live_pending.option_trigger_level
+            else:
+                entry_price = avg_price
+            trigger = str(live_pending.option_trigger_level)
+            stop = str(live_pending.option_stop_level)
+            risk = str(abs(live_pending.option_trigger_level - live_pending.option_stop_level))
+            entry_time = live_pending.created_at
+        elif (
+            matching := [
+                row for row in alerts
+                if row.get("category") in ("ENTRY", "UNCERTAIN_ENTRY")
+                and symbol in str(row.get("message") or "")
+            ]
+        ):
             match = entry_pattern.search(str(matching[-1].get("message") or ""))
             if match is None:
                 logger.warning("could not parse persisted entry for open position %s", symbol)
                 continue
             side, _, parsed_entry, _, trigger, stop, risk = match.groups()
             entry_alert = matching[-1]
-            entry_price = float(position.get("average_price") or parsed_entry or trigger)
+            avg_price_raw = position.get("average_price")
+            try:
+                avg_price = float(avg_price_raw) if avg_price_raw else None
+            except (ValueError, TypeError):
+                avg_price = None
+            if avg_price is not None and avg_price > 0:
+                entry_price = avg_price
+            elif parsed_entry:
+                logger.warning(
+                    "position restore: broker missing/invalid average_price for %s; "
+                    "using parsed alert entry price %.2f (verify manually!)",
+                    symbol, float(parsed_entry),
+                )
+                entry_price = float(parsed_entry)
+            else:
+                logger.warning(
+                    "position restore: broker missing/invalid average_price for %s; "
+                    "no parsed entry found; using order trigger %.2f as fallback (verify manually!)",
+                    symbol, float(trigger),
+                )
+                entry_price = float(trigger)
             risk = risk or str(abs(float(trigger) - float(stop)))
             entry_time = datetime.fromisoformat(str(entry_alert["timestamp"]))
         else:
@@ -660,7 +728,7 @@ def _restore_open_positions(engine: BaseStrategyEngine, broker: OpenAlgoBroker, 
         side_state.order_submission_uncertain = False
         engine.total_entries = max(
             engine.total_entries,
-            sum(row.get("category") in ("ENTRY", "UNCERTAIN_ENTRY") for row in alerts),
+            sum(row.get("category") == "ENTRY" for row in alerts),
         )
         if open_orders is not None and not already_restored:
             protective_orders = [
@@ -754,6 +822,13 @@ def _restore_open_positions(engine: BaseStrategyEngine, broker: OpenAlgoBroker, 
             "restored open %s entry order from OpenAlgo: %s qty=%s trigger=%.2f limit=%.2f",
             side, symbol, quantity, trigger, limit_price,
         )
+
+    # Ensure counter reflects actual ENTRY fills from CSV, even if no open positions exist
+    entry_count = sum(row.get("category") == "ENTRY" for row in alerts)
+    engine.total_entries = max(engine.total_entries, entry_count)
+    print(f"[RESTORE] post-restore: total_entries={engine.total_entries} from {entry_count} ENTRY records in CSV")
+    logger.info("post-restore: total_entries=%d from %d ENTRY records in CSV", 
+                engine.total_entries, entry_count)
 
 
 def _clear_positions_missing_from_broker(
@@ -1282,6 +1357,21 @@ class LiveFeedRunner:
             self.cfg.spot_symbol, self.cfg.exchange_spot, self.cfg.timeframe_minutes,
         )
         _load_persisted_trade_alerts(self.engine, datetime.now().date())
+        
+        # ── Load total_entries counter from CSV ────────────────────────────
+        # Count ENTRY records to restore daily entry limit tracking
+        path = _trade_alert_path(datetime.now().date(), self.engine.cfg.option_index_symbol)
+        if path.exists():
+            try:
+                with path.open(newline="", encoding="utf-8") as handle:
+                    alerts = [row for row in csv.DictReader(handle) if row.get("strategy") == self.engine.strategy_name]
+                    entry_count = sum(1 for row in alerts if row.get("category") == "ENTRY")
+                    self.engine.total_entries = entry_count
+                    print(f"[INIT] Loaded total_entries={entry_count} from CSV")
+                    logger.info("[INIT] Loaded total_entries=%d from CSV", entry_count)
+            except (OSError, ValueError) as exc:
+                logger.warning("[INIT] Failed to load entry count: %s", exc)
+        
         _print_persisted_trade_alerts(
             self.engine.strategy_name,
             datetime.now().date(),

@@ -886,6 +886,11 @@ def test_engine_does_not_create_order_when_entry_stop_gap_exceeds_25_points():
     assert state.pending_entry is None
     assert engine.total_entries == 0
     assert any("before order" in alert.message and "gap" in alert.message for alert in engine.alerts)
+    # The confirmation candle must reset since this trigger/SL pair is
+    # permanently invalid — retrying it every candle would never succeed.
+    assert state.entry_ready is False
+    assert state.first_red_high is None
+    assert state.setup_active is False
 
 
 def test_engine_skips_live_entry_when_broker_position_already_exists():

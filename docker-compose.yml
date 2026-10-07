@@ -1,19 +1,60 @@
+version: '3.8'
+
+x-common-variables: &common-variables
+  TZ: Asia/Kolkata
+  PYTHONUNBUFFERED: "1"
+  PYTHONDONTWRITEBYTECODE: "1"
+
+x-common-environment: &common-environment
+  <<: *common-variables
+  OPENALGO_HOST: http://host.docker.internal:5002
+  OPENALGO_WS_URL: ws://host.docker.internal:8766
+  WEBSOCKET_HOST: host.docker.internal
+  WEBSOCKET_PORT: "8766"
+
 x-live-defaults: &live-defaults
   build: .
   restart: always
   env_file: .env
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
   environment:
-    TZ: Asia/Kolkata
+    <<: *common-environment
     STRATEGY: ema21
     MODE: live
-    OPENALGO_HOST: http://host.docker.internal:5002
-    OPENALGO_WS_URL: ws://host.docker.internal:8766
-    WEBSOCKET_HOST: host.docker.internal
-    WEBSOCKET_PORT: "8766"
   volumes:
     - ./logs:/app/logs
+    - ./data:/app/data
 
 services:
+  # React Dashboard (Node.js Dev Server)
+  react_dashboard:
+    build:
+      context: .
+      dockerfile: Dockerfile.react
+    container_name: react_dashboard
+    labels:
+      com.openalgo.display-name: "React Trading Dashboard"
+    ports:
+      - "3000:3000"
+    restart: unless-stopped
+    volumes:
+      - ./frontend-react/src:/app/src
+      - ./frontend-react/public:/app/public
+      - ./logs:/app/logs:ro
+    environment:
+      <<: *common-variables
+      VITE_APP_TITLE: "Trading Strategy Dashboard"
+      VITE_LOGS_DIR: "/logs"
+    depends_on:
+      - strategy_worker
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:3000"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # Streamlit Dashboard (Legacy Frontend)
   streamlit_interface:
     <<: *live-defaults
     build:
@@ -21,40 +62,61 @@ services:
       dockerfile: Dockerfile.streamlit
     container_name: streamlit_interface
     labels:
-      com.openalgo.display-name: "Streamlit interface"
+      com.openalgo.display-name: "Streamlit Dashboard (Legacy)"
     ports:
       - "8502:8501"
     restart: unless-stopped
     environment:
-      TZ: Asia/Kolkata
+      <<: *common-environment
       STREAMLIT_SERVER_HEADLESS: "true"
       STREAMLIT_SERVER_ADDRESS: 0.0.0.0
       STREAMLIT_SERVER_PORT: "8501"
-      OPENALGO_HOST: http://host.docker.internal:5002
-      OPENALGO_WS_URL: ws://host.docker.internal:8766
-      WEBSOCKET_HOST: host.docker.internal
-      WEBSOCKET_PORT: "8766"
-      BACKGROUND_WORKER_ENABLED: "true"
+      BACKGROUND_WORKER_ENABLED: "false"
     volumes:
       - ./logs:/app/logs
-      - /var/run/docker.sock:/var/run/docker.sock
+      - ./data:/app/data
 
+  # Strategy Worker (Core Engine)
   strategy_worker:
     <<: *live-defaults
     container_name: strategy_worker
     labels:
       com.openalgo.display-name: "Strategy background worker"
     environment:
-      TZ: Asia/Kolkata
+      <<: *common-environment
       STRATEGY: ${STRATEGY:-ema21}
       MODE: ${MODE:-live}
       SCRIPT: ${SCRIPT:-NIFTY}
       BACKGROUND_WORKER_ENABLED: "true"
-      OPENALGO_HOST: http://host.docker.internal:5002
-      OPENALGO_WS_URL: ws://host.docker.internal:8766
-      WEBSOCKET_HOST: host.docker.internal
-      WEBSOCKET_PORT: "8766"
     volumes:
       - ./logs:/app/logs
+      - ./data:/app/data
 
+  # Dashboard Data Exporter (Syncs OpenAlgo & Fyers data to React)
+  dashboard_exporter:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: dashboard_exporter
+    labels:
+      com.openalgo.display-name: "Dashboard Data Exporter"
+    restart: unless-stopped
+    env_file: .env
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      <<: *common-environment
+      STRATEGY_MODE: ${STRATEGY_MODE:-analyzer}
+      EXPORT_INTERVAL: "1"
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      - ./logs:/app/logs
+      - ./data:/app/data
+    command: python3 export_dashboard_data.py ${STRATEGY_MODE:-analyzer} 1
+    depends_on:
+      - strategy_worker
+
+networks:
+  default:
+    name: trading-network
 
