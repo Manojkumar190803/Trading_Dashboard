@@ -10,7 +10,7 @@ services:
     volumes:
       - ./frontend-react/src:/app/src
       - ./frontend-react/public:/app/public
-      - ./logs:/app/logs:ro
+      - ./logs:/app/logs
     
     # Keep dev server running and restart on failure
     restart: on-failure:3

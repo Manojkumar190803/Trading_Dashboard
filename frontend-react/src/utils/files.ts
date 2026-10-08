@@ -2,15 +2,23 @@ import { parseCSV } from './format'
 
 /**
  * Fetch file from public/logs directory or relative path
+ * Includes cache-busting parameter to prevent stale data
  */
 export const fetchLogFile = async (filePath: string): Promise<string> => {
   try {
+    // Add cache-busting timestamp parameter to prevent browser caching
+    const cacheBuster = `?t=${Date.now()}`
+    
     // Try fetching from public/logs first
-    let response = await fetch(`/logs/${filePath}`)
+    let response = await fetch(`/logs/${filePath}${cacheBuster}`, {
+      cache: 'no-store', // Prevent any caching
+    })
     
     if (!response.ok) {
       // Fallback to relative path
-      response = await fetch(`/../../logs/${filePath}`)
+      response = await fetch(`/../../logs/${filePath}${cacheBuster}`, {
+        cache: 'no-store',
+      })
     }
     
     if (!response.ok) {

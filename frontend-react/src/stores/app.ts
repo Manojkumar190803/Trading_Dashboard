@@ -1,4 +1,5 @@
 import { create } from 'zustand'
+import { persist } from 'zustand/middleware'
 import {
   DashboardMetrics,
   Position,
@@ -40,6 +41,7 @@ interface AppStore {
   // Logs
   logs: LogEntry[]
   addLog: (log: LogEntry) => void
+  setLogs: (logs: LogEntry[]) => void
   clearLogs: () => void
   maxLogsDisplay: number
 
@@ -50,6 +52,8 @@ interface AppStore {
   updateInstrument: (id: string, instrument: Partial<Instrument>) => void
   deleteInstrument: (id: string) => void
   toggleInstrument: (id: string) => void
+  exportInstruments: () => Promise<void>
+  getStrategyStatus: () => Promise<any>
 
   // UI State
   sidebarOpen: boolean
@@ -68,7 +72,9 @@ interface AppStore {
   setError: (error: string | null) => void
 }
 
-export const useAppStore = create<AppStore>((set) => ({
+export const useAppStore = create<AppStore>(
+  persist(
+    (set) => ({
     // Dashboard
     metrics: null,
     setMetrics: (metrics) => set({ metrics }),
@@ -104,6 +110,7 @@ export const useAppStore = create<AppStore>((set) => ({
       set((state) => ({
         logs: [log, ...state.logs].slice(0, state.maxLogsDisplay),
       })),
+    setLogs: (logs) => set({ logs }),
     clearLogs: () => set({ logs: [] }),
     maxLogsDisplay: 200,
 
@@ -130,6 +137,38 @@ export const useAppStore = create<AppStore>((set) => ({
           inst.id === id ? { ...inst, status: !inst.status, updatedAt: new Date().toISOString() } : inst
         ),
       })),
+    
+    // Export instruments to backend for Python to consume
+    exportInstruments: async () => {
+      try {
+        const state = useAppStore.getState()
+        const response = await fetch('/api/instruments/export', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ instruments: state.instruments }),
+        })
+        if (!response.ok) {
+          throw new Error(`Export failed: ${response.statusText}`)
+        }
+        console.log('Instruments exported to Python backend')
+      } catch (error) {
+        console.error('Export instruments error:', error)
+      }
+    },
+    
+    // Get status of running strategies from backend
+    getStrategyStatus: async () => {
+      try {
+        const response = await fetch('/api/instruments/status')
+        if (!response.ok) {
+          throw new Error(`Status fetch failed: ${response.statusText}`)
+        }
+        return await response.json()
+      } catch (error) {
+        console.error('Get strategy status error:', error)
+        return null
+      }
+    },
 
     // UI State
     sidebarOpen: true,
@@ -146,5 +185,13 @@ export const useAppStore = create<AppStore>((set) => ({
     setIsLoading: (loading) => set({ isLoading: loading }),
     error: null,
     setError: (error) => set({ error }),
-  }))
+    }),
+    {
+      name: 'app-store',
+      partialize: (state) => ({
+        instruments: state.instruments,
+      }),
+    }
+  )
+)
 

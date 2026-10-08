@@ -199,6 +199,8 @@ export const useRealAccountData = (shouldFetch = true, interval = 1000) => {
     positions: any[]
     orders: any[]
     account: any
+    mode?: 'live' | 'analyzer'
+    engine_status?: string
   } | null>(null)
   const [isLoading, setIsLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -210,19 +212,33 @@ export const useRealAccountData = (shouldFetch = true, interval = 1000) => {
       const response = await fetch(`/logs/dashboard_data.json?t=${Date.now()}`)
       if (response.ok) {
         const accountData = await response.json()
+        console.log('[useRealAccountData] Fetched data:', {
+          mode: accountData.mode,
+          availableMargin: accountData.account?.availableMargin,
+          timestamp: new Date().toISOString()
+        })
+        // Store in localStorage for debugging
+        window.localStorage.setItem('lastAccountData', JSON.stringify({
+          mode: accountData.mode,
+          availableMargin: accountData.account?.availableMargin,
+          timestamp: new Date().toISOString()
+        }))
         setData({
           positions: accountData.positions || [],
           orders: accountData.orders || [],
           account: accountData.account || {},
+          mode: accountData.mode,
+          engine_status: accountData.engine_status,
         })
         setError(null)
       } else {
         // File not found or error - clear data
+        console.log('[useRealAccountData] Failed to fetch:', response.status)
         setData(null)
         setError(null) // Don't show error if file just doesn't exist
       }
     } catch (err) {
-      console.debug('Real account data not available yet')
+      console.log('[useRealAccountData] Error:', err)
       setData(null) // Clear data on error
       setError(null)
     } finally {

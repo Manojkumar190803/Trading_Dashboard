@@ -1,9 +1,11 @@
-import { useMemo } from 'react'
+import { useMemo, useState, useCallback } from 'react'
 import {
   AreaChart,
   Area,
   BarChart,
   Bar,
+  LineChart,
+  Line,
   XAxis,
   YAxis,
   CartesianGrid,
@@ -14,7 +16,7 @@ import {
   Pie,
   Cell,
 } from 'recharts'
-import { TrendingUp, Target, Trophy, Zap } from 'lucide-react'
+import { TrendingUp, Target, Trophy, Zap, Download, RotateCcw, BarChart3, Activity } from 'lucide-react'
 import {
   Card,
   MetricCard,
@@ -27,23 +29,59 @@ import {
 } from '@/components/UI'
 import { useAnalyticsTrades, useAnalyticsSummary, useEquityCurve } from '@/hooks'
 import { formatCurrency, formatPercent, getValueColor, formatNumber } from '@/utils/format'
+import { exportAnalyticsCSV, resetAnalytics } from '@/utils/csv-export'
 import { clsx } from 'clsx'
 
 const Analytics: React.FC = () => {
-  const { trades } = useAnalyticsTrades()
+  const { trades, refetch } = useAnalyticsTrades()
   const summary = useAnalyticsSummary(trades)
   const curve = useEquityCurve(trades)
+  const [isResetting, setIsResetting] = useState(false)
+  const [equityChartType, setEquityChartType] = useState<'area' | 'bar' | 'line'>('area')
+  const [performanceChartType, setPerformanceChartType] = useState<'bar' | 'line'>('bar')
 
-  // Generate sample equity curve data if no trades
+  const handleExportAnalytics = useCallback(() => {
+    exportAnalyticsCSV(summary, trades)
+  }, [summary, trades])
+
+  const handleResetAnalytics = useCallback(async () => {
+    setIsResetting(true)
+    try {
+      const success = await resetAnalytics()
+      if (success) {
+        // Perform multiple refetches with increasing delays
+        // to ensure fresh data after reset
+        setTimeout(() => {
+          refetch()
+          console.log('First refetch after reset (500ms)')
+        }, 500)
+        
+        setTimeout(() => {
+          refetch()
+          console.log('Second refetch after reset (1500ms)')
+        }, 1500)
+        
+        setTimeout(() => {
+          refetch()
+          console.log('Third refetch after reset (2500ms)')
+        }, 2500)
+      }
+    } finally {
+      setIsResetting(false)
+    }
+  }, [refetch])
+
+  // Generate equity curve data - flat when no trades
   const equityCurveData = useMemo(() => {
     if (curve.length === 0) {
+      // Flat equity curve when no trades
       return [
         { datetime: '09:30', total_pnl: 0 },
-        { datetime: '10:00', total_pnl: 500 },
-        { datetime: '10:30', total_pnl: -200 },
-        { datetime: '11:00', total_pnl: 800 },
-        { datetime: '11:30', total_pnl: 1200 },
-        { datetime: '12:00', total_pnl: 1500 },
+        { datetime: '10:00', total_pnl: 0 },
+        { datetime: '10:30', total_pnl: 0 },
+        { datetime: '11:00', total_pnl: 0 },
+        { datetime: '11:30', total_pnl: 0 },
+        { datetime: '12:00', total_pnl: 0 },
       ]
     }
     return curve.map((c) => ({
@@ -103,10 +141,32 @@ const Analytics: React.FC = () => {
   return (
     <div className="space-y-8">
       {/* Header */}
-      <div>
-        <SectionTitle subtitle="Performance intelligence and trade metrics">
-          Analytics Dashboard
-        </SectionTitle>
+      <div className="flex items-center justify-between">
+        <div>
+          <SectionTitle subtitle="Performance intelligence and trade metrics">
+            Analytics Dashboard
+          </SectionTitle>
+        </div>
+        <div className="flex items-center gap-3">
+          <button
+            onClick={handleExportAnalytics}
+            disabled={trades.length === 0}
+            className="flex items-center gap-2 px-4 py-2 text-sm font-semibold text-emerald-400 hover:text-emerald-300 bg-emerald-500/10 hover:bg-emerald-500/20 rounded transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+            title="Download analytics report as CSV"
+          >
+            <Download size={16} />
+            Export CSV
+          </button>
+          <button
+            onClick={handleResetAnalytics}
+            disabled={isResetting || trades.length === 0}
+            className="flex items-center gap-2 px-4 py-2 text-sm font-semibold text-red-400 hover:text-red-300 bg-red-500/10 hover:bg-red-500/20 rounded transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+            title="Reset all analytics data"
+          >
+            <RotateCcw size={16} className={isResetting ? 'animate-spin' : ''} />
+            Reset
+          </button>
+        </div>
       </div>
 
       {/* Key Metrics */}
@@ -145,49 +205,137 @@ const Analytics: React.FC = () => {
       </div>
 
       {/* Charts Grid */}
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
         {/* Equity Curve */}
         <div className="lg:col-span-2">
-          <div className="mb-4">
-            <h3 className="text-lg font-semibold text-text-primary">Equity Curve</h3>
-            <p className="text-xs text-text-secondary mt-1">
-              Cumulative profit/loss progression
-            </p>
+          <div className="mb-3 flex items-center justify-between">
+            <div>
+              <h3 className="text-lg font-semibold text-text-primary">Equity Curve</h3>
+              <p className="text-xs text-text-secondary mt-1">
+                Cumulative profit/loss progression
+              </p>
+            </div>
+            <div className="flex items-center gap-2">
+              <button
+                onClick={() => setEquityChartType('area')}
+                className={clsx(
+                  'p-2 rounded transition-colors',
+                  equityChartType === 'area'
+                    ? 'bg-cyan-500/20 text-cyan-400'
+                    : 'bg-bg-secondary text-text-secondary hover:bg-bg-tertiary'
+                )}
+                title="Area Chart"
+              >
+                <Activity size={16} />
+              </button>
+              <button
+                onClick={() => setEquityChartType('bar')}
+                className={clsx(
+                  'p-2 rounded transition-colors',
+                  equityChartType === 'bar'
+                    ? 'bg-cyan-500/20 text-cyan-400'
+                    : 'bg-bg-secondary text-text-secondary hover:bg-bg-tertiary'
+                )}
+                title="Bar Chart"
+              >
+                <BarChart3 size={16} />
+              </button>
+              <button
+                onClick={() => setEquityChartType('line')}
+                className={clsx(
+                  'p-2 rounded transition-colors',
+                  equityChartType === 'line'
+                    ? 'bg-cyan-500/20 text-cyan-400'
+                    : 'bg-bg-secondary text-text-secondary hover:bg-bg-tertiary'
+                )}
+                title="Line Chart"
+              >
+                <TrendingUp size={16} />
+              </button>
+            </div>
           </div>
 
           <Card>
-            <div className="w-full h-64">
+            <div className="w-full h-48">
               <ResponsiveContainer width="100%" height="100%">
-                <AreaChart data={equityCurveData}>
-                  <defs>
-                    <linearGradient id="colorPnl" x1="0" y1="0" x2="0" y2="1">
-                      <stop offset="5%" stopColor="#59d0ff" stopOpacity={0.8} />
-                      <stop offset="95%" stopColor="#59d0ff" stopOpacity={0} />
-                    </linearGradient>
-                  </defs>
-                  <CartesianGrid
-                    strokeDasharray="3 3"
-                    stroke="rgba(255,255,255,0.1)"
-                  />
-                  <XAxis
-                    dataKey="datetime"
-                    stroke="rgba(255,255,255,0.3)"
-                    style={{ fontSize: '12px' }}
-                  />
-                  <YAxis
-                    stroke="rgba(255,255,255,0.3)"
-                    style={{ fontSize: '12px' }}
-                    tickFormatter={(value) => `₹${(value / 1000).toFixed(0)}k`}
-                  />
-                  <Tooltip content={<CustomTooltip />} />
-                  <Area
-                    type="monotone"
-                    dataKey="total_pnl"
-                    stroke="#59d0ff"
-                    fillOpacity={1}
-                    fill="url(#colorPnl)"
-                  />
-                </AreaChart>
+                {equityChartType === 'area' && (
+                  <AreaChart data={equityCurveData}>
+                    <defs>
+                      <linearGradient id="colorPnl" x1="0" y1="0" x2="0" y2="1">
+                        <stop offset="5%" stopColor="#59d0ff" stopOpacity={0.8} />
+                        <stop offset="95%" stopColor="#59d0ff" stopOpacity={0} />
+                      </linearGradient>
+                    </defs>
+                    <CartesianGrid
+                      strokeDasharray="3 3"
+                      stroke="rgba(255,255,255,0.1)"
+                    />
+                    <XAxis
+                      dataKey="datetime"
+                      stroke="rgba(255,255,255,0.3)"
+                      style={{ fontSize: '12px' }}
+                    />
+                    <YAxis
+                      stroke="rgba(255,255,255,0.3)"
+                      style={{ fontSize: '12px' }}
+                      tickFormatter={(value) => `₹${(value / 1000).toFixed(0)}k`}
+                    />
+                    <Tooltip content={<CustomTooltip />} />
+                    <Area
+                      type="monotone"
+                      dataKey="total_pnl"
+                      stroke="#59d0ff"
+                      fillOpacity={1}
+                      fill="url(#colorPnl)"
+                    />
+                  </AreaChart>
+                )}
+                {equityChartType === 'bar' && (
+                  <BarChart data={equityCurveData}>
+                    <CartesianGrid
+                      strokeDasharray="3 3"
+                      stroke="rgba(255,255,255,0.1)"
+                    />
+                    <XAxis
+                      dataKey="datetime"
+                      stroke="rgba(255,255,255,0.3)"
+                      style={{ fontSize: '12px' }}
+                    />
+                    <YAxis
+                      stroke="rgba(255,255,255,0.3)"
+                      style={{ fontSize: '12px' }}
+                      tickFormatter={(value) => `₹${(value / 1000).toFixed(0)}k`}
+                    />
+                    <Tooltip content={<CustomTooltip />} />
+                    <Bar dataKey="total_pnl" fill="#59d0ff" />
+                  </BarChart>
+                )}
+                {equityChartType === 'line' && (
+                  <LineChart data={equityCurveData}>
+                    <CartesianGrid
+                      strokeDasharray="3 3"
+                      stroke="rgba(255,255,255,0.1)"
+                    />
+                    <XAxis
+                      dataKey="datetime"
+                      stroke="rgba(255,255,255,0.3)"
+                      style={{ fontSize: '12px' }}
+                    />
+                    <YAxis
+                      stroke="rgba(255,255,255,0.3)"
+                      style={{ fontSize: '12px' }}
+                      tickFormatter={(value) => `₹${(value / 1000).toFixed(0)}k`}
+                    />
+                    <Tooltip content={<CustomTooltip />} />
+                    <Line
+                      type="monotone"
+                      dataKey="total_pnl"
+                      stroke="#59d0ff"
+                      strokeWidth={2}
+                      dot={false}
+                    />
+                  </LineChart>
+                )}
               </ResponsiveContainer>
             </div>
           </Card>
@@ -195,12 +343,12 @@ const Analytics: React.FC = () => {
 
         {/* Trade Distribution */}
         <div>
-          <div className="mb-4">
+          <div className="mb-3">
             <h3 className="text-lg font-semibold text-text-primary">Trade Distribution</h3>
             <p className="text-xs text-text-secondary mt-1">Wins vs Losses</p>
           </div>
 
-          <Card className="h-64 flex items-center justify-center">
+          <Card className="h-48 flex items-center justify-center">
             {summary.completed_trades === 0 ? (
               <EmptyState title="No trades yet" />
             ) : (
@@ -214,16 +362,27 @@ const Analytics: React.FC = () => {
                     outerRadius={80}
                     paddingAngle={2}
                     dataKey="value"
+                    label={false}
+                    isAnimationActive={false}
                   >
                     {tradeDistribution.map((entry, index) => (
                       <Cell key={`cell-${index}`} fill={entry.fill} />
                     ))}
                   </Pie>
                   <Tooltip
+                    cursor={{ fill: 'rgba(255,255,255,0.1)' }}
                     contentStyle={{
                       backgroundColor: '#0a0e27',
-                      border: '1px solid rgba(255,255,255,0.1)',
+                      border: '1px solid rgba(255,255,255,0.2)',
+                      borderRadius: '6px',
+                      padding: '8px 12px',
+                      boxShadow: '0 4px 12px rgba(0,0,0,0.3)',
                     }}
+                    formatter={(value: any) => [
+                      <span key="value" style={{ color: '#ffffff', fontWeight: 'bold' }}>
+                        {value} trades
+                      </span>,
+                    ]}
                   />
                 </PieChart>
               </ResponsiveContainer>
@@ -234,31 +393,80 @@ const Analytics: React.FC = () => {
 
       {/* Daily Performance */}
       {dailyData.length > 0 && (
-        <div>
-          <div className="mb-4">
-            <h3 className="text-lg font-semibold text-text-primary">Daily Performance</h3>
+        <div className="w-full">
+          <div className="mb-3 flex items-center justify-between">
+            <div>
+              <h3 className="text-lg font-semibold text-text-primary">Daily Performance</h3>
+            </div>
+            <div className="flex items-center gap-2">
+              <button
+                onClick={() => setPerformanceChartType('bar')}
+                className={clsx(
+                  'p-2 rounded transition-colors',
+                  performanceChartType === 'bar'
+                    ? 'bg-cyan-500/20 text-cyan-400'
+                    : 'bg-bg-secondary text-text-secondary hover:bg-bg-tertiary'
+                )}
+                title="Bar Chart"
+              >
+                <BarChart3 size={16} />
+              </button>
+              <button
+                onClick={() => setPerformanceChartType('line')}
+                className={clsx(
+                  'p-2 rounded transition-colors',
+                  performanceChartType === 'line'
+                    ? 'bg-cyan-500/20 text-cyan-400'
+                    : 'bg-bg-secondary text-text-secondary hover:bg-bg-tertiary'
+                )}
+                title="Line Chart"
+              >
+                <TrendingUp size={16} />
+              </button>
+            </div>
           </div>
 
           <Card>
-            <div className="w-full h-64">
+            <div className="w-full h-48">
               <ResponsiveContainer width="100%" height="100%">
-                <BarChart data={dailyData}>
-                  <CartesianGrid
-                    strokeDasharray="3 3"
-                    stroke="rgba(255,255,255,0.1)"
-                  />
-                  <XAxis dataKey="date" stroke="rgba(255,255,255,0.3)" />
-                  <YAxis stroke="rgba(255,255,255,0.3)" />
-                  <Tooltip
-                    contentStyle={{
-                      backgroundColor: '#0a0e27',
-                      border: '1px solid rgba(255,255,255,0.1)',
-                    }}
-                  />
-                  <Legend />
-                  <Bar dataKey="gain" stackId="a" fill="#27d48a" name="Gains" />
-                  <Bar dataKey="loss" stackId="a" fill="#ff5f6d" name="Losses" />
-                </BarChart>
+                {performanceChartType === 'bar' && (
+                  <BarChart data={dailyData}>
+                    <CartesianGrid
+                      strokeDasharray="3 3"
+                      stroke="rgba(255,255,255,0.1)"
+                    />
+                    <XAxis dataKey="date" stroke="rgba(255,255,255,0.3)" />
+                    <YAxis stroke="rgba(255,255,255,0.3)" />
+                    <Tooltip
+                      contentStyle={{
+                        backgroundColor: '#0a0e27',
+                        border: '1px solid rgba(255,255,255,0.1)',
+                      }}
+                    />
+                    <Legend />
+                    <Bar dataKey="gain" stackId="a" fill="#27d48a" name="Gains" />
+                    <Bar dataKey="loss" stackId="a" fill="#ff5f6d" name="Losses" />
+                  </BarChart>
+                )}
+                {performanceChartType === 'line' && (
+                  <LineChart data={dailyData}>
+                    <CartesianGrid
+                      strokeDasharray="3 3"
+                      stroke="rgba(255,255,255,0.1)"
+                    />
+                    <XAxis dataKey="date" stroke="rgba(255,255,255,0.3)" />
+                    <YAxis stroke="rgba(255,255,255,0.3)" />
+                    <Tooltip
+                      contentStyle={{
+                        backgroundColor: '#0a0e27',
+                        border: '1px solid rgba(255,255,255,0.1)',
+                      }}
+                    />
+                    <Legend />
+                    <Line type="monotone" dataKey="gain" stroke="#27d48a" strokeWidth={2} name="Gains" />
+                    <Line type="monotone" dataKey="loss" stroke="#ff5f6d" strokeWidth={2} name="Losses" />
+                  </LineChart>
+                )}
               </ResponsiveContainer>
             </div>
           </Card>
@@ -266,10 +474,10 @@ const Analytics: React.FC = () => {
       )}
 
       {/* Summary Stats */}
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
         <Card>
-          <h4 className="text-sm font-semibold text-text-primary mb-4">Profitability</h4>
-          <div className="space-y-3">
+          <h4 className="text-sm font-semibold text-text-primary mb-3">Profitability</h4>
+          <div className="space-y-2">
             <div className="flex items-center justify-between">
               <span className="text-sm text-text-secondary">Gross Profit</span>
               <span className="font-bold text-accent-green">
@@ -299,8 +507,8 @@ const Analytics: React.FC = () => {
         </Card>
 
         <Card>
-          <h4 className="text-sm font-semibold text-text-primary mb-4">Statistics</h4>
-          <div className="space-y-3">
+          <h4 className="text-sm font-semibold text-text-primary mb-3">Risk Metrics</h4>
+          <div className="space-y-2">
             <div className="flex items-center justify-between">
               <span className="text-sm text-text-secondary">Total Trades</span>
               <span className="font-bold">{summary.completed_trades}</span>
@@ -325,54 +533,6 @@ const Analytics: React.FC = () => {
           </div>
         </Card>
       </div>
-
-      {/* Recent Trades */}
-      {trades.length > 0 && (
-        <div>
-          <h3 className="text-lg font-semibold text-text-primary mb-4">Recent Trades</h3>
-          <Card>
-            <div className="overflow-x-auto">
-              <Table headers={['Timestamp', 'Strategy', 'P&L', 'Source', 'Message']}>
-                {trades.slice(0, 10).map((trade, idx) => (
-                  <TableRow key={idx}>
-                    <TableCell>
-                      <span className="text-sm text-text-secondary">
-                        {new Date(trade.timestamp).toLocaleTimeString('en-IN', {
-                          hour: '2-digit',
-                          minute: '2-digit',
-                          second: '2-digit',
-                          hour12: true,
-                        })}
-                      </span>
-                    </TableCell>
-                    <TableCell>
-                      <Badge size="sm" variant="info">
-                        {trade.strategy}
-                      </Badge>
-                    </TableCell>
-                    <TableCell>
-                      <span
-                        className={clsx(
-                          'font-mono font-bold',
-                          getValueColor(trade.pnl)
-                        )}
-                      >
-                        {formatCurrency(trade.pnl)}
-                      </span>
-                    </TableCell>
-                    <TableCell>
-                      <span className="text-sm text-text-secondary">{trade.source}</span>
-                    </TableCell>
-                    <TableCell>
-                      <span className="text-sm text-text-secondary">{trade.message}</span>
-                    </TableCell>
-                  </TableRow>
-                ))}
-              </Table>
-            </div>
-          </Card>
-        </div>
-      )}
     </div>
   )
 }

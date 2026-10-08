@@ -22,6 +22,7 @@ from core.models import (
     StrategyAlert,
     StrategyConfig,
 )
+from core.signal_logger import SignalLogger
 from strategies.base import SignalProvider
 
 logger = logging.getLogger("core.engine")
@@ -1833,6 +1834,23 @@ class BaseStrategyEngine:
         signal = self.signal_provider.generate_signal(side, side_state, row, prev_row)
 
         if signal in (Signal.BUY_CE, Signal.BUY_PE):
+            # Log signal for dashboard display
+            if self.signal_provider.strategy_key == "ema21":
+                try:
+                    symbol = side_state.option_symbol or side
+                    ts = pd.to_datetime(row.get("datetime", datetime.now()))
+                    SignalLogger.log_signal(
+                        strategy="EMA21",
+                        side=side,
+                        signal_type="setup",
+                        symbol=symbol,
+                        message=f"EMA21 Strategy: {side} setup detected - {symbol}",
+                        level="INFO",
+                        timestamp=ts.to_pydatetime() if hasattr(ts, 'to_pydatetime') else ts,
+                    )
+                except Exception as e:
+                    logger.warning(f"Could not log signal: {e}")
+            
             self._record_alert(
                 ts,
                 "SIGNAL",

@@ -16,6 +16,8 @@ from core.engine import BaseStrategyEngine
 from core.indicators import add_indicators
 from core.models import RiskConfig, StrategyConfig
 from core.runner import LiveFeedRunner, MultiEngineLiveFeedRunner, _normalize_history_df, run_historical_replay, run_multi_historical_replay
+from core.signal_logger import SignalLogger
+from core.alert_logger import AlertLogger
 from strategies.base import SignalProvider
 
 logger = logging.getLogger("run_strategy")
@@ -48,10 +50,23 @@ def _register_ema21() -> SignalProvider:
     return EMA21SignalProvider()
 
 
+def _register_2bc() -> SignalProvider:
+    import importlib
+    module = importlib.import_module('strategies.2bc')
+    return module.TwoBodyCandleSignalProvider(module.TwoBodyCandleConfig())
+
+
+def _register_bo() -> SignalProvider:
+    from strategies.bo import BreakoutConfig, BreakoutSignalProvider
+    return BreakoutSignalProvider(BreakoutConfig())
+
+
 STRATEGY_REGISTRY["hd"] = _register_hd
 STRATEGY_REGISTRY["cd"] = _register_cd
 STRATEGY_REGISTRY["tc"] = _register_tc
 STRATEGY_REGISTRY["ema21"] = _register_ema21
+STRATEGY_REGISTRY["2bc"] = _register_2bc
+STRATEGY_REGISTRY["bo"] = _register_bo
 STRATEGY_REGISTRY["opt_buy_930"] = lambda: None
 
 
@@ -84,6 +99,15 @@ def get_signal_provider(name: str, args: argparse.Namespace) -> SignalProvider:
     if name == "ema21":
         from strategies.ema21 import EMA21SignalProvider
         return EMA21SignalProvider()
+
+    if name == "2bc":
+        import importlib
+        module = importlib.import_module('strategies.2bc')
+        return module.TwoBodyCandleSignalProvider(module.TwoBodyCandleConfig())
+
+    if name == "bo":
+        from strategies.bo import BreakoutConfig, BreakoutSignalProvider
+        return BreakoutSignalProvider(BreakoutConfig())
 
     factory = STRATEGY_REGISTRY.get(name)
     if factory is None:
@@ -442,6 +466,11 @@ def _run_single_script(args: argparse.Namespace) -> None:
         if len(strategy_names) > 1:
             if "opt_buy_930" in strategy_names:
                 raise SystemExit("opt_buy_930 cannot be combined with candle strategies in backtest mode")
+            # Clear signal and alert logs for fresh backtest run
+            SignalLogger.init()
+            SignalLogger.clear_logs()
+            AlertLogger.init()
+            AlertLogger.clear_alerts()
             providers = [(name, get_signal_provider(name, args)) for name in strategy_names]
             run_multi_historical_replay(
                 cfg,
@@ -455,6 +484,12 @@ def _run_single_script(args: argparse.Namespace) -> None:
             )
         else:
             provider = get_signal_provider(strategy_names[0], args)
+            # Clear signal and alert logs for fresh backtest run
+            if strategy_names[0] == "ema21":
+                SignalLogger.init()
+                SignalLogger.clear_logs()
+                AlertLogger.init()
+                AlertLogger.clear_alerts()
             run_historical_replay(
                 cfg,
                 risk,

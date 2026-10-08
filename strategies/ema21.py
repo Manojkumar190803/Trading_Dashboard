@@ -8,6 +8,7 @@ from typing import Optional
 import pandas as pd
 
 from core.models import BaseSideState, Signal, StrategyConfig
+from core.alert_logger import AlertLogger
 from strategies.base import SignalProvider
 
 
@@ -96,6 +97,19 @@ class EMA21SignalProvider(SignalProvider):
                 side_state.entry_ready = False
                 side_state.setup_invalidated = False
                 side_state.entry_block_reason = None
+                
+                # Log alert: Green candle closed above 21EMA
+                try:
+                    side = side_state.option_symbol or "UNKNOWN"
+                    AlertLogger.log_rule_triggered(
+                        strategy="EMA21",
+                        symbol=side,
+                        rule_name="green_close_above_ema21",
+                        message=f"green candle closed above 21ema waiting for red candle",
+                        timestamp=row.get("datetime"),
+                    )
+                except Exception as e:
+                    pass  # Don't break state update if alert logging fails
             return
 
         row_dt = row.get("datetime")
@@ -127,6 +141,19 @@ class EMA21SignalProvider(SignalProvider):
             side_state.first_red_low = float(row["low"])
             side_state.first_red_time = row.get("datetime")
             side_state.entry_ready = True
+            
+            # Log alert: Red candle detected, entry ready
+            try:
+                side = side_state.option_symbol or "UNKNOWN"
+                AlertLogger.log_rule_triggered(
+                    strategy="EMA21",
+                    symbol=side,
+                    rule_name="red_candle_entry_ready",
+                    message=f"red candle confirmed - ready for entry",
+                    timestamp=row.get("datetime"),
+                )
+            except Exception as e:
+                pass  # Don't break state update if alert logging fails
         if (
             side_state.confirmation_count >= self.ema21_cfg.confirmation_candles
             and side_state.first_red_high is None

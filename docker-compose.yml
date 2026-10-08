@@ -37,15 +37,17 @@ services:
       com.openalgo.display-name: "React Trading Dashboard"
     ports:
       - "3000:3000"
+      - "4000:4000"
     restart: unless-stopped
     volumes:
       - ./frontend-react/src:/app/src
       - ./frontend-react/public:/app/public
-      - ./logs:/app/logs:ro
+      - ./logs:/app/logs
     environment:
       <<: *common-variables
       VITE_APP_TITLE: "Trading Strategy Dashboard"
       VITE_LOGS_DIR: "/logs"
+      LOGS_DIR: "/app/logs"
     depends_on:
       - strategy_worker
     healthcheck:

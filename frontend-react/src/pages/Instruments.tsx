@@ -1,5 +1,5 @@
-import { useState } from 'react'
-import { Plus, Trash2, Edit2, Power, AlertCircle, CheckCircle2 } from 'lucide-react'
+import { useState, useEffect } from 'react'
+import { Plus, Trash2, Edit2, Power, AlertCircle, CheckCircle2, Play, Square } from 'lucide-react'
 import clsx from 'clsx'
 import { useAppStore } from '@/stores'
 import { Instrument } from '@/types'
@@ -31,15 +31,22 @@ interface FormData {
   monitoringEndTime: string
   lotSizeAdjustment: number
   strategy: string
+  atmPrice: number
+  minPremium: number
+  maxPremium: number
+  breakeven_rr: number
+  trail_step_rr: number
+  max_initial_risk_points: number
 }
 
 const Instruments: React.FC = () => {
-  const { instruments, addInstrument, updateInstrument, deleteInstrument, toggleInstrument } = useAppStore()
+  const { instruments, addInstrument, updateInstrument, deleteInstrument, toggleInstrument, exportInstruments, getStrategyStatus } = useAppStore()
   const [showForm, setShowForm] = useState(false)
   const [editingId, setEditingId] = useState<string | null>(null)
   const [searchTerm, setSearchTerm] = useState('')
   const [strategyFilter, setStrategyFilter] = useState<string>('ALL')
   const [filterStatus, setFilterStatus] = useState<string>('ALL')
+  const [strategyStatus, setStrategyStatus] = useState<Record<string, any>>({})
   const [formData, setFormData] = useState<FormData>({
     name: '',
     brokerSymbol: '',
@@ -47,7 +54,43 @@ const Instruments: React.FC = () => {
     monitoringEndTime: '15:30',
     lotSizeAdjustment: 1,
     strategy: '21EMA',
+    atmPrice: 0,
+    minPremium: 0,
+    maxPremium: 0,
+    breakeven_rr: 1.0,
+    trail_step_rr: 0.5,
+    max_initial_risk_points: 20.0,
   })
+
+  // Auto-export instruments when they change
+  useEffect(() => {
+    const exportInsts = async () => {
+      try {
+        await exportInstruments()
+      } catch (error) {
+        console.error('Failed to export instruments:', error)
+      }
+    }
+    exportInsts()
+  }, [instruments, exportInstruments])
+
+  // Poll strategy status every 3 seconds
+  useEffect(() => {
+    const pollStatus = async () => {
+      try {
+        const status = await getStrategyStatus()
+        if (status) {
+          setStrategyStatus(status.running_strategies || {})
+        }
+      } catch (error) {
+        console.error('Failed to get strategy status:', error)
+      }
+    }
+    
+    pollStatus()
+    const interval = setInterval(pollStatus, 3000)
+    return () => clearInterval(interval)
+  }, [getStrategyStatus])
 
   const calculateLotSize = (instrumentName: string): number => {
     const normalized = instrumentName.toUpperCase()
@@ -75,12 +118,23 @@ const Instruments: React.FC = () => {
 
     const lotSize = calculateLotSize(formData.name)
     const strikeStep = getStrikeStep(formData.strategy)
+    // For 21EMA, ATM price is auto-locked by the system, so clear manual input
+    // For other strategies, use premium range for strike monitoring
+    const atmPrice = formData.strategy === '21EMA' ? 0 : formData.atmPrice
+    const minPremium = formData.strategy === '21EMA' ? 0 : formData.minPremium
+    const maxPremium = formData.strategy === '21EMA' ? 0 : formData.maxPremium
 
     if (editingId) {
       updateInstrument(editingId, {
         ...formData,
+        atmPrice,
+        minPremium,
+        maxPremium,
+        breakeven_rr: formData.breakeven_rr,
+        trail_step_rr: formData.trail_step_rr,
+        max_initial_risk_points: formData.max_initial_risk_points,
         lotSize,
-        strikeStep,
+        strikeStep: formData.strategy === '21EMA' ? 0 : strikeStep,
         strategy: formData.strategy as '21EMA' | 'HD' | 'CD' | 'TC' | '2BC' | 'BO',
         productType: 'INTRADAY',
       })
@@ -89,8 +143,14 @@ const Instruments: React.FC = () => {
       addInstrument({
         id: `inst-${Date.now()}`,
         ...formData,
+        atmPrice,
+        minPremium,
+        maxPremium,
+        breakeven_rr: formData.breakeven_rr,
+        trail_step_rr: formData.trail_step_rr,
+        max_initial_risk_points: formData.max_initial_risk_points,
         lotSize,
-        strikeStep,
+        strikeStep: formData.strategy === '21EMA' ? 0 : strikeStep,
         strategy: formData.strategy as '21EMA' | 'HD' | 'CD' | 'TC' | '2BC' | 'BO',
         productType: 'INTRADAY',
         status: true,
@@ -106,6 +166,12 @@ const Instruments: React.FC = () => {
       monitoringEndTime: '15:30',
       lotSizeAdjustment: 1,
       strategy: '21EMA',
+      atmPrice: 0,
+      minPremium: 0,
+      maxPremium: 0,
+      breakeven_rr: 1.0,
+      trail_step_rr: 0.5,
+      max_initial_risk_points: 20.0,
     })
     setShowForm(false)
   }
@@ -118,6 +184,12 @@ const Instruments: React.FC = () => {
       monitoringEndTime: inst.monitoringEndTime,
       lotSizeAdjustment: inst.lotSizeAdjustment,
       strategy: inst.strategy,
+      atmPrice: inst.atmPrice || 0,
+      minPremium: inst.minPremium || 0,
+      maxPremium: inst.maxPremium || 0,
+      breakeven_rr: inst.breakeven_rr || 1.0,
+      trail_step_rr: inst.trail_step_rr || 0.5,
+      max_initial_risk_points: inst.max_initial_risk_points || 20.0,
     })
     setEditingId(inst.id)
     setShowForm(true)
@@ -133,6 +205,12 @@ const Instruments: React.FC = () => {
       monitoringEndTime: '15:30',
       lotSizeAdjustment: 1,
       strategy: '21EMA',
+      atmPrice: 0,
+      minPremium: 0,
+      maxPremium: 0,
+      breakeven_rr: 1.0,
+      trail_step_rr: 0.5,
+      max_initial_risk_points: 20.0,
     })
   }
 
@@ -198,7 +276,7 @@ const Instruments: React.FC = () => {
                 type="text"
                 value={formData.name}
                 onChange={(e) => setFormData({ ...formData, name: e.target.value })}
-                placeholder="e.g., NIFTY, BANKNIFTY"
+                placeholder="e.g., NIFTY, BANKNIFTY, SENSEX"
                 className="w-full px-3 py-2 bg-bg-primary border border-bg-tertiary rounded-lg text-text-primary placeholder-text-tertiary focus:outline-none focus:border-accent-cyan focus:ring-1 focus:ring-accent-cyan"
               />
             </div>
@@ -241,16 +319,40 @@ const Instruments: React.FC = () => {
               <label className="block text-sm font-medium text-text-secondary mb-2">Lot Size Adjustment</label>
               <input
                 type="number"
-                step="0.1"
+                step="1"
+                min="1"
                 value={formData.lotSizeAdjustment}
-                onChange={(e) => setFormData({ ...formData, lotSizeAdjustment: parseFloat(e.target.value) })}
+                onChange={(e) => {
+                  const value = e.target.value
+                  if (value === '') {
+                    setFormData({ ...formData, lotSizeAdjustment: 1 })
+                  } else {
+                    const intValue = Math.max(1, parseInt(value) || 1)
+                    setFormData({ ...formData, lotSizeAdjustment: intValue })
+                  }
+                }}
+                onBlur={(e) => {
+                  // Ensure value is at least 1 on blur
+                  const value = parseInt(e.target.value) || 1
+                  setFormData({ ...formData, lotSizeAdjustment: Math.max(1, value) })
+                }}
                 className="w-full px-3 py-2 bg-bg-primary border border-bg-tertiary rounded-lg text-text-primary focus:outline-none focus:border-accent-cyan focus:ring-1 focus:ring-accent-cyan"
               />
             </div>
             <div>
-              <label className="block text-sm font-medium text-text-secondary mb-2">Calculated Lot Size</label>
+              <label className="block text-sm font-medium text-text-secondary mb-2">Base Lot Size</label>
               <div className="w-full px-3 py-2 bg-bg-primary border border-bg-tertiary rounded-lg text-text-primary font-semibold">
                 {calculateLotSize(formData.name)} (Read-only)
+              </div>
+            </div>
+            <div>
+              <label className="block text-sm font-medium text-text-secondary mb-2">Total Quantity</label>
+              <div className="w-full px-3 py-2 bg-bg-primary border border-accent-cyan/50 rounded-lg text-text-primary font-bold text-lg">
+                <span className="text-accent-cyan">{formData.lotSizeAdjustment}</span>
+                <span className="text-text-secondary mx-1">×</span>
+                <span className="text-accent-green">{calculateLotSize(formData.name)}</span>
+                <span className="text-text-secondary mx-1">=</span>
+                <span className="text-accent-green">{formData.lotSizeAdjustment * calculateLotSize(formData.name)}</span>
               </div>
             </div>
             <div>
@@ -265,17 +367,112 @@ const Instruments: React.FC = () => {
                 ))}
               </select>
             </div>
-            <div>
-              <label className="block text-sm font-medium text-text-secondary mb-2">Strike Step</label>
-              <div className="w-full px-3 py-2 bg-bg-primary border border-bg-tertiary rounded-lg text-text-primary font-semibold">
-                {getStrikeStep(formData.strategy)} (Read-only)
+            {formData.strategy !== '21EMA' && (
+              <div>
+                <label className="block text-sm font-medium text-text-secondary mb-2">Strike Step</label>
+                <div className="w-full px-3 py-2 bg-bg-primary border border-bg-tertiary rounded-lg text-text-primary font-semibold">
+                  {getStrikeStep(formData.strategy)} (Read-only)
+                </div>
               </div>
-            </div>
+            )}
             <div>
               <label className="block text-sm font-medium text-text-secondary mb-2">Product Type</label>
               <div className="w-full px-3 py-2 bg-bg-primary border border-bg-tertiary rounded-lg text-text-primary font-semibold">
                 INTRADAY (Fixed)
               </div>
+            </div>
+            {formData.strategy === '21EMA' ? (
+              <div>
+                <label className="block text-sm font-medium text-text-secondary mb-2">
+                  ATM Price (Auto-Locked at 9:20 AM)
+                </label>
+                <div className="w-full px-3 py-2 bg-bg-primary border border-accent-cyan/40 rounded-lg text-text-primary font-semibold text-accent-cyan">
+                  {formData.atmPrice > 0 ? formData.atmPrice.toFixed(2) : 'Locked during market hours'}
+                </div>
+                <p className="text-xs text-text-tertiary mt-1">Automatically captured by the system at 9:20 AM</p>
+              </div>
+            ) : (
+              <div>
+                <label className="block text-sm font-medium text-text-secondary mb-2">
+                  Min Premium Range
+                </label>
+                <input
+                  type="number"
+                  step="1"
+                  min="0"
+                  value={formData.minPremium || ''}
+                  onChange={(e) => setFormData({ ...formData, minPremium: parseInt(e.target.value) || 0 })}
+                  placeholder="e.g., 120"
+                  className="w-full px-3 py-2 bg-bg-primary border border-bg-tertiary rounded-lg text-text-primary placeholder-text-tertiary focus:outline-none focus:border-accent-cyan focus:ring-1 focus:ring-accent-cyan"
+                />
+                <p className="text-xs text-text-tertiary mt-1">Minimum premium to monitor (integers only)</p>
+              </div>
+            )}
+            {formData.strategy !== '21EMA' && (
+              <div>
+                <label className="block text-sm font-medium text-text-secondary mb-2">
+                  Max Premium Range
+                </label>
+                <input
+                  type="number"
+                  step="1"
+                  min="0"
+                  value={formData.maxPremium || ''}
+                  onChange={(e) => setFormData({ ...formData, maxPremium: parseInt(e.target.value) || 0 })}
+                  placeholder="e.g., 170"
+                  className="w-full px-3 py-2 bg-bg-primary border border-bg-tertiary rounded-lg text-text-primary placeholder-text-tertiary focus:outline-none focus:border-accent-cyan focus:ring-1 focus:ring-accent-cyan"
+                />
+                <p className="text-xs text-text-tertiary mt-1">Maximum premium to monitor (integers only)</p>
+              </div>
+            )}
+            {/* Trailing Stoploss Mechanism - Applied to all strategies */}
+            <div>
+              <label className="block text-sm font-medium text-text-secondary mb-2">
+                Breakeven RR (At 1R Milestone)
+              </label>
+              <input
+                type="number"
+                step="0.1"
+                min="0.1"
+                max="5"
+                value={formData.breakeven_rr || ''}
+                onChange={(e) => setFormData({ ...formData, breakeven_rr: parseFloat(e.target.value) || 1.0 })}
+                placeholder="e.g., 1.0"
+                className="w-full px-3 py-2 bg-bg-primary border border-bg-tertiary rounded-lg text-text-primary placeholder-text-tertiary focus:outline-none focus:border-accent-cyan focus:ring-1 focus:ring-accent-cyan"
+              />
+              <p className="text-xs text-text-tertiary mt-1">Move stop to entry price at 1R (default: 1.0)</p>
+            </div>
+            <div>
+              <label className="block text-sm font-medium text-text-secondary mb-2">
+                Trail Step RR (Per 0.5R Milestone)
+              </label>
+              <input
+                type="number"
+                step="0.1"
+                min="0.1"
+                max="5"
+                value={formData.trail_step_rr || ''}
+                onChange={(e) => setFormData({ ...formData, trail_step_rr: parseFloat(e.target.value) || 0.5 })}
+                placeholder="e.g., 0.5"
+                className="w-full px-3 py-2 bg-bg-primary border border-bg-tertiary rounded-lg text-text-primary placeholder-text-tertiary focus:outline-none focus:border-accent-cyan focus:ring-1 focus:ring-accent-cyan"
+              />
+              <p className="text-xs text-text-tertiary mt-1">Advance stop by this amount at each 0.5R (default: 0.5)</p>
+            </div>
+            <div>
+              <label className="block text-sm font-medium text-text-secondary mb-2">
+                Max Initial Risk Points
+              </label>
+              <input
+                type="number"
+                step="1"
+                min="1"
+                max="100"
+                value={formData.max_initial_risk_points || ''}
+                onChange={(e) => setFormData({ ...formData, max_initial_risk_points: parseFloat(e.target.value) || 20.0 })}
+                placeholder="e.g., 20"
+                className="w-full px-3 py-2 bg-bg-primary border border-bg-tertiary rounded-lg text-text-primary placeholder-text-tertiary focus:outline-none focus:border-accent-cyan focus:ring-1 focus:ring-accent-cyan"
+              />
+              <p className="text-xs text-text-tertiary mt-1">Discard setup if initial risk exceeds this (default: 20)</p>
             </div>
             <div className="col-span-1 md:col-span-3 flex gap-3">
               <button
@@ -312,9 +509,11 @@ const Instruments: React.FC = () => {
                   <th className="px-6 py-4 text-left text-sm font-semibold text-text-secondary">Broker Symbol</th>
                   <th className="px-6 py-4 text-left text-sm font-semibold text-text-secondary">Strategy</th>
                   <th className="px-6 py-4 text-left text-sm font-semibold text-text-secondary">Lot Size</th>
-                  <th className="px-6 py-4 text-left text-sm font-semibold text-text-secondary">Strike Step</th>
+                  <th className="px-6 py-4 text-left text-sm font-semibold text-text-secondary">Price Range</th>
+                  <th className="px-6 py-4 text-left text-sm font-semibold text-text-secondary">Stoploss Config</th>
                   <th className="px-6 py-4 text-left text-sm font-semibold text-text-secondary">Monitoring</th>
                   <th className="px-6 py-4 text-left text-sm font-semibold text-text-secondary">Status</th>
+                  <th className="px-6 py-4 text-left text-sm font-semibold text-text-secondary">Strategy Running</th>
                   <th className="px-6 py-4 text-center text-sm font-semibold text-text-secondary">Actions</th>
                 </tr>
               </thead>
@@ -348,10 +547,36 @@ const Instruments: React.FC = () => {
                         {inst.strategy}
                       </span>
                     </td>
-                    <td className="px-6 py-4 text-text-secondary font-mono">{inst.lotSize || calculateLotSize(inst.name)}</td>
-                    <td className="px-6 py-4 text-text-secondary font-mono">{inst.strikeStep}</td>
+                    <td className="px-6 py-4 text-text-secondary font-mono">
+                      <div>{inst.lotSizeAdjustment} × {inst.lotSize}</div>
+                      <div className="text-xs text-text-tertiary">= {inst.lotSizeAdjustment * (inst.lotSize || 0)} qty</div>
+                    </td>
+                    <td className="px-6 py-4 text-text-secondary font-mono">
+                      {inst.strategy === '21EMA' ? (
+                        inst.atmPrice ? (
+                          <span className="text-accent-cyan font-semibold">{inst.atmPrice.toFixed(2)}</span>
+                        ) : (
+                          <span className="text-text-tertiary italic">Auto-locked</span>
+                        )
+                      ) : (
+                        inst.minPremium || inst.maxPremium ? (
+                          <span className="text-accent-green font-semibold">
+                            {inst.minPremium?.toFixed(0) || '0'} - {inst.maxPremium?.toFixed(0) || '0'}
+                          </span>
+                        ) : (
+                          <span className="text-text-tertiary italic">—</span>
+                        )
+                      )}
+                    </td>
                     <td className="px-6 py-4 text-text-secondary text-sm">
                       {inst.monitoringStartTime} → {inst.monitoringEndTime}
+                    </td>
+                    <td className="px-6 py-4 text-text-secondary text-sm font-mono">
+                      <div className="flex flex-col gap-1">
+                        <div><span className="text-text-tertiary text-xs">BE:</span> {inst.breakeven_rr?.toFixed(1) || '1.0'}R</div>
+                        <div><span className="text-text-tertiary text-xs">Trail:</span> {inst.trail_step_rr?.toFixed(1) || '0.5'}R</div>
+                        <div><span className="text-text-tertiary text-xs">Max Risk:</span> {inst.max_initial_risk_points?.toFixed(0) || '20'} pts</div>
+                      </div>
                     </td>
                     <td className="px-6 py-4">
                       <div className="flex items-center gap-2">
@@ -364,6 +589,36 @@ const Instruments: React.FC = () => {
                           {inst.status ? 'Active' : 'Inactive'}
                         </span>
                       </div>
+                    </td>
+                    <td className="px-6 py-4">
+                      {(() => {
+                        const status = strategyStatus[inst.id]
+                        if (!status) {
+                          return <span className="text-text-tertiary text-sm">Not running</span>
+                        }
+                        return (
+                          <div className="flex items-center gap-2">
+                            {status.status === 'running' ? (
+                              <>
+                                <div className="w-2 h-2 bg-accent-green rounded-full animate-pulse"></div>
+                                <span className="text-accent-green text-sm font-semibold">Running (PID: {status.pid})</span>
+                              </>
+                            ) : status.status === 'crashed' ? (
+                              <>
+                                <AlertCircle size={16} className="text-accent-red" />
+                                <span className="text-accent-red text-sm">Crashed</span>
+                              </>
+                            ) : status.status === 'stopped' ? (
+                              <>
+                                <Square size={16} className="text-text-tertiary" />
+                                <span className="text-text-tertiary text-sm">Stopped</span>
+                              </>
+                            ) : (
+                              <span className="text-accent-yellow text-sm">{status.status}</span>
+                            )}
+                          </div>
+                        )
+                      })()}
                     </td>
                     <td className="px-6 py-4">
                       <div className="flex items-center justify-center gap-2">

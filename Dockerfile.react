@@ -11,8 +11,8 @@ WORKDIR /app
 # Copy package files
 COPY frontend-react/package*.json ./
 
-# Install dependencies
-RUN npm ci
+# Install dependencies with npm install to get latest versions
+RUN npm install
 
 # Copy React source code
 COPY frontend-react/src ./src
@@ -23,13 +23,15 @@ COPY frontend-react/tsconfig.json ./
 COPY frontend-react/tsconfig.node.json ./
 COPY frontend-react/tailwind.config.ts ./
 COPY frontend-react/postcss.config.js ./
+COPY frontend-react/server.js ./
 
-# Expose port
-EXPOSE 3000
+# Expose ports (3000 for Vite, 4000 for API server)
+EXPOSE 3000 4000
 
 # Set environment for development
 ENV VITE_APP_TITLE="Trading Strategy Dashboard" \
-    NODE_ENV=development
+    NODE_ENV=development \
+    LOGS_DIR=/app/logs
 
-# Start development server with HMR support
+# Start development server with HMR support and API server
 CMD ["npm", "run", "dev"]

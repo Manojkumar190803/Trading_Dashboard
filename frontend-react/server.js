@@ -1,0 +1,202 @@
+/**
+ * Simple Express API server for React dashboard
+ * Handles analytics reset and file operations
+ */
+
+import express from 'express'
+import fs from 'fs'
+import path from 'path'
+import { fileURLToPath } from 'url'
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url))
+const app = express()
+const PORT = 4000
+
+const LOGS_DIR = process.env.LOGS_DIR || '/app/logs'
+
+app.use(express.json())
+
+/**
+ * Health check endpoint
+ */
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok', timestamp: new Date().toISOString() })
+})
+
+/**
+ * Reset analytics by clearing the analytics_trades.csv file and writing reset timestamp
+ * This prevents the Streamlit backend from regenerating old trades
+ */
+app.post('/api/analytics/reset', (req, res) => {
+  try {
+    const analyticsFile = path.join(LOGS_DIR, 'analytics_trades.csv')
+    const resetTimestampFile = path.join(LOGS_DIR, 'analytics_reset.txt')
+    const now = new Date()
+    const isoTime = now.toISOString()
+
+    // Clear the analytics file - write header only
+    const header = 'timestamp,strategy,pnl,source,message\n'
+    fs.writeFileSync(analyticsFile, header, 'utf8')
+    console.log(`Analytics file cleared at ${isoTime}`)
+
+    // Write reset timestamp in format: YYYY-MM-DD HH:MM:SS
+    // This matches the Streamlit backend's expected format
+    const year = now.getUTCFullYear()
+    const month = String(now.getUTCMonth() + 1).padStart(2, '0')
+    const day = String(now.getUTCDate()).padStart(2, '0')
+    const hours = String(now.getUTCHours()).padStart(2, '0')
+    const minutes = String(now.getUTCMinutes()).padStart(2, '0')
+    const seconds = String(now.getUTCSeconds()).padStart(2, '0')
+    const resetTimestamp = `${year}-${month}-${day} ${hours}:${minutes}:${seconds}`
+    
+    fs.writeFileSync(resetTimestampFile, resetTimestamp, 'utf8')
+    console.log(`Reset timestamp written: "${resetTimestamp}" at ${isoTime}`)
+
+    res.json({
+      success: true,
+      message: 'Analytics data cleared successfully',
+      timestamp: isoTime,
+    })
+  } catch (error) {
+    console.error('Error resetting analytics:', error)
+    res.status(500).json({
+      success: false,
+      error: error instanceof Error ? error.message : 'Failed to reset analytics',
+    })
+  }
+})
+
+/**
+ * Reset triggered alerts by clearing the alerts JSON file
+ */
+app.post('/api/alerts/reset', (req, res) => {
+  try {
+    const alertsFile = path.join(LOGS_DIR, 'ema21_triggered_alerts.json')
+    const now = new Date().toISOString()
+
+    // Write empty alerts structure
+    const emptyAlerts = { alerts: [] }
+    fs.writeFileSync(alertsFile, JSON.stringify(emptyAlerts, null, 2), 'utf8')
+    console.log(`Alerts cleared at ${now}`)
+
+    res.json({
+      success: true,
+      message: 'Triggered alerts cleared successfully',
+      timestamp: now,
+    })
+  } catch (error) {
+    console.error('Error resetting alerts:', error)
+    res.status(500).json({
+      success: false,
+      error: error instanceof Error ? error.message : 'Failed to reset alerts',
+    })
+  }
+})
+
+/**
+ * Export instruments config to JSON file for Python backend to consume
+ * This creates the bridge between React dashboard and Python strategy engine
+ */
+app.post('/api/instruments/export', (req, res) => {
+  try {
+    const instruments = req.body.instruments || []
+    const configFile = path.join(LOGS_DIR, 'instruments_config.json')
+    
+    const config = {
+      exported_at: new Date().toISOString(),
+      instruments: instruments.map(inst => ({
+        id: inst.id,
+        name: inst.name,
+        brokerSymbol: inst.brokerSymbol,
+        strategy: inst.strategy,
+        status: inst.status,
+        atmPrice: inst.atmPrice,
+        minPremium: inst.minPremium,
+        maxPremium: inst.maxPremium,
+        breakeven_rr: inst.breakeven_rr || 1.0,
+        trail_step_rr: inst.trail_step_rr || 0.5,
+        max_initial_risk_points: inst.max_initial_risk_points || 20.0,
+        lotSizeAdjustment: inst.lotSizeAdjustment,
+        monitoringStartTime: inst.monitoringStartTime,
+        monitoringEndTime: inst.monitoringEndTime,
+      }))
+    }
+    
+    fs.writeFileSync(configFile, JSON.stringify(config, null, 2), 'utf8')
+    console.log(`Instruments config exported at ${config.exported_at}`)
+    
+    res.json({
+      success: true,
+      message: 'Instruments exported successfully',
+      count: instruments.length,
+      timestamp: config.exported_at,
+    })
+  } catch (error) {
+    console.error('Error exporting instruments:', error)
+    res.status(500).json({
+      success: false,
+      error: error instanceof Error ? error.message : 'Failed to export instruments',
+    })
+  }
+})
+
+/**
+ * Get running strategies status from a status file
+ * Updated by the Python daemon
+ */
+app.get('/api/instruments/status', (req, res) => {
+  try {
+    const statusFile = path.join(LOGS_DIR, 'strategies_status.json')
+    
+    if (fs.existsSync(statusFile)) {
+      const status = JSON.parse(fs.readFileSync(statusFile, 'utf8'))
+      res.json(status)
+    } else {
+      res.json({
+        updated_at: new Date().toISOString(),
+        running_strategies: {},
+        message: 'No strategies running'
+      })
+    }
+  } catch (error) {
+    console.error('Error reading strategies status:', error)
+    res.status(500).json({
+      success: false,
+      error: error instanceof Error ? error.message : 'Failed to read status',
+    })
+  }
+})
+
+/**
+ * Proxy endpoint to serve logs
+ */
+app.get('/api/logs/:filename', (req, res) => {
+  try {
+    const filename = req.params.filename
+    // Security: only allow alphanumeric, dots, underscores, and hyphens
+    if (!/^[a-zA-Z0-9._-]+$/.test(filename)) {
+      return res.status(400).json({ error: 'Invalid filename' })
+    }
+
+    const filepath = path.resolve(LOGS_DIR, filename)
+
+    // Security: prevent directory traversal
+    if (!filepath.startsWith(path.resolve(LOGS_DIR))) {
+      return res.status(403).json({ error: 'Access denied' })
+    }
+
+    if (fs.existsSync(filepath)) {
+      res.sendFile(filepath)
+    } else {
+      res.status(404).json({ error: 'File not found' })
+    }
+  } catch (error) {
+    console.error('Error serving log file:', error)
+    res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
+app.listen(PORT, () => {
+  console.log(`Analytics API server running on port ${PORT}`)
+  console.log(`Logs directory: ${LOGS_DIR}`)
+})
