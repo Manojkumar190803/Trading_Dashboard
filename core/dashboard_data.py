@@ -3,7 +3,7 @@
 import json
 import logging
 import os
-from datetime import datetime, timedelta, time
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -26,14 +26,14 @@ class DashboardDataProvider:
             self.client = None
 
     def get_account_summary(self) -> dict:
-        """Fetch account summary with balance, P&L, and positions."""
+        """Fetch account summary with balance, P&L, positions, and mode."""
         if not self.available or not self.client:
             return self._mock_account_summary()
 
         try:
             data = {
                 "timestamp": datetime.now().isoformat(),
-                "engine_status": self._get_engine_status(),
+                "mode": self._detect_mode(),  # Get current OpenAlgo mode
                 "positions": self._fetch_positions(),
                 "orders": self._fetch_orders(),
                 "account": self._fetch_account_info(),
@@ -42,7 +42,7 @@ class DashboardDataProvider:
         except Exception as e:
             logger.error(f"Error fetching account data: {e}")
             return self._mock_account_summary()
-    
+
     def _fetch_positions(self) -> list[dict]:
         """Fetch open positions from OpenAlgo."""
         try:
@@ -103,6 +103,45 @@ class DashboardDataProvider:
             logger.error(f"Error fetching account info: {e}")
             return {}
 
+    def _detect_mode(self) -> str:
+        """Detect OpenAlgo current mode (live or analyzer).
+        
+        Returns 'live' if real account/trades are being used, 'analyzer' if in analysis mode.
+        Checks environment variables and account state to determine mode.
+        """
+        import os
+        
+        # Check environment variable first (highest priority)
+        mode_env = os.getenv("OPENALGO_MODE", "").lower().strip()
+        if mode_env in ("live", "analyzer"):
+            return mode_env
+        
+        # Check for strategy mode (run_strategy.py --mode)
+        strategy_mode = os.getenv("STRATEGY_MODE", "").lower().strip()
+        if strategy_mode in ("live", "paper", "backtest", "smoke"):
+            # Map strategy modes to analyzer/live
+            if strategy_mode == "live":
+                return "live"
+            else:
+                return "analyzer"
+        
+        # Check for dry_run flag
+        dry_run = os.getenv("DRY_RUN", "").lower().strip()
+        if dry_run in ("true", "1", "yes"):
+            return "analyzer"
+        
+        # Try to infer from account data (check if positions/trades exist)
+        try:
+            positions = self._fetch_positions()
+            if positions and len(positions) > 0:
+                # Has active positions, likely live mode
+                return "live"
+        except Exception:
+            pass
+        
+        # Default to analyzer mode (safe default)
+        return "analyzer"
+
     def _safe_float(self, value) -> float:
         """Safely convert value to float, handling strings and None."""
         if value is None:
@@ -112,51 +151,11 @@ class DashboardDataProvider:
         except (ValueError, TypeError):
             return 0.0
 
-    def _is_market_open(self) -> bool:
-        """Check if Indian stock market is currently open."""
-        now = datetime.now()
-        current_time = now.time()
-        
-        # Market hours: 9:15 AM to 3:30 PM IST
-        market_open = time(9, 15)
-        market_close = time(15, 30)
-        
-        # Market is closed on weekends (Saturday=5, Sunday=6)
-        if now.weekday() >= 5:
-            return False
-        
-        return market_open <= current_time <= market_close
-
-    def _check_engine_health(self) -> bool:
-        """Verify engine health by checking OpenAlgo connection."""
-        if not self.available or not self.client:
-            return False
-        
-        try:
-            # Try to fetch positions - simple health check
-            resp = self.client.positionbook()
-            return resp is not None
-        except Exception as e:
-            logger.warning(f"Engine health check failed: {e}")
-            return False
-
-    def _get_engine_status(self) -> str:
-        """Get current engine status: 'active', 'pause', or 'stopped'."""
-        # Check engine health first
-        if not self._check_engine_health():
-            return "stopped"
-        
-        # Check market hours
-        if self._is_market_open():
-            return "active"
-        else:
-            return "pause"
-
     def _mock_account_summary(self) -> dict:
         """Return mock data when API is unavailable."""
         return {
             "timestamp": datetime.now().isoformat(),
-            "engine_status": "stopped",
+            "mode": self._detect_mode(),  # Include mode in mock data too
             "positions": [],
             "orders": [],
             "account": {
@@ -188,35 +187,56 @@ class DashboardDataProvider:
 
 
 class FyersWalletProvider:
-    """Fetch wallet and balance data from Fyers broker."""
+    """Fetch wallet and balance data from Fyers broker, with OpenAlgo fallback."""
 
-    def __init__(self, fyers_api_key: Optional[str] = None, fyers_access_token: Optional[str] = None):
-        """Initialize with Fyers credentials."""
+    def __init__(self, fyers_api_key: Optional[str] = None, fyers_access_token: Optional[str] = None, openalgo_client=None):
+        """Initialize with Fyers credentials and optional OpenAlgo fallback."""
         self.fyers_api_key = fyers_api_key or os.getenv("FYERS_API_KEY")
         self.fyers_access_token = fyers_access_token or os.getenv("FYERS_ACCESS_TOKEN")
-        self.available = bool(self.fyers_api_key and self.fyers_access_token)
+        self.fyers_available = bool(self.fyers_api_key and self.fyers_access_token and "YOUR_" not in str(self.fyers_api_key))
+        self.openalgo_client = openalgo_client
 
     def get_wallet_data(self) -> dict:
-        """Fetch wallet balance from Fyers."""
-        if not self.available:
-            return self._mock_wallet_data()
+        """Fetch wallet balance from Fyers, with OpenAlgo fallback."""
+        # Priority 1: Try Fyers API (live mode)
+        if self.fyers_available:
+            try:
+                from fyers_apiv3 import fyersModel  # type: ignore
 
-        try:
-            from fyers_apiv3 import fyersModel  # type: ignore
+                fyers = fyersModel.FyersModel(
+                    client_id=self.fyers_api_key,
+                    token=self.fyers_access_token,
+                    log_path=Path(__file__).parent.parent / "logs",
+                )
 
-            fyers = fyersModel.FyersModel(
-                client_id=self.fyers_api_key,
-                token=self.fyers_access_token,
-                log_path=Path(__file__).parent.parent / "logs",
-            )
-
-            response = fyers.funds()
-            if response and "data" in response:
-                return response["data"]
-            return self._mock_wallet_data()
-        except Exception as e:
-            logger.error(f"Error fetching Fyers wallet: {e}")
-            return self._mock_wallet_data()
+                response = fyers.funds()
+                if response and "data" in response:
+                    logger.debug(f"✓ Fetched wallet data from Fyers")
+                    return response["data"]
+            except Exception as e:
+                logger.warning(f"Could not fetch from Fyers, falling back to OpenAlgo: {e}")
+        
+        # Priority 2: Try OpenAlgo API (analyzer mode)
+        if self.openalgo_client:
+            try:
+                resp = self.openalgo_client.funds()
+                if resp and "data" in resp:
+                    data = resp["data"]
+                    if isinstance(data, list) and len(data) > 0:
+                        data = data[0]
+                    logger.debug(f"✓ Fetched wallet data from OpenAlgo (fallback)")
+                    return {
+                        "available_balance": float(data.get("availablecash", 0)),
+                        "utilisedMargin": float(data.get("utiliseddebits", 0)),
+                        "availableMargin": float(data.get("availablecash", 0)),
+                        "pnl": float(data.get("m2munrealized", 0)),
+                    }
+            except Exception as e:
+                logger.warning(f"Could not fetch from OpenAlgo: {e}")
+        
+        # Priority 3: Return mock data
+        logger.debug(f"Using mock wallet data (no live data available)")
+        return self._mock_wallet_data()
 
     def _mock_wallet_data(self) -> dict:
         """Return mock wallet data when API is unavailable."""

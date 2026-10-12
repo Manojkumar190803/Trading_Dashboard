@@ -2,6 +2,7 @@ import { useEffect, useCallback, useState } from 'react'
 import { fetchAndParseCSV, getTodayDateString, watchFile } from '@/utils/files'
 import { parseCSV } from '@/utils/format'
 import { StrategyAlert, Trade, EquityCurvePoint } from '@/types'
+import { isMarketOpen } from '@/utils/market-hours'
 
 /**
  * Hook to fetch strategy alerts from daily CSV
@@ -98,6 +99,32 @@ export const useAnalyticsTrades = () => {
       setError(null)
 
       try {
+        // First try to fetch from the new API endpoint that synthesizes from dashboard_data.json
+        const response = await fetch('/api/analytics/summary')
+        if (response.ok) {
+          const data = await response.json()
+          const orders = data.orders || []
+          
+          // Convert orders to trades format
+          const parsed = orders
+            .filter((order: any) => order.timestamp && order.quantity)
+            .map((order: any) => ({
+              timestamp: order.timestamp || '',
+              strategy: order.strategy || 'Unknown',
+              pnl: 0, // Orders don't have PnL directly
+              source: order.exchange || '',
+              message: `${order.action} ${order.symbol} @ ${order.average_price}`,
+            }))
+
+          setTrades(parsed)
+          return
+        }
+      } catch (err) {
+        console.debug('Analytics API endpoint not available, trying CSV...')
+      }
+
+      // Fallback to CSV file
+      try {
         const rows = await fetchAndParseCSV('analytics_trades.csv')
         const parsed = rows
           .filter((row) => row.timestamp && row.pnl)
@@ -130,6 +157,61 @@ export const useAnalyticsTrades = () => {
   }, [fetchTrades])
 
   return { trades, isLoading, error, refetch: fetchTrades }
+}
+
+/**
+ * Hook to fetch analytics summary from API
+ */
+export const useAnalyticsSummaryFromAPI = () => {
+  const [summary, setSummary] = useState({
+    net_pnl: 0,
+    gross_profit: 0,
+    gross_loss: 0,
+    trades_completed: 0,
+    winning_trades: 0,
+    losing_trades: 0,
+    win_rate: 0,
+    profit_factor: 0,
+    expectancy: 0,
+  })
+  const [isLoading, setIsLoading] = useState(true)
+  const [error, setError] = useState<string | null>(null)
+
+  const fetchSummary = useCallback(async () => {
+    try {
+      setIsLoading(true)
+      setError(null)
+      const response = await fetch('/api/analytics/summary')
+      
+      if (response.ok) {
+        const data = await response.json()
+        setSummary({
+          net_pnl: data.net_pnl || 0,
+          gross_profit: data.gross_profit || 0,
+          gross_loss: data.gross_loss || 0,
+          trades_completed: data.trades_completed || 0,
+          winning_trades: data.winning_trades || 0,
+          losing_trades: data.losing_trades || 0,
+          win_rate: data.win_rate || 0,
+          profit_factor: data.profit_factor || 0,
+          expectancy: data.expectancy || 0,
+        })
+      }
+    } catch (err) {
+      console.debug('Failed to fetch analytics summary from API')
+      setError(err instanceof Error ? err.message : 'Failed to fetch analytics')
+    } finally {
+      setIsLoading(false)
+    }
+  }, [])
+
+  useEffect(() => {
+    fetchSummary()
+    const interval = setInterval(fetchSummary, 3000)
+    return () => clearInterval(interval)
+  }, [fetchSummary])
+
+  return { summary, isLoading, error, refetch: fetchSummary }
 }
 
 /**
@@ -249,8 +331,24 @@ export const useRealAccountData = (shouldFetch = true, interval = 1000) => {
   useEffect(() => {
     if (!shouldFetch) return
 
+    // Only poll during market hours (9:15 AM - 3:30 PM IST, Mon-Fri)
+    if (!isMarketOpen()) {
+      console.log('[useRealAccountData] Market closed - polling disabled')
+      return
+    }
+
     fetchData()
-    const timer = setInterval(fetchData, interval)
+    
+    // Set up polling interval
+    const timer = setInterval(() => {
+      // Check market status on each poll
+      if (isMarketOpen()) {
+        fetchData()
+      } else {
+        console.log('[useRealAccountData] Market closed - stopping polling')
+      }
+    }, interval)
+
     return () => clearInterval(timer)
   }, [shouldFetch, interval, fetchData])
 
@@ -307,4 +405,64 @@ export const useRealWalletData = (shouldFetch = true, interval = 1000) => {
   }, [shouldFetch, interval, fetchWallet])
 
   return { wallet, isLoading, error, refetch: fetchWallet }
+}
+
+/**
+ * Hook to fetch daily P&L analytics
+ */
+export const useDailyPnL = () => {
+  const [dailyData, setDailyData] = useState<{
+    month: string
+    year: number
+    month_num: number
+    days: Record<string, { pnl: number; trades: number; color: string }>
+    month_summary: {
+      total_pnl: number
+      best_day: { day: number | null; pnl: number }
+      worst_day: { day: number | null; pnl: number }
+      winning_days: number
+      losing_days: number
+      total_trading_days: number
+    }
+  } | null>(null)
+  const [isLoading, setIsLoading] = useState(true)
+  const [error, setError] = useState<string | null>(null)
+
+  const fetchDailyData = useCallback(async () => {
+    try {
+      setIsLoading(true)
+      setError(null)
+      
+      const response = await fetch('/api/analytics/daily')
+      if (response.ok) {
+        const data = await response.json()
+        setDailyData(data)
+      }
+    } catch (err) {
+      console.debug('Failed to fetch daily P&L analytics')
+      setError(err instanceof Error ? err.message : 'Failed to fetch daily data')
+    } finally {
+      setIsLoading(false)
+    }
+  }, [])
+
+  useEffect(() => {
+    fetchDailyData()
+    const interval = setInterval(fetchDailyData, 5000) // Poll every 5 seconds
+    return () => clearInterval(interval)
+  }, [fetchDailyData])
+
+  const resetDaily = useCallback(async () => {
+    try {
+      const response = await fetch('/api/analytics/daily/reset', { method: 'POST' })
+      if (response.ok) {
+        // Refetch after reset
+        await fetchDailyData()
+      }
+    } catch (err) {
+      console.error('Failed to reset daily analytics:', err)
+    }
+  }, [fetchDailyData])
+
+  return { dailyData, isLoading, error, refetch: fetchDailyData, reset: resetDaily }
 }

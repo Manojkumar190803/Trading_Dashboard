@@ -29,19 +29,24 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application files
 COPY run_strategy.py .
 COPY export_dashboard_data.py .
+COPY api_server.py .
 COPY core ./core
 COPY strategies ./strategies
 COPY frontend ./frontend
 COPY pytest.ini .
 COPY .env.example .env.example
+COPY start_with_api.sh .
 
 # Create necessary directories (logs will be mounted as volume)
 RUN mkdir -p logs data
 
-# Environment defaults
-ENV STRATEGY=ema21 \
-    MODE=live \
-    SCRIPT=NIFTY
+# Make start script executable
+RUN chmod +x start_with_api.sh
 
-# Run strategy
-CMD ["sh", "-c", "exec python3 run_strategy.py --script $SCRIPT --strategy $STRATEGY --mode $MODE"]
+# Environment defaults
+ENV STRATEGY=ema21
+ENV MODE=live
+ENV SCRIPT="NIFTY BANKNIFTY"
+
+# Run both strategy engine and API server
+CMD ["./start_with_api.sh"]

@@ -31,7 +31,8 @@ EXPOSE 3000 4000
 # Set environment for development
 ENV VITE_APP_TITLE="Trading Strategy Dashboard" \
     NODE_ENV=development \
-    LOGS_DIR=/app/logs
+    LOGS_DIR=/app/logs \
+    API_TARGET=http://strategy_worker:5003
 
 # Start development server with HMR support and API server
 CMD ["npm", "run", "dev"]

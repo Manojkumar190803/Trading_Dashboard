@@ -1,6 +1,14 @@
 @import 'tailwindcss/base';
 @import 'tailwindcss/components';
 @import 'tailwindcss/utilities';
+@import './theme-light.css';
+
+/* ==================== Theme Setup ==================== */
+
+/* Dark Theme (Default) */
+:root {
+  color-scheme: dark;
+}
 
 /* ==================== Custom Global Styles ==================== */
 
@@ -98,6 +106,11 @@ td {
 /* Glass Effect */
 .glass {
   @apply bg-bg-primary/80 backdrop-blur-md border border-bg-tertiary/50;
+  transition: all 0.3s ease;
+}
+
+.glass:hover {
+  @apply border-bg-tertiary;
 }
 
 /* Gradient Text */
@@ -105,7 +118,7 @@ td {
   @apply bg-gradient-to-r from-accent-cyan to-accent-blue bg-clip-text text-transparent;
 }
 
-/* Shadow Utilities */
+/* Shadow Utilities - Dark Mode */
 .shadow-glow {
   box-shadow: 0 0 20px rgba(89, 208, 255, 0.3);
 }
@@ -115,6 +128,19 @@ td {
 }
 
 .shadow-glow-red {
+  box-shadow: 0 0 20px rgba(255, 95, 109, 0.3);
+}
+
+/* Light Mode Specific Shadows */
+.dark .shadow-glow {
+  box-shadow: 0 0 20px rgba(89, 208, 255, 0.3);
+}
+
+.dark .shadow-glow-green {
+  box-shadow: 0 0 20px rgba(39, 212, 138, 0.3);
+}
+
+.dark .shadow-glow-red {
   box-shadow: 0 0 20px rgba(255, 95, 109, 0.3);
 }
 

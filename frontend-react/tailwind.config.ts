@@ -1,23 +1,42 @@
 import type { Config } from 'tailwindcss'
 import defaultTheme from 'tailwindcss/defaultTheme'
 
+const darkColors = {
+  bg: {
+    primary: '#0a0e27',
+    secondary: '#111933',
+    tertiary: '#1a1f3a',
+    surface: '#232d4d',
+  },
+  text: {
+    primary: '#f2f8ff',
+    secondary: '#a9c2cc',
+    tertiary: '#8e9cb0',
+  },
+}
+
+const lightColors = {
+  bg: {
+    primary: '#ffffff',
+    secondary: '#f5f7fa',
+    tertiary: '#e8ecf1',
+    surface: '#e0e5ed',
+  },
+  text: {
+    primary: '#0a0e27',
+    secondary: '#4a5568',
+    tertiary: '#718096',
+  },
+}
+
 export default {
   content: ['./index.html', './src/**/*.{js,ts,jsx,tsx}'],
+  darkMode: 'class',
   theme: {
     extend: {
       colors: {
-        // Professional dark theme
-        bg: {
-          primary: '#0a0e27',
-          secondary: '#111933',
-          tertiary: '#1a1f3a',
-          surface: '#232d4d',
-        },
-        text: {
-          primary: '#f2f8ff',
-          secondary: '#a9c2cc',
-          tertiary: '#8e9cb0',
-        },
+        bg: darkColors.bg,
+        text: darkColors.text,
         accent: {
           cyan: '#59d0ff',
           green: '#27d48a',
@@ -46,6 +65,8 @@ export default {
         'glow-red': '0 0 20px rgba(255, 95, 109, 0.15)',
         card: '0 4px 6px rgba(0, 0, 0, 0.1), 0 1px 3px rgba(0, 0, 0, 0.08)',
         'card-hover': '0 20px 25px -5px rgba(0, 0, 0, 0.3)',
+        'light-card': '0 1px 3px rgba(0, 0, 0, 0.08), 0 2px 8px rgba(0, 0, 0, 0.05)',
+        'light-card-hover': '0 4px 12px rgba(0, 0, 0, 0.12), 0 2px 6px rgba(0, 0, 0, 0.08)',
       },
       backdropBlur: {
         xs: '2px',

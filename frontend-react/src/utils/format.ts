@@ -66,14 +66,29 @@ export const getStatusColor = (
       dot: 'bg-accent-yellow',
     },
     stopped: {
-      bg: 'bg-text-tertiary/10',
-      text: 'text-text-tertiary',
-      dot: 'bg-text-tertiary',
+      bg: 'bg-accent-red/10',
+      text: 'text-accent-red',
+      dot: 'bg-accent-red',
+    },
+    Ready: {
+      bg: 'bg-accent-green/10',
+      text: 'text-accent-green',
+      dot: 'bg-accent-green',
     },
     READY: {
       bg: 'bg-accent-green/10',
       text: 'text-accent-green',
       dot: 'bg-accent-green',
+    },
+    active: {
+      bg: 'bg-accent-green/10',
+      text: 'text-accent-green',
+      dot: 'bg-accent-green',
+    },
+    inactive: {
+      bg: 'bg-accent-red/10',
+      text: 'text-accent-red',
+      dot: 'bg-accent-red',
     },
     WARNING: {
       bg: 'bg-accent-yellow/10',
@@ -87,7 +102,11 @@ export const getStatusColor = (
     },
   }
 
-  return statusMap[status] || statusMap.stopped
+  return statusMap[status] || {
+    bg: 'bg-accent-red/10',
+    text: 'text-accent-red',
+    dot: 'bg-accent-red',
+  }
 }
 
 /**

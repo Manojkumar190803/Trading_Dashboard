@@ -1830,7 +1830,7 @@ class MultiEngineLiveFeedRunner:
             "MultiEngineLiveFeedRunner starting [%s] (spot=%s tf=%sm)",
             names, self.cfg.spot_symbol, self.cfg.timeframe_minutes,
         )
-        for engine in self.engines:
+        for name, engine in self.engines:
             _load_persisted_trade_alerts(engine, datetime.now().date())
             _print_persisted_trade_alerts(
                 engine.strategy_name,

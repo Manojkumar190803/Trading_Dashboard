@@ -9,6 +9,7 @@ import {
   Order,
   LogEntry,
   Instrument,
+  TrailingStopsConfig,
 } from '@/types'
 
 interface AppStore {
@@ -54,6 +55,16 @@ interface AppStore {
   toggleInstrument: (id: string) => void
   exportInstruments: () => Promise<void>
   getStrategyStatus: () => Promise<any>
+
+  // Global Trailing Stops Configuration
+  trailingStopsConfig: TrailingStopsConfig
+  setTrailingStopsConfig: (config: Partial<TrailingStopsConfig>) => void
+  resetTrailingStopsConfig: () => void
+
+  // Theme
+  theme: 'dark' | 'light'
+  setTheme: (theme: 'dark' | 'light') => void
+  toggleTheme: () => void
 
   // UI State
   sidebarOpen: boolean
@@ -170,6 +181,33 @@ export const useAppStore = create<AppStore>(
       }
     },
 
+    // Global Trailing Stops Configuration
+    trailingStopsConfig: {
+      breakEvenRR: 1.25,
+      trailStepRR: 0.5,
+      maxInitialRiskPoints: 20,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    },
+    setTrailingStopsConfig: (config) =>
+      set((state) => ({
+        trailingStopsConfig: {
+          ...state.trailingStopsConfig,
+          ...config,
+          updatedAt: new Date().toISOString(),
+        },
+      })),
+    resetTrailingStopsConfig: () =>
+      set({
+        trailingStopsConfig: {
+          breakEvenRR: 1.25,
+          trailStepRR: 0.5,
+          maxInitialRiskPoints: 20,
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+        },
+      }),
+
     // UI State
     sidebarOpen: true,
     setSidebarOpen: (open) => set({ sidebarOpen: open }),
@@ -180,6 +218,29 @@ export const useAppStore = create<AppStore>(
     refreshInterval: 5000,
     setRefreshInterval: (interval) => set({ refreshInterval: interval }),
 
+    // Theme
+    theme: 'dark' as 'dark' | 'light',
+    setTheme: (theme) => {
+      set({ theme })
+      // Apply theme to document
+      if (theme === 'light') {
+        document.documentElement.classList.add('light')
+      } else {
+        document.documentElement.classList.remove('light')
+      }
+    },
+    toggleTheme: () => {
+      set((state) => {
+        const newTheme = state.theme === 'dark' ? 'light' : 'dark'
+        if (newTheme === 'light') {
+          document.documentElement.classList.add('light')
+        } else {
+          document.documentElement.classList.remove('light')
+        }
+        return { theme: newTheme }
+      })
+    },
+
     // Loading
     isLoading: false,
     setIsLoading: (loading) => set({ isLoading: loading }),
@@ -188,10 +249,12 @@ export const useAppStore = create<AppStore>(
     }),
     {
       name: 'app-store',
-      partialize: (state) => ({
+      partialize: (state: AppStore) => ({
         instruments: state.instruments,
+        theme: state.theme,
+        trailingStopsConfig: state.trailingStopsConfig,
       }),
     }
-  )
+  ) as any
 )
 

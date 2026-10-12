@@ -17,6 +17,62 @@ const LOGS_DIR = process.env.LOGS_DIR || '/app/logs'
 app.use(express.json())
 
 /**
+ * Serve log files (.txt, .csv, .json) from the logs directory
+ * This enables React frontend to fetch strategy data files
+ */
+app.get('/logs/:filename', (req, res) => {
+  try {
+    const { filename } = req.params
+    
+    // Only allow .txt, .csv, and .json files
+    if (!filename.match(/\.(txt|csv|json)$/)) {
+      res.status(403).json({ error: 'Invalid file type' })
+      return
+    }
+    
+    const filePath = path.join(LOGS_DIR, filename)
+    
+    // Security: ensure the file is within LOGS_DIR (prevent path traversal)
+    const normalizedPath = path.normalize(filePath)
+    const normalizedLogsDir = path.normalize(LOGS_DIR)
+    if (!normalizedPath.startsWith(normalizedLogsDir)) {
+      res.status(403).json({ error: 'Access denied' })
+      return
+    }
+    
+    // Check if file exists
+    if (!fs.existsSync(filePath)) {
+      console.log(`[logs] File not found: ${filename}`)
+      res.status(404).json({ error: 'File not found' })
+      return
+    }
+    
+    // Read and serve the file
+    const content = fs.readFileSync(filePath, 'utf-8')
+    
+    // Set appropriate content type
+    let contentType = 'application/json'
+    if (filename.endsWith('.txt')) contentType = 'text/plain'
+    if (filename.endsWith('.csv')) contentType = 'text/csv'
+    
+    // CORS headers to allow requests from React (port 3000)
+    res.setHeader('Access-Control-Allow-Origin', '*')
+    res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS')
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type')
+    res.setHeader('Content-Type', contentType)
+    res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate')
+    res.setHeader('Pragma', 'no-cache')
+    res.setHeader('Expires', '0')
+    
+    console.log(`[logs] Serving ${filename} (${content.length} bytes)`)
+    res.send(content)
+  } catch (error) {
+    console.error('[logs] Error serving file:', error)
+    res.status(500).json({ error: 'Error reading file' })
+  }
+})
+
+/**
  * Health check endpoint
  */
 app.get('/health', (req, res) => {
@@ -193,6 +249,79 @@ app.get('/api/logs/:filename', (req, res) => {
   } catch (error) {
     console.error('Error serving log file:', error)
     res.status(500).json({ error: 'Internal server error' })
+  }
+})
+
+/**
+ * Proxy analytics endpoints to strategy_worker backend
+ */
+app.get('/api/analytics/summary', async (req, res) => {
+  try {
+    const backendUrl = process.env.BACKEND_URL || 'http://strategy_worker:5003'
+    const response = await fetch(`${backendUrl}/api/analytics/summary`)
+    const data = await response.json()
+    res.json(data)
+  } catch (error) {
+    console.error('Error proxying analytics/summary:', error)
+    res.status(500).json({ error: 'Failed to fetch analytics summary' })
+  }
+})
+
+app.get('/api/analytics/daily', async (req, res) => {
+  try {
+    const backendUrl = process.env.BACKEND_URL || 'http://strategy_worker:5003'
+    const response = await fetch(`${backendUrl}/api/analytics/daily`)
+    const data = await response.json()
+    res.json(data)
+  } catch (error) {
+    console.error('Error proxying analytics/daily:', error)
+    res.status(500).json({ error: 'Failed to fetch daily analytics' })
+  }
+})
+
+app.post('/api/analytics/daily/reset', async (req, res) => {
+  try {
+    const backendUrl = process.env.BACKEND_URL || 'http://strategy_worker:5003'
+    const response = await fetch(`${backendUrl}/api/analytics/daily/reset`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(req.body),
+    })
+    const data = await response.json()
+    res.json(data)
+  } catch (error) {
+    console.error('Error proxying analytics/daily/reset:', error)
+    res.status(500).json({ error: 'Failed to reset daily analytics' })
+  }
+})
+
+app.get('/api/symbols/search', async (req, res) => {
+  try {
+    const backendUrl = process.env.BACKEND_URL || 'http://strategy_worker:5003'
+    const query = req.query.q || ''
+    const strategy = req.query.strategy || ''
+    const response = await fetch(`${backendUrl}/api/symbols/search?q=${query}&strategy=${strategy}`)
+    const data = await response.json()
+    res.json(data)
+  } catch (error) {
+    console.error('Error proxying symbols/search:', error)
+    res.status(500).json({ error: 'Failed to search symbols' })
+  }
+})
+
+app.post('/api/symbols/validate', async (req, res) => {
+  try {
+    const backendUrl = process.env.BACKEND_URL || 'http://strategy_worker:5003'
+    const response = await fetch(`${backendUrl}/api/symbols/validate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(req.body),
+    })
+    const data = await response.json()
+    res.json(data)
+  } catch (error) {
+    console.error('Error proxying symbols/validate:', error)
+    res.status(500).json({ error: 'Failed to validate symbol' })
   }
 })
 

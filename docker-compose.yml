@@ -48,8 +48,11 @@ services:
       VITE_APP_TITLE: "Trading Strategy Dashboard"
       VITE_LOGS_DIR: "/logs"
       LOGS_DIR: "/app/logs"
+      API_TARGET: http://strategy_worker:5003
+      NODE_ENV: development
     depends_on:
-      - strategy_worker
+      strategy_worker:
+        condition: service_started
     healthcheck:
       test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:3000"]
       interval: 10s
@@ -84,11 +87,12 @@ services:
     container_name: strategy_worker
     labels:
       com.openalgo.display-name: "Strategy background worker"
+    ports:
+      - "5003:5003"
     environment:
       <<: *common-environment
       STRATEGY: ${STRATEGY:-ema21}
       MODE: ${MODE:-live}
-      SCRIPT: ${SCRIPT:-NIFTY}
       BACKGROUND_WORKER_ENABLED: "true"
     volumes:
       - ./logs:/app/logs
@@ -114,7 +118,7 @@ services:
     volumes:
       - ./logs:/app/logs
       - ./data:/app/data
-    command: python3 export_dashboard_data.py ${STRATEGY_MODE:-analyzer} 1
+    command: python3 export_dashboard_data.py both 1
     depends_on:
       - strategy_worker
 

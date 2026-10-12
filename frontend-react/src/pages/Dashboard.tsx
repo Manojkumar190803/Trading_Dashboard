@@ -7,6 +7,7 @@ import {
 import { useRealAccountData, useRealWalletData } from '@/hooks'
 import {
   formatCurrency,
+  getStatusColor,
 } from '@/utils/format'
 
 const Dashboard: React.FC = () => {
@@ -16,67 +17,59 @@ const Dashboard: React.FC = () => {
   // Fetch real Fyers wallet data (live mode) - poll every 1 second for live updates
   const { wallet: walletData, isLoading: walletLoading } = useRealWalletData(true, 1000)
   
+  const [mode, setMode] = useState<'analyzer' | 'live'>('analyzer')
   const [metrics, setMetrics] = useState({
     net_mtm: 0,
     available_margin: 50000,
     active_trades: 0,
+    engine_status: 'Ready' as const,
   })
 
-  const [engineStatus, setEngineStatus] = useState<'active' | 'pause' | 'stopped'>('pause')
+  // Detect mode based on available data - prioritize live over analyzer
+  useEffect(() => {
+    let newMode: 'analyzer' | 'live' = 'analyzer'
+    
+    // Priority: Live mode (wallet) > Analyzer mode (account) > Mock
+    if (walletData) {
+      newMode = 'live'
+    } else if (accountData) {
+      newMode = 'analyzer'
+    }
+    
+    setMode(newMode)
+    console.log(`[Mode] Switched to: ${newMode} (wallet=${!!walletData}, account=${!!accountData})`)
+  }, [accountData, walletData])
 
   // Update metrics from real data when available
   useEffect(() => {
-    // Priority 1: Use OpenAlgo account data (works for both live and analyzer modes)
-    if (accountData?.account) {
-      const account = accountData.account
-      const positions = accountData.positions || []
-      const activeTrades = positions.filter((p: any) => parseFloat(p.qty || p.quantity || 0) !== 0).length
-      
-      // Extract margin with fallback chain for different OpenAlgo versions
-      const margin = account.availableMargin || account.margin || account.available_margin || account.availablecash || 50000
-      
-      setMetrics({
-        net_mtm: parseFloat(account.mtm || account.pnl || account.m2munrealized || 0),
-        available_margin: parseFloat(margin),
-        active_trades: activeTrades,
-      })
-      
-      // Update engine status from accountData
-      if (accountData?.engine_status) {
-        setEngineStatus(accountData.engine_status as 'active' | 'pause' | 'stopped')
-      }
-      return
-    }
-    
-    // Priority 2: Fallback to Fyers wallet data if available
-    if (walletData) {
+    if (mode === 'live' && walletData) {
+      // Live mode: Use Fyers wallet data
       setMetrics({
         net_mtm: walletData.pnl,
         available_margin: walletData.available_balance,
         active_trades: 0, // Would need positions data
+        engine_status: 'Ready',
       })
-      return
+    } else if (accountData?.account) {
+      // Analyzer mode: Use OpenAlgo account data
+      const account = accountData.account
+      const positions = accountData.positions || []
+      const activeTrades = positions.filter((p: any) => parseFloat(p.qty || p.quantity || 0) !== 0).length
+      
+      setMetrics({
+        // Try multiple field names for MTM (OpenAlgo may return different fields)
+        net_mtm: parseFloat(account.mtm || account.pnl || account.m2munrealized || 0),
+        // Try multiple field names for available margin
+        available_margin: parseFloat(account.availableMargin || account.margin || account.available_margin || account.availablecash || 50000),
+        active_trades: activeTrades,
+        engine_status: 'Ready',
+      })
     }
-    
-    // Keep default values if no data available
-  }, [accountData, walletData])
+  }, [mode, accountData, walletData, accountLoading, walletLoading])
 
+  const statusColor = getStatusColor(metrics.engine_status)
   const isProfit = metrics.net_mtm >= 0
   const mtmColor = isProfit ? 'green' : 'red'
-
-  // Get engine status color and label
-  const getEngineStatusColor = () => {
-    switch (engineStatus) {
-      case 'active':
-        return { color: 'emerald', label: 'Engine Active', statusText: 'RUNNING' }
-      case 'pause':
-        return { color: 'amber', label: 'Engine Paused', statusText: 'OFF MARKET' }
-      case 'stopped':
-        return { color: 'red', label: 'Engine Stopped', statusText: 'ERROR' }
-      default:
-        return { color: 'slate', label: 'Status Unknown', statusText: 'N/A' }
-    }
-  }
 
   // Get current time for last sync display
   const lastSyncTime = new Date().toLocaleTimeString('en-IN', {
@@ -101,23 +94,13 @@ const Dashboard: React.FC = () => {
               Live overview of your trading account and market positions
             </p>
           </div>
-
-          {/* Engine Status Indicator */}
-          <div className={clsx(
-            'flex items-center gap-3 px-4 py-2.5 rounded-lg border-2 font-semibold text-sm',
-            engineStatus === 'active' && 'bg-emerald-500/15 border-emerald-400 text-emerald-700',
-            engineStatus === 'pause' && 'bg-amber-500/15 border-amber-400 text-amber-700',
-            engineStatus === 'stopped' && 'bg-red-500/15 border-red-400 text-red-700',
-          )}>
-            <div className={clsx(
-              'w-2.5 h-2.5 rounded-full',
-              engineStatus === 'active' && 'bg-emerald-500 animate-pulse',
-              engineStatus === 'pause' && 'bg-amber-500',
-              engineStatus === 'stopped' && 'bg-red-500',
-            )} />
-            <div>
-              <div className="text-xs uppercase tracking-widest font-semibold opacity-70">Engine</div>
-              <div className="font-bold">{getEngineStatusColor().statusText}</div>
+          <div className="flex flex-col gap-3">
+            {/* Engine Status */}
+            <div className={clsx('flex items-center gap-3 px-4 py-2 rounded-lg border', statusColor.bg)}>
+              <div className={clsx('w-3 h-3 rounded-full animate-pulse', statusColor.dot)} />
+              <span className={clsx('font-semibold text-sm', statusColor.text)}>
+                Engine: {metrics.engine_status}
+              </span>
             </div>
           </div>
         </div>
@@ -147,17 +130,17 @@ const Dashboard: React.FC = () => {
             color="yellow"
           />
           <MetricCard
-            label="Engine Status"
-            value={getEngineStatusColor().statusText}
-            sublabel={engineStatus === 'active' ? 'Ready for Trading' : engineStatus === 'pause' ? 'Waiting for Market' : 'Check Connection'}
+            label="Strategy"
+            value="Active"
+            sublabel="Ready for Trade"
             icon={<Zap size={16} />}
-            color={getEngineStatusColor().color as 'emerald' | 'amber' | 'red' | 'cyan'}
+            color="green"
           />
         </div>
 
         {/* Sync Status Footer */}
         <div className="text-sm text-text-secondary">
-          Live account syncing every 1s · Engine status: {engineStatus.toUpperCase()} · Last updated: {lastSyncTime} IST
+          Live account syncing every 1s · Last updated: {lastSyncTime} IST
         </div>
       </div>
     </div>

@@ -88,6 +88,7 @@ export function buildMetricsFromOpenAlgo(
     available_margin: availableMargin,
     active_trades: positions.filter(p => p.quantity !== 0).length,
     engine_status: 'running' as const,
+    last_update: new Date().toISOString(),
   }
 }
 
@@ -103,6 +104,7 @@ export function buildMetricsFromFyersWallet(
     available_margin: wallet.available_balance || 0,
     active_trades: positions.filter(p => p.quantity !== 0).length,
     engine_status: 'running' as const,
+    last_update: new Date().toISOString(),
   }
 }
 

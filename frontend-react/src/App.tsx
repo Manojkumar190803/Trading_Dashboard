@@ -1,6 +1,8 @@
 import './styles/globals.css'
 import { BrowserRouter as Router, Routes, Route } from 'react-router-dom'
 import { useState, useEffect } from 'react'
+import { useAppStore } from '@/stores'
+import { ToastProvider } from '@/components/Toast'
 import Layout from '@/components/Layout'
 import Dashboard from '@/pages/Dashboard'
 import Positions from '@/pages/Positions'
@@ -11,11 +13,15 @@ import Instruments from '@/pages/Instruments'
 
 function App() {
   const [isReady, setIsReady] = useState(false)
+  const { setTheme } = useAppStore()
 
   useEffect(() => {
-    // Initialize app
+    // Initialize theme from localStorage
+    const savedTheme = localStorage.getItem('theme') as 'dark' | 'light' | null
+    const preferredTheme = savedTheme || 'dark'
+    setTheme(preferredTheme)
     setIsReady(true)
-  }, [])
+  }, [setTheme])
 
   if (!isReady) {
     return (
@@ -29,19 +35,21 @@ function App() {
   }
 
   return (
-    <Router>
-      <Layout>
-        <Routes>
-          <Route path="/" element={<Dashboard />} />
-          <Route path="/dashboard" element={<Dashboard />} />
-          <Route path="/positions" element={<Positions />} />
-          <Route path="/orderbook" element={<Orderbook />} />
-          <Route path="/analytics" element={<Analytics />} />
-          <Route path="/instruments" element={<Instruments />} />
-          <Route path="/logs" element={<Logs />} />
-        </Routes>
-      </Layout>
-    </Router>
+    <ToastProvider>
+      <Router>
+        <Layout>
+          <Routes>
+            <Route path="/" element={<Dashboard />} />
+            <Route path="/dashboard" element={<Dashboard />} />
+            <Route path="/positions" element={<Positions />} />
+            <Route path="/orderbook" element={<Orderbook />} />
+            <Route path="/analytics" element={<Analytics />} />
+            <Route path="/instruments" element={<Instruments />} />
+            <Route path="/logs" element={<Logs />} />
+          </Routes>
+        </Layout>
+      </Router>
+    </ToastProvider>
   )
 }
 

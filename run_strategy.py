@@ -358,6 +358,80 @@ def _run_multi_live(
         runner.stop()
 
 
+def _run_multi_script_live(
+    scripts: list[str],
+    strategy_name: str,
+    args: argparse.Namespace,
+    dry_run: bool,
+    diagnose: bool,
+    verbose: bool,
+) -> None:
+    """Run a single strategy across multiple script/instruments concurrently."""
+    _setup_logging(args.log_level)
+    _load_dotenv_if_present()
+    
+    # Create a broker (shared across all scripts)
+    base_cfg = StrategyConfig()
+    broker = _build_broker(base_cfg, dry_run=dry_run)
+    
+    # Create engines for each script
+    engines: list[tuple[str, BaseStrategyEngine]] = []
+    for script in scripts:
+        # Create fresh config for each script, discovering its profile
+        cfg = StrategyConfig()
+        profile = _apply_discovered_script_profile(cfg, script)
+        
+        # Apply strategy-specific config
+        if strategy_name == "ema21":
+            _apply_ema21_policy(cfg, script)
+            _apply_ema21_expiry_policy(cfg, script)
+        
+        # Apply manual overrides
+        if args.symbol:
+            cfg.spot_symbol = args.symbol
+            cfg.option_index_symbol = args.symbol
+        if args.exchange:
+            cfg.exchange_spot = args.exchange
+        if args.timeframe:
+            cfg.timeframe_minutes = args.timeframe
+        if args.max_risk is not None:
+            cfg.max_option_risk_points = args.max_risk
+        if args.max_sl is not None:
+            risk = RiskConfig()
+            risk.max_sl_per_day = args.max_sl
+        
+        # Create signal provider
+        signal_provider = get_signal_provider(strategy_name, args)
+        
+        # Create engine for this script
+        risk = RiskConfig()
+        if strategy_name == "ema21":
+            risk.max_sl_per_day = _env_int("EMA21_MAX_SL_PER_DAY", 3)
+        if args.max_sl is not None:
+            risk.max_sl_per_day = args.max_sl
+        
+        engine = BaseStrategyEngine(cfg, risk, broker, signal_provider)
+        engine.persist_alerts = True
+        engine.diagnose = diagnose
+        engine.verbose = verbose
+        
+        # Use script as the engine identifier
+        engines.append((script, engine))
+        logger.info("Created engine for script=%s strategy=%s", script, strategy_name)
+    
+    print("[ORDER ROUTING] " + ("PAPER mode: orders are simulated" if dry_run else "LIVE mode: orders will be sent to OpenAlgo"))
+    
+    # Run all engines together
+    base_cfg = StrategyConfig()
+    runner = MultiEngineLiveFeedRunner(engines, broker, base_cfg)
+    try:
+        logger.info("Starting multi-script live runner for scripts=%s strategy=%s", scripts, strategy_name)
+        runner.run_forever()
+    except KeyboardInterrupt:
+        logger.info("interrupted; stopping runner")
+        runner.stop()
+
+
 def _run_mixed_live(
     cfg: StrategyConfig,
     risk: RiskConfig,
@@ -535,6 +609,19 @@ def main(argv: Optional[list[str]] = None) -> None:
     if not scripts:
         raise SystemExit("--script requires at least one script name")
 
+    # Support comma-separated strategies: --strategy hd,cd
+    strategy_names = [s.strip() for s in args.strategy.split(",")]
+
+    # If multiple scripts (instruments), run them together with multi-script handler
+    if len(scripts) > 1 and args.mode in ("paper", "live"):
+        if len(strategy_names) > 1:
+            raise SystemExit("Multiple strategies + multiple scripts not yet supported; use one strategy with multiple scripts")
+        strategy_name = strategy_names[0]
+        dry_run = args.mode == "paper"
+        _run_multi_script_live(scripts, strategy_name, args, dry_run=dry_run, diagnose=args.diagnose, verbose=args.verbose)
+        return
+    
+    # Single script: use the original loop (for backtest or single-script live)
     for script in scripts:
         single_args = argparse.Namespace(**vars(args))
         single_args.script = script

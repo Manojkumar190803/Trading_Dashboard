@@ -22,19 +22,31 @@ import {
   MetricCard,
   SectionTitle,
   EmptyState,
-  Table,
-  TableRow,
-  TableCell,
-  Badge,
 } from '@/components/UI'
-import { useAnalyticsTrades, useAnalyticsSummary, useEquityCurve } from '@/hooks'
+import DailyPnLCalendar from '@/components/DailyPnLCalendar'
+import MonthlySummary from '@/components/MonthlySummary'
+import { useAnalyticsTrades, useAnalyticsSummary, useEquityCurve, useAnalyticsSummaryFromAPI, useDailyPnL } from '@/hooks'
 import { formatCurrency, formatPercent, getValueColor, formatNumber } from '@/utils/format'
 import { exportAnalyticsCSV, resetAnalytics } from '@/utils/csv-export'
 import { clsx } from 'clsx'
 
 const Analytics: React.FC = () => {
   const { trades, refetch } = useAnalyticsTrades()
-  const summary = useAnalyticsSummary(trades)
+  const tradesSummary = useAnalyticsSummary(trades)
+  const { summary: apiSummary } = useAnalyticsSummaryFromAPI()
+  const { dailyData, reset: resetDaily } = useDailyPnL()
+  
+  // Use API summary if available, otherwise fall back to trades-based summary
+  const summary = apiSummary.trades_completed > 0 ? {
+    completed_trades: apiSummary.trades_completed,
+    gross_profit: apiSummary.gross_profit,
+    gross_loss: apiSummary.gross_loss,
+    winning_trades: apiSummary.winning_trades,
+    expectancy: apiSummary.expectancy,
+    win_rate: apiSummary.win_rate,
+    profit_factor: apiSummary.profit_factor,
+  } : tradesSummary
+  
   const curve = useEquityCurve(trades)
   const [isResetting, setIsResetting] = useState(false)
   const [equityChartType, setEquityChartType] = useState<'area' | 'bar' | 'line'>('area')
@@ -104,8 +116,8 @@ const Analytics: React.FC = () => {
     },
   ]
 
-  // Daily performance data
-  const dailyData = useMemo(() => {
+  // Performance data for daily charts (calculated from trades)
+  const performanceData = useMemo(() => {
     if (trades.length === 0) {
       return []
     }
@@ -257,8 +269,8 @@ const Analytics: React.FC = () => {
 
           <Card>
             <div className="w-full h-48">
-              <ResponsiveContainer width="100%" height="100%">
-                {equityChartType === 'area' && (
+              {equityChartType === 'area' && (
+                <ResponsiveContainer width="100%" height="100%">
                   <AreaChart data={equityCurveData}>
                     <defs>
                       <linearGradient id="colorPnl" x1="0" y1="0" x2="0" y2="1">
@@ -289,8 +301,10 @@ const Analytics: React.FC = () => {
                       fill="url(#colorPnl)"
                     />
                   </AreaChart>
-                )}
-                {equityChartType === 'bar' && (
+                </ResponsiveContainer>
+              )}
+              {equityChartType === 'bar' && (
+                <ResponsiveContainer width="100%" height="100%">
                   <BarChart data={equityCurveData}>
                     <CartesianGrid
                       strokeDasharray="3 3"
@@ -309,8 +323,10 @@ const Analytics: React.FC = () => {
                     <Tooltip content={<CustomTooltip />} />
                     <Bar dataKey="total_pnl" fill="#59d0ff" />
                   </BarChart>
-                )}
-                {equityChartType === 'line' && (
+                </ResponsiveContainer>
+              )}
+              {equityChartType === 'line' && (
+                <ResponsiveContainer width="100%" height="100%">
                   <LineChart data={equityCurveData}>
                     <CartesianGrid
                       strokeDasharray="3 3"
@@ -335,8 +351,8 @@ const Analytics: React.FC = () => {
                       dot={false}
                     />
                   </LineChart>
-                )}
-              </ResponsiveContainer>
+                </ResponsiveContainer>
+              )}
             </div>
           </Card>
         </div>
@@ -392,7 +408,7 @@ const Analytics: React.FC = () => {
       </div>
 
       {/* Daily Performance */}
-      {dailyData.length > 0 && (
+      {performanceData.length > 0 && (
         <div className="w-full">
           <div className="mb-3 flex items-center justify-between">
             <div>
@@ -428,9 +444,9 @@ const Analytics: React.FC = () => {
 
           <Card>
             <div className="w-full h-48">
-              <ResponsiveContainer width="100%" height="100%">
-                {performanceChartType === 'bar' && (
-                  <BarChart data={dailyData}>
+              {performanceChartType === 'bar' && (
+                <ResponsiveContainer width="100%" height="100%">
+                  <BarChart data={performanceData}>
                     <CartesianGrid
                       strokeDasharray="3 3"
                       stroke="rgba(255,255,255,0.1)"
@@ -447,9 +463,11 @@ const Analytics: React.FC = () => {
                     <Bar dataKey="gain" stackId="a" fill="#27d48a" name="Gains" />
                     <Bar dataKey="loss" stackId="a" fill="#ff5f6d" name="Losses" />
                   </BarChart>
-                )}
-                {performanceChartType === 'line' && (
-                  <LineChart data={dailyData}>
+                </ResponsiveContainer>
+              )}
+              {performanceChartType === 'line' && (
+                <ResponsiveContainer width="100%" height="100%">
+                  <LineChart data={performanceData}>
                     <CartesianGrid
                       strokeDasharray="3 3"
                       stroke="rgba(255,255,255,0.1)"
@@ -466,8 +484,8 @@ const Analytics: React.FC = () => {
                     <Line type="monotone" dataKey="gain" stroke="#27d48a" strokeWidth={2} name="Gains" />
                     <Line type="monotone" dataKey="loss" stroke="#ff5f6d" strokeWidth={2} name="Losses" />
                   </LineChart>
-                )}
-              </ResponsiveContainer>
+                </ResponsiveContainer>
+              )}
             </div>
           </Card>
         </div>
@@ -532,6 +550,35 @@ const Analytics: React.FC = () => {
             </div>
           </div>
         </Card>
+      </div>
+
+      {/* Daily P&L Calendar & Monthly Summary */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+        <DailyPnLCalendar
+          dailyData={dailyData}
+          onExport={() => {
+            // Export daily P&L data
+            if (dailyData) {
+              const csvContent = [
+                'Day,P&L,Trades',
+                ...Object.entries(dailyData.days).map(
+                  ([day, data]) => `${day},${data.pnl},${data.trades}`
+                ),
+              ].join('\n')
+
+              const blob = new Blob([csvContent], { type: 'text/csv' })
+              const url = window.URL.createObjectURL(blob)
+              const a = document.createElement('a')
+              a.href = url
+              a.download = `daily_pnl_${dailyData.month.replace(' ', '_')}.csv`
+              a.click()
+              window.URL.revokeObjectURL(url)
+            }
+          }}
+          onReset={resetDaily}
+        />
+
+        <MonthlySummary monthSummary={dailyData?.month_summary || null} />
       </div>
     </div>
   )

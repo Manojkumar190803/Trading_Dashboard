@@ -45,20 +45,12 @@ export interface AnalyticsSummary {
   profit_factor: number
 }
 
-export interface AccountData {
-  timestamp: string
-  mode?: 'live' | 'analyzer'
-  engine_status?: string
-  positions: any[]
-  orders: any[]
-  account: Record<string, any>
-}
-
 export interface DashboardMetrics {
   net_mtm: number
   available_margin: number
   active_trades: number
-  engine_status: string
+  engine_status: 'running' | 'paused' | 'stopped'
+  last_update: string
   openalgo_mode?: 'live' | 'analyzer'
 }
 
@@ -95,18 +87,23 @@ export interface Instrument {
   monitoringStartTime: string
   monitoringEndTime: string
   lotSizeAdjustment: number
-  strikeStep: number
   strategy: '21EMA' | 'HD' | 'CD' | 'TC' | '2BC' | 'BO'
   productType: 'INTRADAY' // Fixed, not editable
   status: boolean
   createdAt: string
   updatedAt: string
   lotSize?: number // Calculated from instrument name
-  atmPrice?: number // Locked ATM price for 21EMA strategy
-  minPremium?: number // Minimum premium range for HD, CD, TC, 2BC, BO
-  maxPremium?: number // Maximum premium range for HD, CD, TC, 2BC, BO
-  // Trailing Stoploss Mechanism (applied to all strategies)
-  breakeven_rr?: number // Move stop to entry at 1R milestone (default: 1.0)
-  trail_step_rr?: number // Advance stop by this amount at each 0.5R milestone (default: 0.5)
-  max_initial_risk_points?: number // Max allowed initial risk in premium points (default: 20.0)
+  trailingStepRR?: number // Risk Ratio step for trailing (0.25, 0.5, 1.0, etc)
+  premiumMinPrice?: number // Minimum premium price (non-21EMA strategies)
+  premiumMaxPrice?: number // Maximum premium price (non-21EMA strategies)
+  premiumOptionStrike?: number // ATM strike price for options
+  maxInitialRiskPoints?: number // Maximum allowed initial risk in points (default 20, override to 23, 25, etc)
+}
+
+export interface TrailingStopsConfig {
+  breakEvenRR: number // Breakeven milestone in Risk Ratio (default 1.25)
+  trailStepRR: number // Trailing step size in Risk Ratio (default 0.5)
+  maxInitialRiskPoints: number // Maximum initial risk in points (default 20)
+  createdAt: string
+  updatedAt: string
 }

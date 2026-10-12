@@ -156,9 +156,93 @@ openalgo_buying_setups/
 
 ---
 
+## Database (Phase 9: ✅ Complete)
+
+The system now includes PostgreSQL database integration for persistent data storage:
+
+### Quick Setup
+```bash
+# 1. Ensure PostgreSQL is running on localhost:5432
+# 2. Verify credentials in .env (user: astro, password: astro)
+# 3. Docker handles database connection automatically via host.docker.internal
+
+# 4. Check database schema
+docker exec strategy_worker python core/db_migrations.py --info
+
+# 5. Test API endpoints
+curl http://localhost:5003/api/health
+curl http://localhost:5003/api/db/trades
+curl http://localhost:5003/api/db/positions
+```
+
+### Architecture
+- **Database**: PostgreSQL 15+ on `localhost:5432`
+- **ORM**: SQLAlchemy 2.0 with SQLAlchemy ORM models
+- **Driver**: psycopg[binary] 3.1.0+ for Python 3.11 compatibility
+- **Tables**: 7 tables (trades, positions, orders, strategy_configs, daily_pnl, logs, account_summary)
+- **API**: Flask REST endpoints on port 5003
+
+### Available Database Tables
+| Table | Purpose | Rows |
+|-------|---------|------|
+| `trades` | Individual trade entry/exit records | 0 |
+| `positions` | Active positions and P&L | 0 |
+| `orders` | Broker order details and status | 0 |
+| `strategy_configs` | Strategy parameter sets | 0 |
+| `daily_pnl` | Daily P&L summary by strategy | 0 |
+| `logs` | Event logs, alerts, signals | 0 |
+| `account_summary` | Account balance snapshots | 0 |
+
+### API Endpoints (Port 5003)
+```
+✅ GET  /api/health                    → Health check
+✅ GET  /api/db/trades                 → Recent trades (filters: days, strategy, symbol)
+✅ GET  /api/db/positions              → Active positions
+✅ GET  /api/db/daily-pnl              → Daily summary (filters: strategy)
+✅ GET  /api/db/logs                   → Event logs (filters: hours, level, strategy, symbol)
+❌ GET  /api/db/orders                 → (Not implemented yet)
+❌ GET  /api/db/strategy_configs       → (Not implemented yet)
+❌ GET  /api/db/account_summary        → (Not implemented yet)
+```
+
+### Recording Trade Data
+```python
+from core.db_utils import record_trade
+from datetime import datetime
+
+record_trade(
+    strategy_name="EMA21",
+    symbol="NIFTY",
+    entry_time=datetime.now(),
+    entry_price=23500.50,
+    entry_qty=1,
+    entry_side="BUY",
+    exit_time=datetime.now(),
+    exit_price=23550.00,
+    exit_qty=1,
+    pnl=49.50,
+    pnl_percentage=0.21,
+    status="EXIT"
+)
+```
+
+### For Detailed Documentation
+📖 **See [DATABASE.md](DATABASE.md)** for:
+- Complete schema definitions with all columns and constraints
+- Connection configuration and networking setup
+- API reference with example responses
+- Troubleshooting guide
+- Data persistence and backup procedures
+
+---
+
 ## Environment Variables
 
 ```env
+# Database (PostgreSQL)
+DB_URL=postgresql://astro:astro@host.docker.internal:5432/TRADING_SETUPS
+
+# OpenAlgo
 OPENALGO_API_KEY=your_api_key
 OPENALGO_HOST=http://127.0.0.1:5002
 OPENALGO_WS_URL=ws://127.0.0.1:8765

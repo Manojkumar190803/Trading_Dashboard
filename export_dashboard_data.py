@@ -57,9 +57,37 @@ def main(mode: str = "analyzer", interval: int = 5):
             if mode.lower() in ["analyzer", "both"]:
                 dashboard_provider.write_dashboard_json()
             
-            # Export Fyers data (for live mode)
+            # Export Fyers data (for live mode) or use OpenAlgo data as fallback
             if mode.lower() in ["live", "both"]:
-                wallet_provider.write_wallet_json()
+                # Try Fyers first, if available credentials
+                fyers_api_key = os.getenv("FYERS_API_KEY")
+                fyers_token = os.getenv("FYERS_ACCESS_TOKEN")
+                has_fyers_creds = fyers_api_key and fyers_token and "YOUR_" not in str(fyers_api_key)
+                
+                if has_fyers_creds:
+                    # Use Fyers wallet provider
+                    wallet_provider.write_wallet_json()
+                else:
+                    # Fall back to OpenAlgo account data
+                    try:
+                        account_data = dashboard_provider.get_account_summary()
+                        if account_data and "account" in account_data:
+                            account = account_data["account"]
+                            wallet_data = {
+                                "available_balance": float(account.get("availableMargin", account.get("availablecash", 0))),
+                                "utilisedMargin": float(account.get("used_margin", account.get("utiliseddebits", 0))),
+                                "availableMargin": float(account.get("availableMargin", account.get("availablecash", 0))),
+                                "pnl": float(account.get("pnl", account.get("m2munrealized", 0))),
+                                "timestamp": datetime.now().isoformat(),
+                            }
+                            # Write to wallet_data.json
+                            output_path = Path(__file__).parent / "logs" / "wallet_data.json"
+                            output_path.parent.mkdir(parents=True, exist_ok=True)
+                            with open(output_path, "w") as f:
+                                json.dump(wallet_data, f, indent=2)
+                            logger.debug(f"Wallet data from OpenAlgo written to {output_path}")
+                    except Exception as e:
+                        logger.warning(f"Could not fetch wallet data: {e}")
             
             time.sleep(interval)
     except KeyboardInterrupt:

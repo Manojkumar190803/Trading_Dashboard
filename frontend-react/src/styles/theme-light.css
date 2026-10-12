@@ -1,0 +1,626 @@
+/* ═══════════════════════════════════════════════════════════════════════════════
+   LIGHT MODE - PROFESSIONAL & MODERN TRADING DASHBOARD
+   ═══════════════════════════════════════════════════════════════════════════════
+   
+   Color Palette (Light Mode):
+   ─────────────────────────────────────────────────────────────────────────────
+   Primary:        #FFFFFF (White)
+   Secondary:      #F8FAFC (Very Light Blue-Gray)
+   Tertiary:       #F1F5F9 (Light Blue-Gray)
+   Accent:         #EFF6FF (Extra Light Blue)
+   
+   Text Colors:
+   Primary Text:   #0F172A (Very Dark Blue-Gray)
+   Secondary Text: #475569 (Medium Gray)
+   Tertiary Text:  #94A3B8 (Light Gray)
+   
+   Accent Colors (Vibrant & Professional):
+   Blue (Primary):   #3B82F6 (Vibrant Blue)
+   Green (Success):  #10B981 (Emerald Green)
+   Red (Error):      #EF4444 (Vibrant Red)
+   Yellow (Warning): #F59E0B (Amber)
+   Cyan (Info):      #06B6D4 (Cyan)
+   Purple (Alt):     #8B5CF6 (Purple)
+   
+   Borders & Shadows:
+   Border:         #D1D5DB (Light Gray)
+   Border Soft:    #E2E8F0 (Very Light Gray)
+   Shadow:         rgba(15, 23, 42, 0.08)
+   ═══════════════════════════════════════════════════════════════════════════════ */
+
+html.light {
+  color-scheme: light;
+  
+  /* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
+  /* 1. BACKGROUND COLORS - Clean White Foundation */
+  /* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
+  
+  --bg-primary: #FFFFFF;
+  --bg-secondary: #F8FAFC;
+  --bg-tertiary: #F1F5F9;
+  --bg-surface: #EFF6FF;
+  --bg-hover: #F0F4F8;
+  
+  /* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
+  /* 2. TEXT COLORS - Professional Gray Scale (Enhanced for Readability) */
+  /* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
+  
+  --text-primary: #0F172A;
+  --text-secondary: #334155;
+  --text-tertiary: #64748B;
+  --text-muted: #94A3B8;
+  
+  /* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
+  /* 3. ACCENT COLORS - Vibrant & Professional */
+  /* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
+  
+  --accent-blue: #3B82F6;
+  --accent-blue-light: #DBEAFE;
+  --accent-blue-dark: #1E40AF;
+  
+  --accent-green: #10B981;
+  --accent-green-light: #D1FAE5;
+  --accent-green-dark: #047857;
+  
+  --accent-red: #EF4444;
+  --accent-red-light: #FEE2E2;
+  --accent-red-dark: #991B1B;
+  
+  --accent-yellow: #F59E0B;
+  --accent-yellow-light: #FEF3C7;
+  --accent-yellow-dark: #B45309;
+  
+  --accent-cyan: #06B6D4;
+  --accent-cyan-light: #CFFAFE;
+  --accent-cyan-dark: #0E7490;
+  
+  --accent-purple: #8B5CF6;
+  --accent-purple-light: #EDE9FE;
+  --accent-purple-dark: #5B21B6;
+  
+  /* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
+  /* 4. BORDER & SHADOW COLORS */
+  /* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
+  
+  --border-color: #E2E8F0;
+  --border-light: #F1F5F9;
+  --shadow-sm: 0 1px 2px 0 rgba(15, 23, 42, 0.05);
+  --shadow-md: 0 4px 6px -1px rgba(15, 23, 42, 0.08);
+  --shadow-lg: 0 10px 15px -3px rgba(15, 23, 42, 0.1);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════════
+   LIGHT MODE - ELEMENT OVERRIDES
+   ═══════════════════════════════════════════════════════════════════════════════ */
+
+/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
+/* Body & Text Elements */
+/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
+
+html.light body {
+  @apply !bg-white !text-slate-900;
+  color: #0F172A;
+  background-color: #FFFFFF;
+}
+
+html.light h1,
+html.light h2,
+html.light h3,
+html.light h4,
+html.light h5,
+html.light h6 {
+  @apply !text-slate-900;
+  color: #0F172A;
+  font-weight: 600;
+}
+
+html.light p,
+html.light span,
+html.light a {
+  color: #334155;
+}
+
+html.light a {
+  color: #3B82F6;
+  transition: color 0.2s;
+}
+
+html.light a:hover {
+  color: #1E40AF;
+}
+
+/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
+/* Background Color Variables */
+/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
+
+html.light [class*="bg-bg-primary"],
+html.light .bg-bg-primary {
+  @apply !bg-white !important;
+  background-color: #FFFFFF !important;
+}
+
+html.light [class*="bg-bg-secondary"],
+html.light .bg-bg-secondary {
+  @apply !bg-slate-50 !important;
+  background-color: #F8FAFC !important;
+}
+
+html.light [class*="bg-bg-tertiary"],
+html.light .bg-bg-tertiary {
+  @apply !bg-slate-100 !important;
+  background-color: #F1F5F9 !important;
+}
+
+html.light [class*="bg-bg-surface"],
+html.light .bg-bg-surface {
+  @apply !bg-blue-50 !important;
+  background-color: #EFF6FF !important;
+}
+
+/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
+/* Text Color Variables */
+/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
+
+html.light [class*="text-text-primary"],
+html.light .text-text-primary {
+  @apply !text-slate-900 !important;
+  color: #0F172A !important;
+}
+
+html.light [class*="text-text-secondary"],
+html.light .text-text-secondary {
+  @apply !text-slate-600 !important;
+  color: #334155 !important;
+}
+
+html.light [class*="text-text-tertiary"],
+html.light .text-text-tertiary {
+  @apply !text-slate-500 !important;
+  color: #64748B !important;
+}
+
+/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
+/* Accent Colors - Primary & Variants */
+/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
+
+html.light [class*="accent-blue"],
+html.light .text-blue-600,
+html.light .border-blue-600 {
+  color: #3B82F6 !important;
+  border-color: #3B82F6 !important;
+}
+
+html.light [class*="bg-accent-blue"],
+html.light .bg-blue-50 {
+  @apply !bg-blue-50 !important;
+  background-color: #EFF6FF !important;
+}
+
+html.light [class*="accent-green"],
+html.light .text-green-600 {
+  color: #10B981 !important;
+}
+
+html.light [class*="bg-accent-green"],
+html.light .bg-green-50 {
+  @apply !bg-green-50 !important;
+  background-color: #F0FDF4 !important;
+}
+
+html.light [class*="accent-red"],
+html.light .text-red-600 {
+  color: #EF4444 !important;
+}
+
+html.light [class*="bg-accent-red"],
+html.light .bg-red-50 {
+  @apply !bg-red-50 !important;
+  background-color: #FEF2F2 !important;
+}
+
+html.light [class*="accent-yellow"],
+html.light .text-yellow-600 {
+  color: #F59E0B !important;
+}
+
+html.light [class*="bg-accent-yellow"],
+html.light .bg-yellow-50 {
+  @apply !bg-yellow-50 !important;
+  background-color: #FFFBEB !important;
+}
+
+html.light [class*="accent-cyan"],
+html.light .text-cyan-600 {
+  color: #06B6D4 !important;
+}
+
+html.light [class*="bg-accent-cyan"],
+html.light .bg-cyan-50 {
+  @apply !bg-cyan-50 !important;
+  background-color: #F0F9FF !important;
+}
+
+html.light [class*="accent-purple"],
+html.light .text-purple-600 {
+  color: #8B5CF6 !important;
+}
+
+html.light [class*="bg-accent-purple"],
+html.light .bg-purple-50 {
+  @apply !bg-purple-50 !important;
+  background-color: #F5F3FF !important;
+}
+
+/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
+/* Borders & Dividers */
+/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
+
+html.light [class*="border"],
+html.light hr {
+  @apply !border-slate-200 !important;
+  border-color: #E2E8F0 !important;
+}
+
+html.light .divide-slate-200 > * + * {
+  @apply !border-slate-200 !important;
+  border-color: #E2E8F0 !important;
+}
+
+/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
+/* Cards & Containers */
+/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
+
+html.light [class*="card"],
+html.light [class*="card"],
+html.light [class*="Card"] {
+  background-color: #FFFFFF !important;
+  border-color: #E2E8F0 !important;
+  box-shadow: 0 1px 3px 0 rgba(15, 23, 42, 0.1);
+  transition: box-shadow 0.2s;
+}
+
+html.light [class*="card"]:hover,
+html.light [class*="Card"]:hover {
+  box-shadow: 0 4px 6px -1px rgba(15, 23, 42, 0.15);
+}
+
+/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
+/* Buttons */
+/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
+
+html.light button {
+  @apply transition-all duration-200;
+}
+
+/* Primary Button */
+html.light button.btn-primary,
+html.light [class*="btn-primary"] {
+  background-color: #3B82F6 !important;
+  border-color: #3B82F6 !important;
+  color: #FFFFFF !important;
+  transition: all 0.2s;
+}
+
+html.light button.btn-primary:hover,
+html.light [class*="btn-primary"]:hover {
+  background-color: #1E40AF !important;
+  border-color: #1E40AF !important;
+}
+
+/* Secondary Button */
+html.light button.btn-secondary,
+html.light [class*="btn-secondary"] {
+  background-color: #F1F5F9 !important;
+  border-color: #E2E8F0 !important;
+  color: #0F172A !important;
+  transition: all 0.2s;
+}
+
+html.light button.btn-secondary:hover,
+html.light [class*="btn-secondary"]:hover {
+  background-color: #E2E8F0 !important;
+  border-color: #CBD5E1 !important;
+}
+
+/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
+/* Form Elements - Inputs & Selects */
+/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
+
+html.light input,
+html.light select,
+html.light textarea {
+  @apply !bg-white !text-slate-900 !border-slate-300 !important;
+  background-color: #FFFFFF !important;
+  color: #0F172A !important;
+  border-color: #E2E8F0 !important;
+}
+
+html.light input:focus,
+html.light select:focus,
+html.light textarea:focus {
+  border-color: #3B82F6 !important;
+  box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.1) !important;
+  outline: none;
+}
+
+html.light input::placeholder {
+  color: #64748B !important;
+}
+
+/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
+/* Tables */
+/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
+
+html.light table {
+  @apply !bg-white !text-slate-900;
+  background-color: #FFFFFF !important;
+  color: #0F172A !important;
+}
+
+html.light table thead {
+  @apply !bg-slate-50 !border-b-2;
+  background-color: #F8FAFC !important;
+  border-bottom-color: #E2E8F0 !important;
+}
+
+html.light table th {
+  @apply !text-slate-900 !font-semibold;
+  color: #0F172A !important;
+  background-color: #F8FAFC !important;
+}
+
+html.light table td {
+  @apply !border-slate-200;
+  border-color: #E2E8F0 !important;
+  color: #334155 !important;
+}
+
+html.light table tbody tr:hover {
+  background-color: #EFF6FF !important;
+}
+
+/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
+/* Badges & Tags */
+/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
+
+html.light [class*="badge"],
+html.light [class*="Badge"] {
+  @apply !border-0 !font-medium !text-xs;
+}
+
+/* Success Badge */
+html.light [class*="badge-success"],
+html.light .badge.success {
+  @apply !bg-green-100 !text-green-800 !important;
+  background-color: #DCFCE7 !important;
+  color: #166534 !important;
+}
+
+/* Error Badge */
+html.light [class*="badge-error"],
+html.light .badge.error {
+  @apply !bg-red-100 !text-red-800 !important;
+  background-color: #FEE2E2 !important;
+  color: #991B1B !important;
+}
+
+/* Warning Badge */
+html.light [class*="badge-warning"],
+html.light .badge.warning {
+  @apply !bg-yellow-100 !text-yellow-800 !important;
+  background-color: #FEF3C7 !important;
+  color: #92400E !important;
+}
+
+/* Info Badge */
+html.light [class*="badge-info"],
+html.light .badge.info {
+  @apply !bg-blue-100 !text-blue-800 !important;
+  background-color: #DBEAFE !important;
+  color: #1E40AF !important;
+}
+
+/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
+/* Sidebar & Navigation */
+/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
+
+html.light [class*="sidebar"],
+html.light [class*="Sidebar"] {
+  @apply !bg-white !border-r !border-slate-200 !important;
+  background-color: #FFFFFF !important;
+  border-right-color: #E2E8F0 !important;
+}
+
+html.light [class*="nav-item"],
+html.light [class*="NavItem"] {
+  @apply !text-slate-600 !transition-all;
+  color: #334155 !important;
+}
+
+html.light [class*="nav-item"]:hover,
+html.light [class*="NavItem"]:hover {
+  background-color: #F1F5F9 !important;
+  color: #3B82F6 !important;
+  transition: all 0.2s;
+}
+
+html.light [class*="nav-item"].active,
+html.light [class*="NavItem"].active {
+  @apply !bg-blue-50 !text-blue-600 !border-l-4 !border-l-blue-600 !important;
+  background-color: #EFF6FF !important;
+  color: #3B82F6 !important;
+  border-left-color: #3B82F6 !important;
+}
+
+/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
+/* Dropdowns & Menus */
+/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
+
+html.light [class*="dropdown"],
+html.light [class*="menu"] {
+  @apply !bg-white !border-slate-200 !shadow-lg !important;
+  background-color: #FFFFFF !important;
+  border-color: #E2E8F0 !important;
+  box-shadow: 0 10px 15px -3px rgba(15, 23, 42, 0.2) !important;
+}
+
+html.light [class*="dropdown"] a,
+html.light [class*="menu"] a {
+  color: #0F172A !important;
+  transition: all 0.2s;
+}
+
+html.light [class*="dropdown"] a:hover,
+html.light [class*="menu"] a:hover {
+  background-color: #EFF6FF !important;
+  color: #3B82F6 !important;
+}
+
+/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
+/* Modals & Dialogs */
+/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
+
+html.light [class*="modal"],
+html.light [class*="dialog"] {
+  @apply !bg-white !text-slate-900 !border-slate-200 !shadow-2xl !important;
+  background-color: #FFFFFF !important;
+  color: #0F172A !important;
+  border-color: #E2E8F0 !important;
+}
+
+html.light [class*="modal-backdrop"] {
+  @apply !bg-black/30 !important;
+  background-color: rgba(0, 0, 0, 0.3) !important;
+}
+
+/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
+/* Scrollbars */
+/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
+
+html.light ::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+html.light ::-webkit-scrollbar-track {
+  @apply !bg-slate-100;
+  background-color: #F1F5F9 !important;
+}
+
+html.light ::-webkit-scrollbar-thumb {
+  background-color: #94A3B8 !important;
+  border-radius: 4px;
+}
+
+html.light ::-webkit-scrollbar-thumb:hover {
+  background-color: #64748B !important;
+}
+
+/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
+/* Code Blocks */
+/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
+
+html.light code,
+html.light pre {
+  @apply !bg-slate-100 !text-slate-900 !border-slate-300 !important;
+  background-color: #F1F5F9 !important;
+  color: #0F172A !important;
+  border-color: #E2E8F0 !important;
+}
+
+html.light code {
+  padding: 0.25rem 0.5rem;
+  border-radius: 0.25rem;
+  font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
+  font-size: 0.875rem;
+}
+
+/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
+/* Alerts & Notifications */
+/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
+
+html.light [class*="alert"],
+html.light [class*="Alert"] {
+  border: 1px solid;
+  border-radius: 0.375rem;
+}
+
+html.light [class*="alert-success"],
+html.light .alert.success {
+  background-color: #F0FDF4 !important;
+  border-color: #86EFAC !important;
+  color: #166534 !important;
+}
+
+html.light [class*="alert-error"],
+html.light .alert.error {
+  background-color: #FEF2F2 !important;
+  border-color: #FECACA !important;
+  color: #991B1B !important;
+}
+
+html.light [class*="alert-warning"],
+html.light .alert.warning {
+  background-color: #FFFBEB !important;
+  border-color: #FDE047 !important;
+  color: #92400E !important;
+}
+
+html.light [class*="alert-info"],
+html.light .alert.info {
+  background-color: #EFF6FF !important;
+  border-color: #93C5FD !important;
+  color: #1E40AF !important;
+}
+
+/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
+/* Progress Bars & Loaders */
+/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
+
+html.light [class*="progress"],
+html.light [class*="Progress"] {
+  @apply !bg-slate-200 !important;
+  background-color: #E2E8F0 !important;
+}
+
+html.light [class*="progress-bar"],
+html.light [class*="ProgressBar"] {
+  @apply !bg-blue-600 !important;
+  background-color: #3B82F6 !important;
+}
+
+/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
+/* Links & Anchors */
+/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
+
+html.light a {
+  color: #3B82F6 !important;
+  transition: color 0.2s;
+}
+
+html.light a:hover {
+  color: #1E40AF !important;
+  text-decoration: underline;
+}
+
+html.light a:visited {
+  color: #8B5CF6 !important;
+}
+
+/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
+/* Utility Classes - Light Card Shadow */
+/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
+
+html.light .light-card {
+  @apply !shadow-sm;
+  box-shadow: 0 1px 3px 0 rgba(15, 23, 42, 0.1) !important;
+}
+
+html.light .light-card-hover:hover {
+  box-shadow: 0 4px 6px -1px rgba(15, 23, 42, 0.15) !important;
+  transition: box-shadow 0.2s;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════════
+   END OF LIGHT MODE THEME
+   ═══════════════════════════════════════════════════════════════════════════════ */

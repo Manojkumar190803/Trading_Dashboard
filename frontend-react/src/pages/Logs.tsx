@@ -1,14 +1,16 @@
 import { useState, useEffect } from 'react'
-import { AlertCircle, AlertTriangle, CheckCircle2, Info, Pause, TrendingUp, Clock, Download, RotateCcw } from 'lucide-react'
+import { AlertCircle, AlertTriangle, CheckCircle2, Info, Pause, TrendingUp, Clock, Download, RotateCcw, X } from 'lucide-react'
 import {
   Card,
   SectionTitle,
-  EmptyState,
   Badge,
 } from '@/components/UI'
 import { formatTime } from '@/utils/format'
 import { useAppStore } from '@/stores'
+import { useToast } from '@/components/Toast'
+import { useInstruments } from '@/hooks/useInstruments'
 import { clsx } from 'clsx'
+import { isMarketOpen } from '@/utils/market-hours'
 
 interface LogEntry {
   id: string
@@ -18,6 +20,7 @@ interface LogEntry {
   category?: string
   strategy?: string
   details?: string
+  type?: string
 }
 
 interface AlertEntry {
@@ -31,26 +34,290 @@ interface AlertEntry {
 }
 
 const Logs: React.FC = () => {
-  const { instruments, logs: storeLogs, setLogs: setStoreLogs } = useAppStore()
+  const { logs: storeLogs, setLogs: setStoreLogs, setInstruments: setStoreInstruments } = useAppStore()
+  const { instruments: apiInstruments } = useInstruments()
   const [logs, setLogs] = useState<LogEntry[]>([])
   const [alerts, setAlerts] = useState<AlertEntry[]>([])
+  const [previousLogCount, setPreviousLogCount] = useState(0)
+  const [previousAlertCount, setPreviousAlertCount] = useState(0)
+  const [isInitialLoad, setIsInitialLoad] = useState(true)
+  const [lastToastTime, setLastToastTime] = useState<number>(Date.now())
+  const toast = useToast()
+
+  // Sync API instruments to Zustand store for other components to use
+  useEffect(() => {
+    if (apiInstruments.length > 0) {
+      setStoreInstruments(apiInstruments)
+    }
+  }, [apiInstruments, setStoreInstruments])
+
+  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  // TOAST NOTIFICATION SYSTEM FOR TRADING EVENTS
+  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  // Detect and show toast for trading events
+  useEffect(() => {
+    // Skip toast triggers on initial load (when logs first sync from store)
+    if (isInitialLoad) {
+      setPreviousLogCount(logs.length)
+      setIsInitialLoad(false)
+      setLastToastTime(Date.now())
+      return
+    }
+
+    // Only show toasts for new logs
+    if (logs.length <= previousLogCount) return
+
+    // Get new logs since last check
+    const newLogs = logs.slice(previousLogCount)
+    setPreviousLogCount(logs.length)
+
+    // Only trigger toasts for logs that arrived within the last 60 seconds
+    // This prevents replaying old logs when the file is reloaded
+    const sixtySecondsAgo = Date.now() - 60000
+
+    newLogs.forEach((log) => {
+      // Skip logs that are older than 60 seconds (prevents replay of old logs)
+      const logTime = new Date(log.timestamp).getTime()
+      if (logTime < sixtySecondsAgo) return
+
+      const messageUpper = log.message.toUpperCase()
+      const timeStr = new Date(log.timestamp).toLocaleTimeString('en-IN')
+
+      // 🚨 ALERT TRIGGERED
+      if (messageUpper.includes('ALERT') || messageUpper.includes('TRIGGERED')) {
+        const symbolMatch = log.message.match(/([A-Z]+\d+[A-Z]+\d+[CE|PE]{2})/)?.[0]
+        const symbol = symbolMatch || 'Unknown'
+        toast.addToast({
+          type: 'warning',
+          title: '🚨 Alert Triggered',
+          message: `Alert for ${symbol} triggered at ${timeStr}`,
+          duration: 8000,
+        })
+      }
+
+      // 📍 ENTRY TRIGGERED / ENTRY FILLED
+      if (messageUpper.includes('ENTRY') && (messageUpper.includes('FILLED') || messageUpper.includes('TRIGGERED'))) {
+        const symbolMatch = log.message.match(/([A-Z]+\d+[A-Z]+\d+[CE|PE]{2})/)?.[0]
+        const priceMatch = log.message.match(/₹?(\d+\.?\d*)/)?.[1]
+        const qtyMatch = log.message.match(/(\d+)\s*(?:contracts|qty|quantity)/i)?.[1]
+        
+        const symbol = symbolMatch || 'Unknown'
+        const price = priceMatch ? `₹${priceMatch}` : 'Market Price'
+        const qty = qtyMatch || '1'
+        
+        toast.addToast({
+          type: 'success',
+          title: '📍 Entry Filled',
+          message: `Entry for ${symbol} at ${price} (${qty} contracts)`,
+          duration: 6000,
+        })
+      }
+
+      // 🛑 STOP LOSS PLACED / SET
+      if (messageUpper.includes('STOP') || messageUpper.includes('SL')) {
+        if (!messageUpper.includes('TRAILING')) {
+          const symbolMatch = log.message.match(/([A-Z]+\d+[A-Z]+\d+[CE|PE]{2})/)?.[0]
+          const priceMatch = log.message.match(/(?:at|@)\s*₹?(\d+\.?\d*)/)?.[1]
+          
+          const symbol = symbolMatch || 'Unknown'
+          const price = priceMatch ? `₹${priceMatch}` : 'Value'
+          
+          toast.addToast({
+            type: 'info',
+            title: '🛑 Stop Loss Placed',
+            message: `SL placed at ${price} for ${symbol}`,
+            duration: 5000,
+          })
+        }
+      }
+
+      // 📉 TRAILING STOP LOSS
+      if (messageUpper.includes('TRAILING') && messageUpper.includes('SL')) {
+        const oldPriceMatch = log.message.match(/from\s*₹?(\d+\.?\d*)/)?.[1]
+        const newPriceMatch = log.message.match(/to\s*₹?(\d+\.?\d*)/)?.[1]
+        
+        const oldPrice = oldPriceMatch ? `₹${oldPriceMatch}` : 'Previous'
+        const newPrice = newPriceMatch ? `₹${newPriceMatch}` : 'Updated'
+        
+        toast.addToast({
+          type: 'info',
+          title: '📉 Trailing SL Updated',
+          message: `Trailing SL moved from ${oldPrice} to ${newPrice}`,
+          duration: 4000,
+        })
+      }
+
+      // ✅ POSITION CLOSED / TRADE CLOSED
+      if ((messageUpper.includes('CLOSED') || messageUpper.includes('EXIT')) && 
+          (messageUpper.includes('POSITION') || messageUpper.includes('TRADE'))) {
+        const pnlMatch = log.message.match(/(?:P&L|PNL|P\&L)\s*[:-]?\s*₹?(-?\d+\.?\d*)/i)?.[1]
+        const pnlNum = pnlMatch ? parseFloat(pnlMatch) : null
+        
+        const pnlStr = pnlNum !== null 
+          ? (pnlNum >= 0 ? `✅ +₹${pnlNum}` : `❌ -₹${Math.abs(pnlNum)}`)
+          : 'Closed'
+        
+        const toastType = pnlNum !== null && pnlNum >= 0 ? 'success' : 'error'
+        
+        toast.addToast({
+          type: toastType,
+          title: '✅ Position Closed',
+          message: `Trade closed with P&L: ${pnlStr}`,
+          duration: 7000,
+        })
+      }
+
+      // 🔄 BREAKEVEN HIT
+      if (messageUpper.includes('BREAKEVEN')) {
+        const symbolMatch = log.message.match(/([A-Z]+\d+[A-Z]+\d+[CE|PE]{2})/)?.[0]
+        const symbol = symbolMatch || 'Unknown'
+        
+        toast.addToast({
+          type: 'success',
+          title: '🔄 Breakeven Hit',
+          message: `Position ${symbol} reached breakeven`,
+          duration: 5000,
+        })
+      }
+
+      // ⚠️ ERROR / EXECUTION ISSUES
+      if (log.level === 'ERROR' || messageUpper.includes('FAILED') || messageUpper.includes('ERROR')) {
+        toast.addToast({
+          type: 'error',
+          title: '⚠️ Execution Error',
+          message: log.message,
+          duration: 8000,
+        })
+      }
+    })
+  }, [logs, previousLogCount, isInitialLoad, toast])
+
+  // Detect and show toast for alert events
+  useEffect(() => {
+    // Skip toast triggers on initial load
+    if (isInitialLoad) {
+      setPreviousAlertCount(alerts.length)
+      return
+    }
+
+    // Only show toasts for new alerts
+    if (alerts.length <= previousAlertCount) return
+
+    // Get new alerts since last check
+    const newAlerts = alerts.slice(previousAlertCount)
+    setPreviousAlertCount(alerts.length)
+
+    // Only trigger toasts for alerts that arrived within the last 60 seconds
+    // This prevents replaying old alerts when the file is reloaded
+    const sixtySecondsAgo = Date.now() - 60000
+
+    newAlerts.forEach((alert) => {
+      // Skip alerts older than 60 seconds (prevents replay of old alerts)
+      const alertTime = new Date(alert.timestamp).getTime()
+      if (alertTime < sixtySecondsAgo) return
+      const timeStr = new Date(alert.timestamp).toLocaleTimeString('en-IN')
+      
+      // Map alert types to appropriate toast types
+      const getAlertTypeInfo = (type: string): { title: string; toastType: 'warning' | 'success' | 'info' | 'error' } => {
+        const typeUpper = type.toUpperCase()
+        
+        if (typeUpper.includes('ENTRY')) {
+          return { title: '📍 Entry Alert', toastType: 'success' }
+        } else if (typeUpper.includes('EXIT') || typeUpper.includes('CLOSE')) {
+          return { title: '✅ Exit Alert', toastType: 'info' }
+        } else if (typeUpper.includes('SL')) {
+          return { title: '🛑 SL Alert', toastType: 'warning' }
+        } else if (typeUpper.includes('TP')) {
+          return { title: '🎯 Target Alert', toastType: 'success' }
+        } else {
+          return { title: '🚨 Trade Alert', toastType: 'warning' }
+        }
+      }
+
+      const { title, toastType } = getAlertTypeInfo(alert.alert_type)
+
+      toast.addToast({
+        type: toastType,
+        title,
+        message: `${alert.symbol}: ${alert.message} at ${timeStr}`,
+        duration: 6000,
+      })
+    })
+  }, [alerts, previousAlertCount, isInitialLoad, toast])
 
   // Load logs from real signal log file - reads actual EMA21 strategy signals
+  // Only load when instruments are configured
   useEffect(() => {
+    // If no instruments configured, clear logs in local state
+    if (apiInstruments.length === 0) {
+      setStoreLogs([])
+      setLogs([])
+      setAlerts([])
+      return
+    }
+
     const loadLogsFromData = async () => {
       try {
-        // Fetch real signal logs from EMA21 strategy
-        const response = await fetch(`/logs/ema21_3min_logs.json?t=${Date.now()}`)
-        if (response.ok) {
-          const data = await response.json()
-          if (data.logs && Array.isArray(data.logs)) {
-            // Set logs in Zustand store
-            setStoreLogs(data.logs)
+        // Get today's date for monitoring file
+        const today = new Date()
+        const dateStr = today.toISOString().split('T')[0].replace(/-/g, '')
+        const monitoringFile = `http://localhost:4000/logs/monitoring_${dateStr}.csv?t=${Date.now()}`
+        
+        console.log('🔍 Fetching monitoring file:', monitoringFile)
+        
+        // Fetch monitoring data which contains real 3min candles
+        const response = await fetch(monitoringFile)
+        console.log('📡 Response status:', response.status, response.ok)
+        
+        if (!response.ok) {
+          console.log('❌ File not found or error:', response.status)
+          setStoreLogs([])
+          return
+        }
+
+        const text = await response.text()
+        console.log('📄 File size:', text.length, 'bytes')
+        
+        // Parse CSV format
+        const lines = text.split('\n').filter((line) => line.trim().length > 0)
+        const headers = lines[0].split(',')
+        
+        console.log('📋 CSV headers:', headers)
+        console.log('📋 Total lines (including header):', lines.length)
+        
+        // Parse monitoring file for DATA entries (3m candles)
+        const logs: LogEntry[] = []
+        for (let i = 1; i < lines.length; i++) {
+          const line = lines[i]
+          if (line.includes('DATA') && line.includes('3m candle')) {
+            // Parse CSV line - be careful with commas in message field
+            const parts = line.split(',')
+            if (parts.length >= 7) {
+              const timestamp = parts[0]
+              const category = parts[1]
+              const symbol = parts[3]
+              const message = parts.slice(7).join(',') // Message might have commas
+              
+              // Extract the side (CE or PE) from the symbol
+              const side = symbol.includes('CE') ? 'CE' : 'PE'
+              logs.push({
+                id: `log-${i}`,
+                timestamp: new Date(timestamp).toISOString(),
+                level: 'INFO',
+                message: `${symbol} ${message}`,
+                strategy: 'EMA21',
+                type: 'CANDLE'
+              })
+            }
           }
         }
+        
+        console.log('✅ Parsed logs:', logs.length)
+        setStoreLogs(logs)
       } catch (error) {
-        // File might not exist yet - that's OK
-        console.debug('No signal logs available yet:', error)
+        console.error('❌ Error loading logs:', error)
+        setStoreLogs([])
       }
     }
     
@@ -59,28 +326,99 @@ const Logs: React.FC = () => {
     const interval = setInterval(loadLogsFromData, 2000)
     
     return () => clearInterval(interval)
-  }, [setStoreLogs])
+  }, [setStoreLogs, apiInstruments])
 
   // Sync logs from store
   useEffect(() => {
     setLogs(storeLogs as any)
   }, [storeLogs])
 
-  // Load triggered alerts from JSON file
+  // Load triggered alerts from CSV file
+  // Only load when instruments are configured
   useEffect(() => {
+    // If no instruments configured, clear alerts
+    if (apiInstruments.length === 0) {
+      setAlerts([])
+      return
+    }
+
     const loadAlertsFromData = async () => {
       try {
-        // Fetch triggered alerts from EMA21 strategy
-        const response = await fetch(`/logs/ema21_triggered_alerts.json?t=${Date.now()}`)
-        if (response.ok) {
-          const data = await response.json()
-          if (data.alerts && Array.isArray(data.alerts)) {
-            setAlerts(data.alerts)
+        // Get today's date for trade alerts file
+        const today = new Date()
+        const dateStr = today.toISOString().split('T')[0].replace(/-/g, '')
+        
+        // Fetch alerts for all configured instruments (NIFTY, BANKNIFTY, etc.)
+        const allAlerts: AlertEntry[] = []
+        
+        for (const instrument of apiInstruments) {
+          const alertsFile = `http://localhost:4000/logs/trade_alerts_${instrument.brokerSymbol}_${dateStr}.csv?t=${Date.now()}`
+          
+          console.log('🔍 Fetching alerts file:', alertsFile)
+          
+          try {
+            // Fetch triggered alerts from EMA21 strategy CSV
+            const response = await fetch(alertsFile)
+            console.log('📡 Alerts response status:', response.status, response.ok, `for ${instrument.brokerSymbol}`)
+            
+            if (!response.ok) {
+              console.log(`❌ Alerts file not found for ${instrument.brokerSymbol}:`, response.status)
+              continue
+            }
+
+            const text = await response.text()
+            console.log('📄 Alerts file size:', text.length, 'bytes', `for ${instrument.brokerSymbol}`)
+            
+            const lines = text.split('\n').filter(line => line.trim().length > 0)
+            console.log('📋 Total alert lines:', lines.length, `for ${instrument.brokerSymbol}`)
+            
+            // Parse CSV: timestamp,strategy,category,message
+            lines.forEach((line, idx) => {
+              if (idx === 0) return // Skip header
+              
+              // Simple CSV parsing - handle quoted fields
+              const parts = line.split(',')
+              if (parts.length >= 4) {
+                const timestamp = parts[0].trim()
+                const strategyRaw = parts[1].trim()
+                const category = parts[2].trim()
+                const message = parts.slice(3).join(',').trim()
+                
+                // Clean up strategy name - remove "SignalProvider" suffix
+                const strategy = strategyRaw.replace('SignalProvider', '').trim() || 'EMA21'
+                
+                // Extract symbol from message (e.g., "NIFTY13OCT2622600PE")
+                const symbolMatch = message.match(/([A-Z]+\d+[A-Z]+\d+(?:CE|PE))/)
+                const symbol = symbolMatch ? symbolMatch[1] : instrument.brokerSymbol
+                
+                // Determine status based on category
+                const status = category.includes('ENTRY') || category.includes('SIGNAL') ? 'ACTIVE' : 'CLOSED'
+                
+                allAlerts.push({
+                  id: `${timestamp}_${symbol}`,
+                  timestamp: new Date(`${timestamp}+05:30`).toISOString(),
+                  strategy: strategy,
+                  alert_type: category,
+                  message: message,
+                  symbol: symbol,
+                  status: status
+                } as AlertEntry)
+              }
+            })
+          } catch (err) {
+            console.error(`❌ Error loading alerts for ${instrument.brokerSymbol}:`, err)
+            // Continue to next instrument if one fails
+            continue
           }
         }
+        
+        console.log('✅ Parsed all alerts:', allAlerts.length)
+        // Sort alerts by timestamp in descending order (newest first)
+        const sortedAlerts = [...allAlerts].sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime())
+        setAlerts(sortedAlerts)
       } catch (error) {
-        // File might not exist yet - that's OK
-        console.debug('No triggered alerts available yet:', error)
+        console.error('❌ Error loading alerts:', error)
+        setAlerts([])
       }
     }
     
@@ -89,27 +427,13 @@ const Logs: React.FC = () => {
     const interval = setInterval(loadAlertsFromData, 2000)
     
     return () => clearInterval(interval)
-  }, [])
+  }, [apiInstruments])
 
   const [filterLevel, setFilterLevel] = useState<LogEntry['level'] | 'ALL'>('ALL')
   const [filterStrategy, setFilterStrategy] = useState<string>('ALL')
   const [expandedLog, setExpandedLog] = useState<string | null>(null)
 
   // Helper function to check if market is currently open (9:00 AM to 3:30 PM IST)
-  const isMarketOpen = (): boolean => {
-    const now = new Date()
-    const hours = now.getHours()
-    const minutes = now.getMinutes()
-    
-    // Market hours: 9:00 AM (9) to 3:30 PM (15:30)
-    // 9 = 9:00 AM, 15 = 3:00 PM, 16 = 4:00 PM
-    if (hours < 9) return false // Before 9 AM
-    if (hours > 15) return false // After 3:30 PM
-    if (hours === 9) return true // From 9 AM onwards
-    if (hours === 15 && minutes >= 30) return false // After 3:30 PM
-    return true // Between 10 AM to 3:30 PM
-  }
-
   // Get unique strategies
   const strategies = Array.from(
     new Set(logs.map((l) => l.strategy).filter(Boolean))
@@ -129,55 +453,131 @@ const Logs: React.FC = () => {
     return `${hours}:${minutes}:${seconds}`
   }
 
-  // Extract active symbols from logs
+  // Extract candle data from log message: "SYMBOL 3m candle O: X H: Y L: Z C: W V: Q"
+  const parseCandleData = (message: string): { close: string; high: string; low: string; volume: string } | null => {
+    const candleMatch = message.match(/O=([\d.]+)\s+H=([\d.]+)\s+L=([\d.]+)\s+C=([\d.]+)/)
+    if (candleMatch && candleMatch[4]) {
+      return {
+        close: parseFloat(candleMatch[4]).toFixed(2),
+        high: parseFloat(candleMatch[2]).toFixed(2),
+        low: parseFloat(candleMatch[3]).toFixed(2),
+        volume: '', // EMA data not shown in sidebar
+      }
+    }
+    return null
+  }
+
+  // Extract active symbols from logs - grouped by base instrument with latest candle data
   const getActiveSymbols = (): Array<{
-    name: string
-    symbol: string
+    baseSymbol: string
     strike: string
-    premium?: string
-    directions: string[]
     strategy: string
+    hasCE: boolean
+    ceCandleData: { close: string; high: string; low: string; volume: string } | null
+    hasPE: boolean
+    peCandleData: { close: string; high: string; low: string; volume: string } | null
   }> => {
-    const activeSymbols: Record<string, any> = {}
+    const symbolMap = new Map<string, {
+      strike: string
+      strategy: string
+      hasCE: boolean
+      ceCandleData: { close: string; high: string; low: string; volume: string } | null
+      hasPE: boolean
+      peCandleData: { close: string; high: string; low: string; volume: string } | null
+    }>()
     
-    logs.forEach((log) => {
-      // Extract symbols from messages like "NIFTY25SEP26000CE" or "NIFTY25SEP26100CE"
-      const symbolMatch = log.message.match(/([A-Z]+\d+[A-Z]+\d+[CE|PE]{2})/g)
+    // Process logs in reverse order to get latest candle data first
+    ;[...logs].reverse().forEach((log) => {
+      // Extract symbols from messages like "NIFTY13OCT2622600CE" or "BANKNIFTY13OCT2645000PE"
+      const symbolMatch = log.message.match(/([A-Z]+\d+[A-Z]+\d+(?:CE|PE))/g)
       if (symbolMatch && log.strategy !== 'All') {
         symbolMatch.forEach((sym) => {
           const isCE = sym.endsWith('CE')
-          const isPE = sym.endsWith('PE')
+          // Extract base symbol (everything before the date part)
+          const baseMatch = sym.match(/^([A-Z]+)\d+/)
+          const baseSymbol: string = baseMatch ? baseMatch[1] : sym.substring(0, 10)
           
-          // Extract base symbol from something like "NIFTY25SEP26000CE"
-          const instrumentMatch = sym.match(/^([A-Z]+)/)
-          const instrument = instrumentMatch ? instrumentMatch[1] : 'NIFTY'
-          const strike = sym.match(/\d{5,6}(?=[CE|PE]{2})/)?.[0] || 'N/A'
+          // Extract strike price (digits between expiry and CE/PE, skipping the 2-digit year)
+          // Format: NIFTY13OCT26[22600]CE where 26 is year, 22600 is strike
+          const strikeMatch = sym.match(/^[A-Z]+\d+[A-Z]+\d{2}(\d+)(?:CE|PE)$/)
+          const strike: string = strikeMatch ? strikeMatch[1] : '—'
           
-          // Use strike as part of the key to differentiate between same instrument with different strikes
-          const key = `${instrument}_${strike}`
+          const mapKey = `${baseSymbol}:${strike}`
           
-          if (!activeSymbols[key]) {
-            activeSymbols[key] = {
-              name: `${instrument} (${strike})`,
-              symbol: sym,
-              strike: strike,
-              premium: 'Real-time',
-              directions: [],
-              strategy: log.strategy,
+          if (!symbolMap.has(mapKey)) {
+            symbolMap.set(mapKey, {
+              strike,
+              strategy: log.strategy || 'Default',
+              hasCE: false,
+              ceCandleData: null,
+              hasPE: false,
+              peCandleData: null,
+            })
+          }
+          const entry = symbolMap.get(mapKey)!
+          if (isCE) {
+            entry.hasCE = true
+            // Only set candle data if not already set (first/latest entry)
+            if (!entry.ceCandleData && log.message.includes('3m candle')) {
+              entry.ceCandleData = parseCandleData(log.message)
             }
-          }
-          
-          if (isCE && !activeSymbols[key].directions.includes('CE')) {
-            activeSymbols[key].directions.push('CE')
-          }
-          if (isPE && !activeSymbols[key].directions.includes('PE')) {
-            activeSymbols[key].directions.push('PE')
+          } else {
+            entry.hasPE = true
+            // Only set candle data if not already set (first/latest entry)
+            if (!entry.peCandleData && log.message.includes('3m candle')) {
+              entry.peCandleData = parseCandleData(log.message)
+            }
           }
         })
       }
     })
     
-    return Object.values(activeSymbols).slice(0, 3) // Return max 3 active symbols
+    const symbolsFromLogs = Array.from(symbolMap.entries())
+      .map(([mapKey, data]) => {
+        const baseSymbol = mapKey.split(':')[0]
+        return {
+          baseSymbol,
+          ...data,
+        }
+      })
+      .slice(0, 4)
+    
+    // Combine symbols from logs with configured Active instruments
+    // Show all available symbols up to 4 total, with logs taking priority
+    const configuredSymbols = apiInstruments
+      .filter((inst) => inst.status) // Only ACTIVE
+      .map((inst) => {
+        // Try to extract strike from brokerSymbol if available
+        // Format: NIFTY13OCT26[22600]CE where 26 is year, 22600 is strike
+        const strikeMatch = inst.brokerSymbol.match(/^[A-Z]+\d+[A-Z]+\d{2}(\d+)(?:CE|PE)?$/)
+        // Fallback to premiumOptionStrike field if configured
+        const strike = strikeMatch ? strikeMatch[1] : (inst.premiumOptionStrike ? String(inst.premiumOptionStrike) : '—')
+        const baseMatch = inst.brokerSymbol.match(/^([A-Z]+)\d+/)
+        const baseSymbol = baseMatch ? baseMatch[1] : inst.brokerSymbol
+        
+        return {
+          baseSymbol,
+          strike,
+          strategy: inst.strategy,
+          hasCE: true,
+          ceCandleData: null,
+          hasPE: true,
+          peCandleData: null,
+        }
+      })
+    
+    // Merge symbols from logs with configured instruments
+    // Avoid duplicates by checking baseSymbol
+    const mergedSymbols = [...symbolsFromLogs]
+    const logSymbolBases = new Set(symbolsFromLogs.map(s => s.baseSymbol))
+    
+    for (const configured of configuredSymbols) {
+      if (!logSymbolBases.has(configured.baseSymbol)) {
+        mergedSymbols.push(configured)
+      }
+    }
+    
+    return mergedSymbols.slice(0, 4)
   }
 
   // Filter logs - exclude INFO level logs
@@ -257,9 +657,9 @@ const Logs: React.FC = () => {
 
   // Get completed 3-minute candle history (all logs for this side)
   const get3MinuteCandleHistory = (logs: LogEntry[]): LogEntry[] => {
-    // Return all logs sorted by timestamp (oldest first for display)
+    // Return all logs sorted by timestamp (newest first - descending order)
     return [...logs].sort(
-      (a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()
+      (a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()
     )
   }
 
@@ -275,19 +675,26 @@ const Logs: React.FC = () => {
     return Array.from(activeStrategies)
   }
 
-  // Reset triggered alerts
-  const resetAlerts = async () => {
+  // Reset triggered alerts - note: since we only load recent 60-second alerts,
+  // clearing will prevent old ones from reappearing
+  const resetAlerts = () => {
     if (!confirm('Are you sure you want to clear all triggered alerts?')) {
       return
     }
-    try {
-      const response = await fetch('/api/alerts/reset', { method: 'POST' })
-      if (response.ok) {
-        setAlerts([])
-      }
-    } catch (error) {
-      console.error('Failed to reset alerts:', error)
-    }
+    // Clear the alerts array
+    setAlerts([])
+    setPreviousAlertCount(0)
+    toast.addToast({
+      type: 'success',
+      title: '✅ Alerts Cleared',
+      message: 'All triggered alerts have been cleared',
+      duration: 3000,
+    })
+  }
+
+  // Clear all toast messages
+  const clearAllMessages = () => {
+    toast.clearAll()
   }
 
   // Export 3-minute logs to CSV
@@ -394,7 +801,7 @@ const Logs: React.FC = () => {
       {/* Monitoring Status Section - Enhanced with Market Hours Logic */}
       <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
         {/* Status Card */}
-        {instruments.length === 0 ? (
+        {apiInstruments.length === 0 ? (
           // No instruments configured state
           <Card className="relative overflow-hidden border border-bg-tertiary/50 bg-gradient-to-br from-bg-tertiary/5 to-transparent">
             <div className="absolute -right-8 -top-8 w-20 h-20 bg-text-secondary/5 rounded-full blur-2xl"></div>
@@ -482,7 +889,7 @@ const Logs: React.FC = () => {
         )}
 
         {/* Active Symbols Card - Only show when instruments are configured and during market hours */}
-        {instruments.length === 0 ? (
+        {apiInstruments.length === 0 ? (
           // No instruments state
           <Card className="relative overflow-hidden border border-bg-tertiary/50 bg-gradient-to-br from-bg-tertiary/5 to-transparent">
             <div className="absolute -right-8 -top-8 w-20 h-20 bg-text-secondary/5 rounded-full blur-2xl"></div>
@@ -506,46 +913,33 @@ const Logs: React.FC = () => {
         ) : isMarketOpen() ? (
           <Card className="relative overflow-hidden border border-accent-cyan/30 bg-gradient-to-br from-accent-cyan/5 to-transparent">
             <div className="absolute -right-8 -top-8 w-20 h-20 bg-accent-cyan/10 rounded-full blur-2xl"></div>
-            <div className="relative space-y-2">
-              <div className="flex items-center gap-3">
-                <div className="flex items-center justify-center w-10 h-10 rounded-lg bg-accent-cyan/20">
-                  <TrendingUp size={20} className="text-accent-cyan" />
-                </div>
-                <div>
+            <div className="relative space-y-3">
+              <div className="flex items-center justify-between gap-3">
+                <div className="flex items-center gap-3">
+                  <div className="flex items-center justify-center w-10 h-10 rounded-lg bg-accent-cyan/20">
+                    <TrendingUp size={20} className="text-accent-cyan" />
+                  </div>
                   <p className="text-xs uppercase text-text-secondary font-semibold">Active Symbols</p>
                 </div>
+                <p className="text-xs text-text-tertiary">Last: {getLatestCandleTime()}</p>
               </div>
-              <div className="space-y-1.5 ml-0">
+              <div className="space-y-2 pl-4">
                 {getActiveSymbols().length > 0 ? (
                   getActiveSymbols().map((symbol, idx) => (
-                    <div key={idx} className="space-y-1.5 pl-4">
-                      <div>
-                        <p className="text-sm text-text-primary font-bold">{symbol.name}</p>
-                        <p className="text-xs text-text-tertiary">{symbol.strategy}</p>
-                      </div>
-                      <div className="flex items-center gap-1.5">
-                        <div className="w-1.5 h-1.5 rounded-full bg-accent-cyan"></div>
-                        <p className="text-xs text-text-secondary">Strike: {symbol.strike}</p>
-                      </div>
-                      <div className="flex items-center gap-1.5">
-                        <div className="w-1.5 h-1.5 rounded-full bg-accent-cyan"></div>
-                        <p className="text-xs text-text-secondary">Premium: {symbol.premium}</p>
-                      </div>
-                      <div className="flex flex-wrap gap-1.5 mt-2">
-                        {symbol.directions.includes('CE') && (
-                          <span className="px-2 py-1 text-xs rounded bg-accent-cyan/10 text-accent-cyan font-medium">CE</span>
+                    <div key={idx} className="flex items-center gap-3">
+                      <p className="text-sm text-text-secondary font-semibold">
+                        {symbol.strategy} <span className="text-text-tertiary/60">-</span> {symbol.baseSymbol} <span className="text-accent-cyan font-bold">{symbol.strike}</span>
+                        {symbol.hasCE && (
+                          <span className="ml-2 px-1.5 py-0.5 text-xs font-bold rounded bg-accent-cyan/20 text-accent-cyan">CE</span>
                         )}
-                        {symbol.directions.includes('PE') && (
-                          <span className="px-2 py-1 text-xs rounded bg-accent-red/10 text-accent-red font-medium">PE</span>
+                        {symbol.hasPE && (
+                          <span className="ml-1 px-1.5 py-0.5 text-xs font-bold rounded bg-accent-red/20 text-accent-red">PE</span>
                         )}
-                      </div>
-                      {idx < getActiveSymbols().length - 1 && (
-                        <div className="mt-3 pt-3 border-t border-bg-tertiary/30"></div>
-                      )}
+                      </p>
                     </div>
                   ))
                 ) : (
-                  <div className="space-y-1.5 pl-4">
+                  <div className="space-y-1">
                     <p className="text-sm text-text-secondary">No active symbols</p>
                     <p className="text-xs text-text-tertiary">Waiting for signals...</p>
                   </div>
@@ -556,20 +950,37 @@ const Logs: React.FC = () => {
         ) : (
           <Card className="relative overflow-hidden border border-bg-tertiary/50 bg-gradient-to-br from-bg-tertiary/5 to-transparent">
             <div className="absolute -right-8 -top-8 w-20 h-20 bg-text-secondary/5 rounded-full blur-2xl"></div>
-            <div className="relative space-y-4">
-              <div className="flex items-center gap-3">
-                <div className="flex items-center justify-center w-10 h-10 rounded-lg bg-bg-tertiary/20">
-                  <TrendingUp size={20} className="text-text-secondary" />
-                </div>
-                <div>
+            <div className="relative space-y-3">
+              <div className="flex items-center justify-between gap-3">
+                <div className="flex items-center gap-3">
+                  <div className="flex items-center justify-center w-10 h-10 rounded-lg bg-bg-tertiary/20">
+                    <TrendingUp size={20} className="text-text-secondary" />
+                  </div>
                   <p className="text-xs uppercase text-text-secondary font-semibold">Active Symbols</p>
                 </div>
+                <p className="text-xs text-text-tertiary">Waiting...</p>
               </div>
-              <div className="space-y-2 ml-0">
-                <div className="space-y-1.5 pl-4">
-                  <p className="text-sm text-text-secondary">No active symbols</p>
-                  <p className="text-xs text-text-secondary/60">Market is closed</p>
-                </div>
+              <div className="space-y-2 pl-4">
+                {getActiveSymbols().length > 0 ? (
+                  getActiveSymbols().map((symbol, idx) => (
+                    <div key={idx} className="flex items-center gap-3">
+                      <p className="text-sm text-text-secondary font-semibold">
+                        {symbol.strategy} <span className="text-text-tertiary/60">-</span> {symbol.baseSymbol} <span className="text-text-tertiary font-bold">{symbol.strike}</span>
+                        {symbol.hasCE && (
+                          <span className="ml-2 px-1.5 py-0.5 text-xs font-bold rounded bg-bg-tertiary/30 text-text-secondary">CE</span>
+                        )}
+                        {symbol.hasPE && (
+                          <span className="ml-1 px-1.5 py-0.5 text-xs font-bold rounded bg-bg-tertiary/30 text-text-secondary">PE</span>
+                        )}
+                      </p>
+                    </div>
+                  ))
+                ) : (
+                  <div className="space-y-1">
+                    <p className="text-sm text-text-secondary">No active symbols</p>
+                    <p className="text-xs text-text-secondary/60">Market is closed</p>
+                  </div>
+                )}
               </div>
             </div>
           </Card>
@@ -709,7 +1120,7 @@ const Logs: React.FC = () => {
                                   <div key={idx} className="grid grid-cols-3 gap-3 px-3 py-2 border-b border-accent-cyan/10 text-xs text-text-secondary hover:bg-bg-secondary/20 transition-colors">
                                     <div className="font-mono text-text-tertiary">{formatTime(log.timestamp)}</div>
                                     <div>
-                                      <Badge size="xs" variant={getLevelColor(log.level)}>
+                                      <Badge size="sm" variant={getLevelColor(log.level)}>
                                         {log.level}
                                       </Badge>
                                     </div>
@@ -787,7 +1198,7 @@ const Logs: React.FC = () => {
                                   <div key={idx} className="grid grid-cols-3 gap-3 px-3 py-2 border-b border-accent-red/10 text-xs text-text-secondary hover:bg-bg-secondary/20 transition-colors">
                                     <div className="font-mono text-text-tertiary">{formatTime(log.timestamp)}</div>
                                     <div>
-                                      <Badge size="xs" variant={getLevelColor(log.level)}>
+                                      <Badge size="sm" variant={getLevelColor(log.level)}>
                                         {log.level}
                                       </Badge>
                                     </div>
@@ -819,25 +1230,40 @@ const Logs: React.FC = () => {
       {/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */}
       <div className="space-y-4">
         <div className="flex items-center justify-between">
-          <SectionTitle title="Triggered Alerts" icon={<AlertTriangle size={20} />} />
-          {alerts.length > 0 && (
+          <SectionTitle>
             <div className="flex items-center gap-2">
-              <button
-                onClick={exportAlertsToCSV}
-                className="flex items-center gap-2 px-3 py-1.5 text-xs font-medium text-white/70 hover:text-white bg-bg-tertiary/50 hover:bg-bg-tertiary/80 rounded transition-all"
-              >
-                <Download size={14} />
-                Export
-              </button>
-              <button
-                onClick={resetAlerts}
-                className="flex items-center gap-2 px-3 py-1.5 text-xs font-medium text-white/70 hover:text-white bg-bg-tertiary/50 hover:bg-bg-tertiary/80 rounded transition-all hover:bg-red-900/30"
-              >
-                <RotateCcw size={14} />
-                Reset
-              </button>
+              <AlertTriangle size={20} className="text-accent-red" />
+              Triggered Alerts
             </div>
-          )}
+          </SectionTitle>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={clearAllMessages}
+              className="flex items-center gap-2 px-3 py-1.5 text-xs font-medium text-accent-red/70 hover:text-accent-red bg-accent-red/10 hover:bg-accent-red/20 rounded transition-all"
+              title="Clear all alert toast messages"
+            >
+              <X size={14} />
+              Clear Messages
+            </button>
+            {alerts.length > 0 && (
+              <>
+                <button
+                  onClick={exportAlertsToCSV}
+                  className="flex items-center gap-2 px-3 py-1.5 text-xs font-medium text-white/70 hover:text-white bg-bg-tertiary/50 hover:bg-bg-tertiary/80 rounded transition-all"
+                >
+                  <Download size={14} />
+                  Export
+                </button>
+                <button
+                  onClick={resetAlerts}
+                  className="flex items-center gap-2 px-3 py-1.5 text-xs font-medium text-white/70 hover:text-white bg-bg-tertiary/50 hover:bg-bg-tertiary/80 rounded transition-all hover:bg-red-900/30"
+                >
+                  <RotateCcw size={14} />
+                  Reset
+                </button>
+              </>
+            )}
+          </div>
         </div>
 
         <Card className="border border-bg-tertiary/50">
@@ -855,13 +1281,13 @@ const Logs: React.FC = () => {
                   </tr>
                 </thead>
                 <tbody>
-                  {alerts.map((alert) => (
+                  {[...alerts].sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()).map((alert) => (
                     <tr key={alert.id} className="border-b border-bg-tertiary/30 hover:bg-bg-tertiary/20 transition-colors">
                       <td className="px-4 py-2 text-text-secondary">
                         {formatTime(alert.timestamp)}
                       </td>
                       <td className="px-4 py-2">
-                        <Badge variant="default">{alert.strategy}</Badge>
+                        <Badge variant="info">{alert.strategy}</Badge>
                       </td>
                       <td className="px-4 py-2 text-text-primary font-semibold">
                         {alert.symbol}

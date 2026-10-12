@@ -15,62 +15,53 @@ import argparse
 from pathlib import Path
 from dotenv import load_dotenv, set_key
 
-# Add project root to path
-sys.path.insert(0, str(Path(__file__).parent))
-
-from core.dashboard_data import DashboardDataProvider
-
 
 def get_current_mode() -> str:
-    """Get the current OpenAlgo mode from dashboard provider."""
-    try:
-        provider = DashboardDataProvider(
-            api_key=os.getenv("OPENALGO_API_KEY", "demo"),
-            host=os.getenv("OPENALGO_HOST", "http://localhost:5010"),
-        )
-        return provider._detect_mode()
-    except Exception:
-        # Fallback to environment variables
-        mode = os.getenv("OPENALGO_MODE", "").lower().strip()
-        if mode in ("live", "analyzer"):
-            return mode
+    """Get the current OpenAlgo mode from environment."""
+    # Try .env file first
+    env_file = Path(__file__).parent / ".env"
+    if env_file.exists():
+        load_dotenv(env_file)
+    
+    # Check OPENALGO_MODE env var
+    mode = os.getenv("OPENALGO_MODE", "").lower().strip()
+    if mode in ("live", "analyzer"):
+        return mode
+    
+    # Check STRATEGY_MODE
+    strategy_mode = os.getenv("STRATEGY_MODE", "").lower().strip()
+    if strategy_mode == "live":
+        return "live"
+    elif strategy_mode in ("paper", "backtest", "smoke"):
         return "analyzer"
+    
+    # Default
+    return "analyzer"
 
 
 def set_mode(new_mode: str) -> bool:
-    """Set the OpenAlgo mode using DashboardDataProvider."""
+    """Set the OpenAlgo mode in .env file."""
     if new_mode not in ("live", "analyzer"):
         print(f"❌ Invalid mode: {new_mode}. Must be 'live' or 'analyzer'")
         return False
     
-    try:
-        provider = DashboardDataProvider(
-            api_key=os.getenv("OPENALGO_API_KEY", "demo"),
-            host=os.getenv("OPENALGO_HOST", "http://localhost:5010"),
-        )
-        success = provider.set_mode(new_mode)
-        
-        if success:
-            # Also set environment variable for backward compatibility
-            env_file = Path(__file__).parent / ".env"
-            if not env_file.exists():
-                env_file.write_text("")
-            set_key(str(env_file), "OPENALGO_MODE", new_mode)
-            
-            print(f"✅ Mode set to: {new_mode}")
-            print(f"   File: logs/current_mode.txt")
-            print(f"   Env:  OPENALGO_MODE (updated for compatibility)")
-        else:
-            print(f"❌ Failed to set mode")
-            return False
-    except Exception as e:
-        print(f"❌ Error setting mode: {e}")
-        return False
+    env_file = Path(__file__).parent / ".env"
     
-    # Print what to do to apply changes
-    print("\n📋 Updates applied:")
-    print("   ✓ The React dashboard will detect the mode change within 1 second")
-    print("   ✓ Next export cycle will include the new mode")
+    if not env_file.exists():
+        # Create .env file
+        print(f"📝 Creating .env file at {env_file}")
+        env_file.write_text("")
+    
+    # Set the environment variable
+    set_key(str(env_file), "OPENALGO_MODE", new_mode)
+    print(f"✅ Set OPENALGO_MODE={new_mode} in {env_file}")
+    
+    # Also print what to do to apply changes
+    print("\n📋 To apply changes:")
+    print("   1. The React dashboard will detect the mode change within 1 second")
+    print("   2. For running processes, restart with:")
+    print("      - docker-compose restart react_dashboard  (React dashboard)")
+    print("      - Restart strategy workers if they check env")
     
     return True
 

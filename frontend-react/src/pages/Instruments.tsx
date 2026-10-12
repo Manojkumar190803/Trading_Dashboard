@@ -1,8 +1,9 @@
-import { useState, useEffect } from 'react'
-import { Plus, Trash2, Edit2, Power, AlertCircle, CheckCircle2, Play, Square } from 'lucide-react'
+import { useState, useEffect, useRef } from 'react'
+import { Plus, Trash2, Edit2, Power, AlertCircle, CheckCircle2, Search, ChevronDown } from 'lucide-react'
 import clsx from 'clsx'
 import { useAppStore } from '@/stores'
 import { Instrument } from '@/types'
+import { useInstruments } from '@/hooks/useInstruments'
 
 const STRATEGIES = ['21EMA', 'HD', 'CD', 'TC', '2BC', 'BO']
 
@@ -14,16 +15,6 @@ const LOT_SIZE_MAP: Record<string, number> = {
   'SENSEX': 20,
 }
 
-// Strike step mapping by strategy
-const STRIKE_STEP_MAP: Record<string, number> = {
-  '21EMA': 50,  // NIFTY default
-  'HD': 50,
-  'CD': 50,
-  'TC': 50,
-  '2BC': 50,
-  'BO': 50,
-}
-
 interface FormData {
   name: string
   brokerSymbol: string
@@ -31,22 +22,26 @@ interface FormData {
   monitoringEndTime: string
   lotSizeAdjustment: number
   strategy: string
-  atmPrice: number
-  minPremium: number
-  maxPremium: number
-  breakeven_rr: number
-  trail_step_rr: number
-  max_initial_risk_points: number
+  premiumMinPrice?: number
+  premiumMaxPrice?: number
 }
 
 const Instruments: React.FC = () => {
-  const { instruments, addInstrument, updateInstrument, deleteInstrument, toggleInstrument, exportInstruments, getStrategyStatus } = useAppStore()
+  const { trailingStopsConfig, setTrailingStopsConfig, resetTrailingStopsConfig } = useAppStore()
+  const { instruments, isLoading, error, addInstrument: apiAddInstrument, updateInstrument: apiUpdateInstrument, deleteInstrument: apiDeleteInstrument, toggleInstrument: apiToggleInstrument } = useInstruments()
   const [showForm, setShowForm] = useState(false)
   const [editingId, setEditingId] = useState<string | null>(null)
   const [searchTerm, setSearchTerm] = useState('')
   const [strategyFilter, setStrategyFilter] = useState<string>('ALL')
   const [filterStatus, setFilterStatus] = useState<string>('ALL')
-  const [strategyStatus, setStrategyStatus] = useState<Record<string, any>>({})
+  const [symbolSuggestions, setSymbolSuggestions] = useState<string[]>([])
+  const [showSymbolDropdown, setShowSymbolDropdown] = useState(false)
+  const symbolDropdownRef = useRef<HTMLDivElement>(null)
+  const [showTrailingConfig, setShowTrailingConfig] = useState(false)
+  const [localTrailingConfig, setLocalTrailingConfig] = useState(trailingStopsConfig)
+  const [symbolValidation, setSymbolValidation] = useState<{ symbol: string; valid: boolean; message: string } | null>(null)
+  const [isValidatingSymbol, setIsValidatingSymbol] = useState(false)
+  const [isSubmitting, setIsSubmitting] = useState(false)
   const [formData, setFormData] = useState<FormData>({
     name: '',
     brokerSymbol: '',
@@ -54,51 +49,88 @@ const Instruments: React.FC = () => {
     monitoringEndTime: '15:30',
     lotSizeAdjustment: 1,
     strategy: '21EMA',
-    atmPrice: 0,
-    minPremium: 0,
-    maxPremium: 0,
-    breakeven_rr: 1.0,
-    trail_step_rr: 0.5,
-    max_initial_risk_points: 20.0,
+    premiumMinPrice: undefined,
+    premiumMaxPrice: undefined,
   })
 
-  // Auto-export instruments when they change
-  useEffect(() => {
-    const exportInsts = async () => {
-      try {
-        await exportInstruments()
-      } catch (error) {
-        console.error('Failed to export instruments:', error)
-      }
+  // Fetch symbol suggestions from API
+  const fetchSymbolSuggestions = async (query: string, strategy: string) => {
+    if (query.length < 1) {
+      setSymbolSuggestions([])
+      return
     }
-    exportInsts()
-  }, [instruments, exportInstruments])
+    try {
+      const response = await fetch(`/api/symbols/search?q=${encodeURIComponent(query)}&strategy=${encodeURIComponent(strategy)}`)
+      const data = await response.json()
+      setSymbolSuggestions(data.symbols || [])
+      setShowSymbolDropdown(true)
+    } catch (error) {
+      console.error('Error fetching symbols:', error)
+      setSymbolSuggestions([])
+    }
+  }
 
-  // Poll strategy status every 3 seconds
+  // Validate symbol with OpenAlgo
+  const validateSymbol = async (symbol: string) => {
+    if (!symbol) return
+    
+    setIsValidatingSymbol(true)
+    try {
+      const response = await fetch('/api/symbols/validate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ symbol: symbol.toUpperCase() })
+      })
+      const data = await response.json()
+      setSymbolValidation({
+        symbol: symbol.toUpperCase(),
+        valid: data.valid,
+        message: data.message || 'Validation complete'
+      })
+    } catch (error) {
+      console.error('Error validating symbol:', error)
+      setSymbolValidation({
+        symbol: symbol.toUpperCase(),
+        valid: false,
+        message: '❌ Error validating symbol'
+      })
+    } finally {
+      setIsValidatingSymbol(false)
+    }
+  }
+
   useEffect(() => {
-    const pollStatus = async () => {
-      try {
-        const status = await getStrategyStatus()
-        if (status) {
-          setStrategyStatus(status.running_strategies || {})
-        }
-      } catch (error) {
-        console.error('Failed to get strategy status:', error)
+    // Debounce symbol search
+    const timer = setTimeout(() => {
+      if (formData.brokerSymbol.length >= 1) {
+        fetchSymbolSuggestions(formData.brokerSymbol, formData.strategy)
+      } else {
+        setSymbolSuggestions([])
+        setShowSymbolDropdown(false)
+      }
+    }, 300)
+    return () => clearTimeout(timer)
+  }, [formData.brokerSymbol, formData.strategy])
+
+  // Close dropdown when clicking outside
+  useEffect(() => {
+    const handleClickOutside = (e: MouseEvent) => {
+      if (symbolDropdownRef.current && !symbolDropdownRef.current.contains(e.target as Node)) {
+        setShowSymbolDropdown(false)
       }
     }
-    
-    pollStatus()
-    const interval = setInterval(pollStatus, 3000)
-    return () => clearInterval(interval)
-  }, [getStrategyStatus])
+    document.addEventListener('mousedown', handleClickOutside)
+    return () => document.removeEventListener('mousedown', handleClickOutside)
+  }, [])
+
+  // Sync local trailing config with global config when it changes
+  useEffect(() => {
+    setLocalTrailingConfig(trailingStopsConfig)
+  }, [trailingStopsConfig])
 
   const calculateLotSize = (instrumentName: string): number => {
     const normalized = instrumentName.toUpperCase()
     return LOT_SIZE_MAP[normalized] || 1
-  }
-
-  const getStrikeStep = (strategyName: string): number => {
-    return STRIKE_STEP_MAP[strategyName] || 50
   }
 
   const filteredInstruments = instruments.filter((inst) => {
@@ -116,64 +148,56 @@ const Instruments: React.FC = () => {
       return
     }
 
-    const lotSize = calculateLotSize(formData.name)
-    const strikeStep = getStrikeStep(formData.strategy)
-    // For 21EMA, ATM price is auto-locked by the system, so clear manual input
-    // For other strategies, use premium range for strike monitoring
-    const atmPrice = formData.strategy === '21EMA' ? 0 : formData.atmPrice
-    const minPremium = formData.strategy === '21EMA' ? 0 : formData.minPremium
-    const maxPremium = formData.strategy === '21EMA' ? 0 : formData.maxPremium
-
-    if (editingId) {
-      updateInstrument(editingId, {
-        ...formData,
-        atmPrice,
-        minPremium,
-        maxPremium,
-        breakeven_rr: formData.breakeven_rr,
-        trail_step_rr: formData.trail_step_rr,
-        max_initial_risk_points: formData.max_initial_risk_points,
-        lotSize,
-        strikeStep: formData.strategy === '21EMA' ? 0 : strikeStep,
-        strategy: formData.strategy as '21EMA' | 'HD' | 'CD' | 'TC' | '2BC' | 'BO',
-        productType: 'INTRADAY',
-      })
-      setEditingId(null)
-    } else {
-      addInstrument({
-        id: `inst-${Date.now()}`,
-        ...formData,
-        atmPrice,
-        minPremium,
-        maxPremium,
-        breakeven_rr: formData.breakeven_rr,
-        trail_step_rr: formData.trail_step_rr,
-        max_initial_risk_points: formData.max_initial_risk_points,
-        lotSize,
-        strikeStep: formData.strategy === '21EMA' ? 0 : strikeStep,
-        strategy: formData.strategy as '21EMA' | 'HD' | 'CD' | 'TC' | '2BC' | 'BO',
-        productType: 'INTRADAY',
-        status: true,
-        createdAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString(),
-      })
+    // Validate premium prices for non-21EMA strategies
+    if (formData.strategy !== '21EMA') {
+      if (formData.premiumMinPrice === undefined || formData.premiumMaxPrice === undefined) {
+        alert('Premium Min and Max prices are required for this strategy')
+        return
+      }
+      if (formData.premiumMinPrice >= formData.premiumMaxPrice) {
+        alert('Premium Min price must be less than Max price')
+        return
+      }
     }
 
-    setFormData({
-      name: '',
-      brokerSymbol: '',
-      monitoringStartTime: '09:15',
-      monitoringEndTime: '15:30',
-      lotSizeAdjustment: 1,
-      strategy: '21EMA',
-      atmPrice: 0,
-      minPremium: 0,
-      maxPremium: 0,
-      breakeven_rr: 1.0,
-      trail_step_rr: 0.5,
-      max_initial_risk_points: 20.0,
-    })
-    setShowForm(false)
+    const baseLotSize = calculateLotSize(formData.name)
+    const lotSize = baseLotSize * formData.lotSizeAdjustment  // Apply adjustment multiplier
+
+    setIsSubmitting(true)
+    
+    const submitData = {
+      name: formData.name,
+      brokerSymbol: formData.brokerSymbol,
+      monitoringStartTime: formData.monitoringStartTime,
+      monitoringEndTime: formData.monitoringEndTime,
+      lotSizeAdjustment: formData.lotSizeAdjustment,
+      calculatedLotSize: lotSize,
+      strategy: formData.strategy,
+      productType: 'INTRADAY',
+      premiumMinPrice: formData.premiumMinPrice,
+      premiumMaxPrice: formData.premiumMaxPrice,
+    }
+
+    if (editingId) {
+      apiUpdateInstrument(editingId, submitData).then((result) => {
+        if (result.success) {
+          setEditingId(null)
+          handleCancel()
+        } else {
+          alert(`Error updating instrument: ${result.error}`)
+        }
+        setIsSubmitting(false)
+      })
+    } else {
+      apiAddInstrument(submitData).then((result) => {
+        if (result.success) {
+          handleCancel()
+        } else {
+          alert(`Error creating instrument: ${result.error}`)
+        }
+        setIsSubmitting(false)
+      })
+    }
   }
 
   const handleEdit = (inst: Instrument) => {
@@ -184,12 +208,8 @@ const Instruments: React.FC = () => {
       monitoringEndTime: inst.monitoringEndTime,
       lotSizeAdjustment: inst.lotSizeAdjustment,
       strategy: inst.strategy,
-      atmPrice: inst.atmPrice || 0,
-      minPremium: inst.minPremium || 0,
-      maxPremium: inst.maxPremium || 0,
-      breakeven_rr: inst.breakeven_rr || 1.0,
-      trail_step_rr: inst.trail_step_rr || 0.5,
-      max_initial_risk_points: inst.max_initial_risk_points || 20.0,
+      premiumMinPrice: (inst as any).premiumMinPrice,
+      premiumMaxPrice: (inst as any).premiumMaxPrice,
     })
     setEditingId(inst.id)
     setShowForm(true)
@@ -205,13 +225,10 @@ const Instruments: React.FC = () => {
       monitoringEndTime: '15:30',
       lotSizeAdjustment: 1,
       strategy: '21EMA',
-      atmPrice: 0,
-      minPremium: 0,
-      maxPremium: 0,
-      breakeven_rr: 1.0,
-      trail_step_rr: 0.5,
-      max_initial_risk_points: 20.0,
+      premiumMinPrice: undefined,
+      premiumMaxPrice: undefined,
     })
+    setSymbolValidation(null)
   }
 
   return (
@@ -276,22 +293,71 @@ const Instruments: React.FC = () => {
                 type="text"
                 value={formData.name}
                 onChange={(e) => setFormData({ ...formData, name: e.target.value })}
-                placeholder="e.g., NIFTY, BANKNIFTY, SENSEX"
+                placeholder="e.g., NIFTY, BANKNIFTY"
                 className="w-full px-3 py-2 bg-bg-primary border border-bg-tertiary rounded-lg text-text-primary placeholder-text-tertiary focus:outline-none focus:border-accent-cyan focus:ring-1 focus:ring-accent-cyan"
               />
             </div>
-            <div>
+            <div ref={symbolDropdownRef} className="relative">
               <label className="block text-sm font-medium text-text-secondary mb-2">
-                Broker Symbol *
+                Broker Symbol * (Searchable)
               </label>
-              <input
-                type="text"
-                value={formData.brokerSymbol}
-                onChange={(e) => setFormData({ ...formData, brokerSymbol: e.target.value })}
-                placeholder="e.g., NIFTY50, BANKNIFTY"
-                className="w-full px-3 py-2 bg-bg-primary border border-bg-tertiary rounded-lg text-text-primary placeholder-text-tertiary focus:outline-none focus:border-accent-cyan focus:ring-1 focus:ring-accent-cyan"
-              />
-              <p className="text-xs text-text-tertiary mt-1">Symbol used by your broker for this instrument</p>
+              <div className="relative">
+                <div className="absolute left-3 top-3 text-text-tertiary">
+                  <Search size={16} />
+                </div>
+                <input
+                  type="text"
+                  value={formData.brokerSymbol}
+                  onChange={(e) => {
+                    setFormData({ ...formData, brokerSymbol: e.target.value })
+                    setShowSymbolDropdown(true)
+                    setSymbolValidation(null)
+                  }}
+                  onFocus={() => setShowSymbolDropdown(true)}
+                  onBlur={() => {
+                    if (formData.brokerSymbol && !symbolValidation) {
+                      setTimeout(() => validateSymbol(formData.brokerSymbol), 200)
+                    }
+                  }}
+                  placeholder="e.g., NIFTY (spot) or NIFTY25DEC26000CE (option)"
+                  className="w-full pl-9 pr-3 py-2 bg-bg-primary border border-bg-tertiary rounded-lg text-text-primary placeholder-text-tertiary focus:outline-none focus:border-accent-cyan focus:ring-1 focus:ring-accent-cyan"
+                  autoComplete="off"
+                />
+              </div>
+              
+              {symbolValidation && (
+                <div className={clsx(
+                  "mt-2 p-2 rounded text-sm flex items-center gap-2",
+                  symbolValidation.valid 
+                    ? "bg-green-900/30 text-green-300" 
+                    : "bg-red-900/30 text-red-300"
+                )}>
+                  {symbolValidation.valid ? (
+                    <CheckCircle2 size={16} />
+                  ) : (
+                    <AlertCircle size={16} />
+                  )}
+                  <span>{symbolValidation.message}</span>
+                </div>
+              )}
+              
+              {showSymbolDropdown && symbolSuggestions.length > 0 && (
+                <div className="absolute top-full left-0 right-0 mt-1 bg-bg-secondary border border-bg-tertiary rounded-lg shadow-lg z-50 max-h-48 overflow-y-auto">
+                  {symbolSuggestions.map((symbol) => (
+                    <div
+                      key={symbol}
+                      onClick={() => {
+                        setFormData({ ...formData, brokerSymbol: symbol })
+                        setShowSymbolDropdown(false)
+                        setTimeout(() => validateSymbol(symbol), 100)
+                      }}
+                      className="px-3 py-2 hover:bg-bg-tertiary cursor-pointer text-text-primary text-sm border-b border-bg-tertiary last:border-b-0"
+                    >
+                      ✓ {symbol}
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
             <div>
               <label className="block text-sm font-medium text-text-secondary mb-2">
@@ -320,39 +386,15 @@ const Instruments: React.FC = () => {
               <input
                 type="number"
                 step="1"
-                min="1"
                 value={formData.lotSizeAdjustment}
-                onChange={(e) => {
-                  const value = e.target.value
-                  if (value === '') {
-                    setFormData({ ...formData, lotSizeAdjustment: 1 })
-                  } else {
-                    const intValue = Math.max(1, parseInt(value) || 1)
-                    setFormData({ ...formData, lotSizeAdjustment: intValue })
-                  }
-                }}
-                onBlur={(e) => {
-                  // Ensure value is at least 1 on blur
-                  const value = parseInt(e.target.value) || 1
-                  setFormData({ ...formData, lotSizeAdjustment: Math.max(1, value) })
-                }}
+                onChange={(e) => setFormData({ ...formData, lotSizeAdjustment: parseInt(e.target.value) || 1 })}
                 className="w-full px-3 py-2 bg-bg-primary border border-bg-tertiary rounded-lg text-text-primary focus:outline-none focus:border-accent-cyan focus:ring-1 focus:ring-accent-cyan"
               />
             </div>
             <div>
-              <label className="block text-sm font-medium text-text-secondary mb-2">Base Lot Size</label>
+              <label className="block text-sm font-medium text-text-secondary mb-2">Calculated Lot Size</label>
               <div className="w-full px-3 py-2 bg-bg-primary border border-bg-tertiary rounded-lg text-text-primary font-semibold">
-                {calculateLotSize(formData.name)} (Read-only)
-              </div>
-            </div>
-            <div>
-              <label className="block text-sm font-medium text-text-secondary mb-2">Total Quantity</label>
-              <div className="w-full px-3 py-2 bg-bg-primary border border-accent-cyan/50 rounded-lg text-text-primary font-bold text-lg">
-                <span className="text-accent-cyan">{formData.lotSizeAdjustment}</span>
-                <span className="text-text-secondary mx-1">×</span>
-                <span className="text-accent-green">{calculateLotSize(formData.name)}</span>
-                <span className="text-text-secondary mx-1">=</span>
-                <span className="text-accent-green">{formData.lotSizeAdjustment * calculateLotSize(formData.name)}</span>
+                {calculateLotSize(formData.name) * formData.lotSizeAdjustment} (Read-only) = {calculateLotSize(formData.name)} × {formData.lotSizeAdjustment}
               </div>
             </div>
             <div>
@@ -367,113 +409,47 @@ const Instruments: React.FC = () => {
                 ))}
               </select>
             </div>
-            {formData.strategy !== '21EMA' && (
-              <div>
-                <label className="block text-sm font-medium text-text-secondary mb-2">Strike Step</label>
-                <div className="w-full px-3 py-2 bg-bg-primary border border-bg-tertiary rounded-lg text-text-primary font-semibold">
-                  {getStrikeStep(formData.strategy)} (Read-only)
-                </div>
-              </div>
-            )}
             <div>
               <label className="block text-sm font-medium text-text-secondary mb-2">Product Type</label>
               <div className="w-full px-3 py-2 bg-bg-primary border border-bg-tertiary rounded-lg text-text-primary font-semibold">
                 INTRADAY (Fixed)
               </div>
             </div>
-            {formData.strategy === '21EMA' ? (
-              <div>
-                <label className="block text-sm font-medium text-text-secondary mb-2">
-                  ATM Price (Auto-Locked at 9:20 AM)
-                </label>
-                <div className="w-full px-3 py-2 bg-bg-primary border border-accent-cyan/40 rounded-lg text-text-primary font-semibold text-accent-cyan">
-                  {formData.atmPrice > 0 ? formData.atmPrice.toFixed(2) : 'Locked during market hours'}
-                </div>
-                <p className="text-xs text-text-tertiary mt-1">Automatically captured by the system at 9:20 AM</p>
-              </div>
-            ) : (
-              <div>
-                <label className="block text-sm font-medium text-text-secondary mb-2">
-                  Min Premium Range
-                </label>
-                <input
-                  type="number"
-                  step="1"
-                  min="0"
-                  value={formData.minPremium || ''}
-                  onChange={(e) => setFormData({ ...formData, minPremium: parseInt(e.target.value) || 0 })}
-                  placeholder="e.g., 120"
-                  className="w-full px-3 py-2 bg-bg-primary border border-bg-tertiary rounded-lg text-text-primary placeholder-text-tertiary focus:outline-none focus:border-accent-cyan focus:ring-1 focus:ring-accent-cyan"
-                />
-                <p className="text-xs text-text-tertiary mt-1">Minimum premium to monitor (integers only)</p>
-              </div>
-            )}
+
+            {/* Trailing Mechanism - Risk Ratio Step */}
+            {/* Premium Price Min for Non-21EMA Strategies */}
             {formData.strategy !== '21EMA' && (
-              <div>
-                <label className="block text-sm font-medium text-text-secondary mb-2">
-                  Max Premium Range
-                </label>
-                <input
-                  type="number"
-                  step="1"
-                  min="0"
-                  value={formData.maxPremium || ''}
-                  onChange={(e) => setFormData({ ...formData, maxPremium: parseInt(e.target.value) || 0 })}
-                  placeholder="e.g., 170"
-                  className="w-full px-3 py-2 bg-bg-primary border border-bg-tertiary rounded-lg text-text-primary placeholder-text-tertiary focus:outline-none focus:border-accent-cyan focus:ring-1 focus:ring-accent-cyan"
-                />
-                <p className="text-xs text-text-tertiary mt-1">Maximum premium to monitor (integers only)</p>
-              </div>
+              <>
+                <div>
+                  <label className="block text-sm font-medium text-text-secondary mb-2">Premium Min Price</label>
+                  <input
+                    type="number"
+                    step="0.05"
+                    min="0"
+                    value={formData.premiumMinPrice || ''}
+                    onChange={(e) => setFormData({ ...formData, premiumMinPrice: parseFloat(e.target.value) || undefined })}
+                    className="w-full px-3 py-2 bg-bg-primary border border-bg-tertiary rounded-lg text-text-primary focus:outline-none focus:border-accent-cyan focus:ring-1 focus:ring-accent-cyan"
+                    placeholder="e.g., 25.50"
+                  />
+                  <p className="text-xs text-text-tertiary mt-1">Minimum option premium price</p>
+                </div>
+
+                <div>
+                  <label className="block text-sm font-medium text-text-secondary mb-2">Premium Max Price</label>
+                  <input
+                    type="number"
+                    step="0.05"
+                    min="0"
+                    value={formData.premiumMaxPrice || ''}
+                    onChange={(e) => setFormData({ ...formData, premiumMaxPrice: parseFloat(e.target.value) || undefined })}
+                    className="w-full px-3 py-2 bg-bg-primary border border-bg-tertiary rounded-lg text-text-primary focus:outline-none focus:border-accent-cyan focus:ring-1 focus:ring-accent-cyan"
+                    placeholder="e.g., 150.75"
+                  />
+                  <p className="text-xs text-text-tertiary mt-1">Maximum option premium price</p>
+                </div>
+              </>
             )}
-            {/* Trailing Stoploss Mechanism - Applied to all strategies */}
-            <div>
-              <label className="block text-sm font-medium text-text-secondary mb-2">
-                Breakeven RR (At 1R Milestone)
-              </label>
-              <input
-                type="number"
-                step="0.1"
-                min="0.1"
-                max="5"
-                value={formData.breakeven_rr || ''}
-                onChange={(e) => setFormData({ ...formData, breakeven_rr: parseFloat(e.target.value) || 1.0 })}
-                placeholder="e.g., 1.0"
-                className="w-full px-3 py-2 bg-bg-primary border border-bg-tertiary rounded-lg text-text-primary placeholder-text-tertiary focus:outline-none focus:border-accent-cyan focus:ring-1 focus:ring-accent-cyan"
-              />
-              <p className="text-xs text-text-tertiary mt-1">Move stop to entry price at 1R (default: 1.0)</p>
-            </div>
-            <div>
-              <label className="block text-sm font-medium text-text-secondary mb-2">
-                Trail Step RR (Per 0.5R Milestone)
-              </label>
-              <input
-                type="number"
-                step="0.1"
-                min="0.1"
-                max="5"
-                value={formData.trail_step_rr || ''}
-                onChange={(e) => setFormData({ ...formData, trail_step_rr: parseFloat(e.target.value) || 0.5 })}
-                placeholder="e.g., 0.5"
-                className="w-full px-3 py-2 bg-bg-primary border border-bg-tertiary rounded-lg text-text-primary placeholder-text-tertiary focus:outline-none focus:border-accent-cyan focus:ring-1 focus:ring-accent-cyan"
-              />
-              <p className="text-xs text-text-tertiary mt-1">Advance stop by this amount at each 0.5R (default: 0.5)</p>
-            </div>
-            <div>
-              <label className="block text-sm font-medium text-text-secondary mb-2">
-                Max Initial Risk Points
-              </label>
-              <input
-                type="number"
-                step="1"
-                min="1"
-                max="100"
-                value={formData.max_initial_risk_points || ''}
-                onChange={(e) => setFormData({ ...formData, max_initial_risk_points: parseFloat(e.target.value) || 20.0 })}
-                placeholder="e.g., 20"
-                className="w-full px-3 py-2 bg-bg-primary border border-bg-tertiary rounded-lg text-text-primary placeholder-text-tertiary focus:outline-none focus:border-accent-cyan focus:ring-1 focus:ring-accent-cyan"
-              />
-              <p className="text-xs text-text-tertiary mt-1">Discard setup if initial risk exceeds this (default: 20)</p>
-            </div>
+
             <div className="col-span-1 md:col-span-3 flex gap-3">
               <button
                 type="submit"
@@ -509,11 +485,8 @@ const Instruments: React.FC = () => {
                   <th className="px-6 py-4 text-left text-sm font-semibold text-text-secondary">Broker Symbol</th>
                   <th className="px-6 py-4 text-left text-sm font-semibold text-text-secondary">Strategy</th>
                   <th className="px-6 py-4 text-left text-sm font-semibold text-text-secondary">Lot Size</th>
-                  <th className="px-6 py-4 text-left text-sm font-semibold text-text-secondary">Price Range</th>
-                  <th className="px-6 py-4 text-left text-sm font-semibold text-text-secondary">Stoploss Config</th>
                   <th className="px-6 py-4 text-left text-sm font-semibold text-text-secondary">Monitoring</th>
                   <th className="px-6 py-4 text-left text-sm font-semibold text-text-secondary">Status</th>
-                  <th className="px-6 py-4 text-left text-sm font-semibold text-text-secondary">Strategy Running</th>
                   <th className="px-6 py-4 text-center text-sm font-semibold text-text-secondary">Actions</th>
                 </tr>
               </thead>
@@ -547,36 +520,18 @@ const Instruments: React.FC = () => {
                         {inst.strategy}
                       </span>
                     </td>
-                    <td className="px-6 py-4 text-text-secondary font-mono">
-                      <div>{inst.lotSizeAdjustment} × {inst.lotSize}</div>
-                      <div className="text-xs text-text-tertiary">= {inst.lotSizeAdjustment * (inst.lotSize || 0)} qty</div>
-                    </td>
-                    <td className="px-6 py-4 text-text-secondary font-mono">
+                    <td className="px-6 py-4 text-text-secondary font-mono">{inst.lotSize || calculateLotSize(inst.name)}</td>
+                    <td className="px-6 py-4 text-text-secondary text-sm">
                       {inst.strategy === '21EMA' ? (
-                        inst.atmPrice ? (
-                          <span className="text-accent-cyan font-semibold">{inst.atmPrice.toFixed(2)}</span>
-                        ) : (
-                          <span className="text-text-tertiary italic">Auto-locked</span>
-                        )
+                        <span className="text-text-tertiary">—</span>
                       ) : (
-                        inst.minPremium || inst.maxPremium ? (
-                          <span className="text-accent-green font-semibold">
-                            {inst.minPremium?.toFixed(0) || '0'} - {inst.maxPremium?.toFixed(0) || '0'}
-                          </span>
-                        ) : (
-                          <span className="text-text-tertiary italic">—</span>
-                        )
+                        <span>
+                          {(inst as any).premiumMinPrice?.toFixed(2) || '—'} - {(inst as any).premiumMaxPrice?.toFixed(2) || '—'}
+                        </span>
                       )}
                     </td>
                     <td className="px-6 py-4 text-text-secondary text-sm">
                       {inst.monitoringStartTime} → {inst.monitoringEndTime}
-                    </td>
-                    <td className="px-6 py-4 text-text-secondary text-sm font-mono">
-                      <div className="flex flex-col gap-1">
-                        <div><span className="text-text-tertiary text-xs">BE:</span> {inst.breakeven_rr?.toFixed(1) || '1.0'}R</div>
-                        <div><span className="text-text-tertiary text-xs">Trail:</span> {inst.trail_step_rr?.toFixed(1) || '0.5'}R</div>
-                        <div><span className="text-text-tertiary text-xs">Max Risk:</span> {inst.max_initial_risk_points?.toFixed(0) || '20'} pts</div>
-                      </div>
                     </td>
                     <td className="px-6 py-4">
                       <div className="flex items-center gap-2">
@@ -591,59 +546,34 @@ const Instruments: React.FC = () => {
                       </div>
                     </td>
                     <td className="px-6 py-4">
-                      {(() => {
-                        const status = strategyStatus[inst.id]
-                        if (!status) {
-                          return <span className="text-text-tertiary text-sm">Not running</span>
-                        }
-                        return (
-                          <div className="flex items-center gap-2">
-                            {status.status === 'running' ? (
-                              <>
-                                <div className="w-2 h-2 bg-accent-green rounded-full animate-pulse"></div>
-                                <span className="text-accent-green text-sm font-semibold">Running (PID: {status.pid})</span>
-                              </>
-                            ) : status.status === 'crashed' ? (
-                              <>
-                                <AlertCircle size={16} className="text-accent-red" />
-                                <span className="text-accent-red text-sm">Crashed</span>
-                              </>
-                            ) : status.status === 'stopped' ? (
-                              <>
-                                <Square size={16} className="text-text-tertiary" />
-                                <span className="text-text-tertiary text-sm">Stopped</span>
-                              </>
-                            ) : (
-                              <span className="text-accent-yellow text-sm">{status.status}</span>
-                            )}
-                          </div>
-                        )
-                      })()}
-                    </td>
-                    <td className="px-6 py-4">
                       <div className="flex items-center justify-center gap-2">
                         <button
-                          onClick={() => toggleInstrument(inst.id)}
-                          className="p-2 hover:bg-bg-tertiary rounded transition-colors text-text-secondary hover:text-accent-cyan"
-                          title={inst.status ? 'Disable' : 'Enable'}
+                          onClick={() => apiToggleInstrument(inst.id)}
+                          className={`p-2 rounded transition-colors ${
+                            inst.status 
+                              ? 'text-accent-green hover:text-accent-cyan hover:bg-accent-green/10' 
+                              : 'text-accent-red hover:text-accent-cyan hover:bg-accent-red/10'
+                          }`}
+                          title={inst.status ? 'Archive (Hide from active list)' : 'Restore (Enable monitoring)'}
                         >
                           <Power size={18} />
                         </button>
                         <button
                           onClick={() => handleEdit(inst)}
                           className="p-2 hover:bg-bg-tertiary rounded transition-colors text-text-secondary hover:text-accent-cyan"
-                          title="Edit"
+                          title="Edit instrument settings"
                         >
                           <Edit2 size={18} />
                         </button>
                         <button
                           onClick={() => {
-                            if (window.confirm(`Delete ${inst.name}?`)) {
-                              deleteInstrument(inst.id)
+                            const confirmMessage = `⚠️ PERMANENT DELETE\n\n"${inst.name}" will be permanently removed from the database.\n\nThis action CANNOT be undone.\n\nAre you sure?`
+                            if (window.confirm(confirmMessage)) {
+                              apiDeleteInstrument(inst.id)
                             }
                           }}
-                          className="p-2 hover:bg-bg-tertiary rounded transition-colors text-text-secondary hover:text-accent-red"
-                          title="Delete"
+                          className="p-2 hover:bg-bg-tertiary rounded transition-colors text-text-secondary hover:text-accent-red hover:bg-accent-red/10"
+                          title="Permanently delete (cannot undo)"
                         >
                           <Trash2 size={18} />
                         </button>
@@ -653,6 +583,153 @@ const Instruments: React.FC = () => {
                 ))}
               </tbody>
             </table>
+          </div>
+        )}
+      </div>
+
+      {/* Divider */}
+      <div className="pt-2 mt-8 border-t-2 border-accent-cyan/20"></div>
+
+      {/* Global Trailing Stops Configuration */}
+      <div className="bg-gradient-to-r from-accent-cyan/5 to-accent-blue/5 rounded-lg border-2 border-accent-cyan/40 overflow-hidden shadow-lg shadow-accent-cyan/10">
+        <button
+          onClick={() => setShowTrailingConfig(!showTrailingConfig)}
+          className="w-full px-6 py-4 flex items-center justify-between hover:bg-accent-cyan/10 transition-colors group"
+        >
+          <div className="flex items-center gap-3">
+            <div className="px-3 py-1 bg-accent-cyan text-bg-primary rounded-full text-xs font-bold">
+              GLOBAL CONFIG
+            </div>
+            <h2 className="text-lg font-semibold text-text-primary group-hover:text-accent-cyan transition-colors">
+              Configure Global Trailing Stops
+            </h2>
+          </div>
+          <ChevronDown
+            size={24}
+            className={clsx(
+              'text-accent-cyan transition-transform duration-200',
+              showTrailingConfig && 'rotate-180'
+            )}
+          />
+        </button>
+
+        {showTrailingConfig && (
+          <div className="border-t border-bg-tertiary px-6 py-6 space-y-6">
+            {/* Info Box */}
+            <div className="bg-bg-primary border border-accent-cyan/30 rounded-lg p-4">
+              <p className="text-sm text-text-secondary">
+                These settings apply globally to all strategies and instruments. Breakeven at <span className="font-semibold text-accent-cyan">{localTrailingConfig.breakEvenRR.toFixed(2)}</span> RR, 
+                trailing in <span className="font-semibold text-accent-cyan">{localTrailingConfig.trailStepRR.toFixed(2)}</span> RR steps.
+              </p>
+            </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+              {/* Breakeven RR Milestone */}
+              <div>
+                <label className="block text-sm font-medium text-text-secondary mb-2">Breakeven Milestone (RR)</label>
+                <input
+                  type="number"
+                  step="0.05"
+                  min="0.5"
+                  max="3.0"
+                  value={localTrailingConfig.breakEvenRR}
+                  onChange={(e) =>
+                    setLocalTrailingConfig({
+                      ...localTrailingConfig,
+                      breakEvenRR: parseFloat(e.target.value) || 1.25,
+                    })
+                  }
+                  className="w-full px-3 py-2 bg-bg-primary border border-bg-tertiary rounded-lg text-text-primary focus:outline-none focus:border-accent-cyan focus:ring-1 focus:ring-accent-cyan"
+                  placeholder="1.25"
+                />
+                <p className="text-xs text-text-tertiary mt-2">
+                  At which Risk Ratio should the stop move to breakeven? (1.0 = entry+1R, 1.25 = entry+1.25R)
+                </p>
+              </div>
+
+              {/* Trailing Step Size */}
+              <div>
+                <label className="block text-sm font-medium text-text-secondary mb-2">Trailing Step Size (RR)</label>
+                <input
+                  type="number"
+                  step="0.05"
+                  min="0.05"
+                  max="2.0"
+                  value={localTrailingConfig.trailStepRR}
+                  onChange={(e) =>
+                    setLocalTrailingConfig({
+                      ...localTrailingConfig,
+                      trailStepRR: parseFloat(e.target.value) || 0.5,
+                    })
+                  }
+                  className="w-full px-3 py-2 bg-bg-primary border border-bg-tertiary rounded-lg text-text-primary focus:outline-none focus:border-accent-cyan focus:ring-1 focus:ring-accent-cyan"
+                  placeholder="0.5"
+                />
+                <p className="text-xs text-text-tertiary mt-2">
+                  How much profit to trail on each step? (0.25 = fine, 0.5 = default, 1.0 = aggressive)
+                </p>
+              </div>
+
+              {/* Max Initial Risk Points */}
+              <div>
+                <label className="block text-sm font-medium text-text-secondary mb-2">Max Initial Risk Points</label>
+                <input
+                  type="number"
+                  step="1"
+                  min="1"
+                  max="50"
+                  value={localTrailingConfig.maxInitialRiskPoints}
+                  onChange={(e) =>
+                    setLocalTrailingConfig({
+                      ...localTrailingConfig,
+                      maxInitialRiskPoints: parseFloat(e.target.value) || 20,
+                    })
+                  }
+                  className="w-full px-3 py-2 bg-bg-primary border border-bg-tertiary rounded-lg text-text-primary focus:outline-none focus:border-accent-cyan focus:ring-1 focus:ring-accent-cyan"
+                  placeholder="20"
+                />
+                <p className="text-xs text-text-tertiary mt-2">
+                  Global default for maximum initial risk. Can be overridden per instrument.
+                </p>
+              </div>
+            </div>
+
+            {/* Action Buttons */}
+            <div className="flex gap-3 pt-4 border-t border-bg-tertiary">
+              <button
+                onClick={() => {
+                  setTrailingStopsConfig(localTrailingConfig)
+                  setShowTrailingConfig(false)
+                }}
+                className="flex-1 px-4 py-2 bg-accent-cyan text-bg-primary rounded-lg hover:bg-accent-cyan/90 transition-colors font-semibold"
+              >
+                Save Configuration
+              </button>
+              <button
+                onClick={() => {
+                  setLocalTrailingConfig(trailingStopsConfig)
+                  setShowTrailingConfig(false)
+                }}
+                className="flex-1 px-4 py-2 bg-bg-tertiary text-text-primary rounded-lg hover:bg-bg-tertiary/80 transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={() => {
+                  resetTrailingStopsConfig()
+                  setLocalTrailingConfig({
+                    breakEvenRR: 1.25,
+                    trailStepRR: 0.5,
+                    maxInitialRiskPoints: 20,
+                    createdAt: new Date().toISOString(),
+                    updatedAt: new Date().toISOString(),
+                  })
+                }}
+                className="px-4 py-2 bg-accent-red/20 text-accent-red rounded-lg hover:bg-accent-red/30 transition-colors font-semibold"
+              >
+                Reset to Default
+              </button>
+            </div>
           </div>
         )}
       </div>
