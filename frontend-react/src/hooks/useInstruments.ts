@@ -15,7 +15,7 @@ interface InstrumentPayload {
   status?: string
 }
 
-export const useInstruments = () => {
+export const useInstruments = (includeArchived = false) => {
   const [instruments, setInstruments] = useState<Instrument[]>([])
   const [isLoading, setIsLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
@@ -26,27 +26,36 @@ export const useInstruments = () => {
     try {
       const response = await fetch('/api/instruments')
       const data = await response.json()
+      const allResponse = includeArchived
+        ? await fetch('/api/instruments/debug/all')
+        : null
+      const allData = allResponse?.ok ? await allResponse.json() : { instruments: [] }
       
-      // Transform backend response to frontend format
-      const transformedInstruments = (data.instruments || []).map((inst: any) => ({
+      const transformInstrument = (inst: any) => ({
         id: inst.id.toString(),
         name: inst.name,
-        brokerSymbol: inst.brokerSymbol || inst.broker_symbol,
-        monitoringStartTime: inst.monitoringStartTime || inst.monitoring_start_time,
-        monitoringEndTime: inst.monitoringEndTime || inst.monitoring_end_time,
-        lotSizeAdjustment: inst.lotSizeAdjustment || inst.lot_size_adjustment,
+        brokerSymbol: inst.brokerSymbol || inst.broker_symbol || inst.name.toUpperCase(),
+        monitoringStartTime: inst.monitoringStartTime || inst.monitoring_start_time || '',
+        monitoringEndTime: inst.monitoringEndTime || inst.monitoring_end_time || '',
+        lotSizeAdjustment: inst.lotSizeAdjustment ?? inst.lot_size_adjustment ?? 1,
         lotSize: inst.calculatedLotSize || inst.calculated_lot_size,
         strategy: inst.strategy as any,
-        productType: inst.productType || inst.product_type,
+        productType: inst.productType || inst.product_type || 'INTRADAY',
         status: inst.status === 'ACTIVE' || inst.status === true,
         premiumMinPrice: inst.premiumMinPrice || inst.premium_min_price,
         premiumMaxPrice: inst.premiumMaxPrice || inst.premium_max_price,
         premiumOptionStrike: inst.premiumOptionStrike || inst.premium_option_strike,
         createdAt: inst.createdAt || inst.created_at,
         updatedAt: inst.updatedAt || inst.updated_at,
-      }))
+      })
+
+      const activeInstruments = (data.instruments || []).map(transformInstrument)
+      const activeIds = new Set(activeInstruments.map((instrument: Instrument) => instrument.id))
+      const inactiveInstruments = (allData.instruments || [])
+        .filter((inst: any) => inst.status === 'INACTIVE' && !activeIds.has(inst.id.toString()))
+        .map(transformInstrument)
       
-      setInstruments(transformedInstruments)
+      setInstruments([...activeInstruments, ...inactiveInstruments])
       setError(null)
     } catch (err) {
       console.error('Error fetching instruments:', err)
@@ -59,7 +68,7 @@ export const useInstruments = () => {
   // Create instrument
   const addInstrument = async (formData: InstrumentPayload) => {
     try {
-      const response = await fetch('/api/instruments', {
+      let response = await fetch('/api/instruments', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -76,7 +85,42 @@ export const useInstruments = () => {
         }),
       })
       
-      if (!response.ok) throw new Error('Failed to create instrument')
+      let result = await response.json().catch(() => ({}))
+      if (!response.ok && /duplicate key|uq_instrument_name/i.test(String(result.error || ''))) {
+        const archivedResponse = await fetch('/api/instruments/debug/all')
+        const archivedData = await archivedResponse.json()
+        const archivedInstruments = archivedData.instruments || []
+        const isArchived = (instrument: { id: number; name: string; status: string }) => instrument.status !== 'ACTIVE'
+        const archived = archivedInstruments.find((instrument: { id: number; name: string; status: string }) =>
+          instrument.name.trim() === formData.name.trim() && isArchived(instrument)
+        ) || archivedInstruments.find((instrument: { id: number; name: string; status: string }) =>
+          instrument.name.trim().toLowerCase() === formData.name.trim().toLowerCase()
+          && isArchived(instrument)
+        )
+
+        if (archived) {
+          response = await fetch(`/api/instruments/${archived.id}`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              name: formData.name,
+              brokerSymbol: formData.brokerSymbol,
+              monitoringStartTime: formData.monitoringStartTime,
+              monitoringEndTime: formData.monitoringEndTime,
+              lotSizeAdjustment: formData.lotSizeAdjustment,
+              calculatedLotSize: formData.calculatedLotSize,
+              strategy: formData.strategy,
+              productType: formData.productType,
+              premiumMinPrice: formData.premiumMinPrice,
+              premiumMaxPrice: formData.premiumMaxPrice,
+              status: 'ACTIVE',
+            }),
+          })
+          result = await response.json().catch(() => ({}))
+        }
+      }
+
+      if (!response.ok) throw new Error(result.error || `Failed to create instrument (${response.status})`)
       
       // Refresh instruments after creation
       await fetchInstruments()
@@ -145,7 +189,7 @@ export const useInstruments = () => {
       const instrument = instruments.find(i => i.id === id)
       if (!instrument) throw new Error('Instrument not found')
       
-      const newStatus = instrument.status ? 'ARCHIVED' : 'ACTIVE'
+      const newStatus = instrument.status ? 'INACTIVE' : 'ACTIVE'
       
       const response = await fetch(`/api/instruments/${id}`, {
         method: 'PUT',
@@ -155,7 +199,8 @@ export const useInstruments = () => {
         }),
       })
       
-      if (!response.ok) throw new Error('Failed to toggle instrument status')
+      const result = await response.json().catch(() => ({}))
+      if (!response.ok) throw new Error(result.error || 'Failed to toggle instrument status')
       
       // Refresh instruments after update
       await fetchInstruments()
@@ -170,7 +215,7 @@ export const useInstruments = () => {
   // Initial fetch on mount
   useEffect(() => {
     fetchInstruments()
-  }, [])
+  }, [includeArchived])
 
   return {
     instruments,

@@ -12,9 +12,34 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const app = express()
 const PORT = 4000
 
-const LOGS_DIR = process.env.LOGS_DIR || '/app/logs'
+// Determine LOGS_DIR: check env var, then default to ../logs (project root)
+const LOGS_DIR = process.env.LOGS_DIR || path.join(__dirname, '..', 'logs')
+
+// Ensure logs directory exists
+if (!fs.existsSync(LOGS_DIR)) {
+  console.error(`❌ LOGS_DIR does not exist: ${LOGS_DIR}`)
+  console.error(`Please set LOGS_DIR environment variable or ensure ../logs directory exists`)
+} else {
+  console.log(`✅ LOGS_DIR configured: ${LOGS_DIR}`)
+}
 
 app.use(express.json())
+
+// CORS middleware - handle preflight requests and set CORS headers on all responses
+app.use((req, res, next) => {
+  res.setHeader('Access-Control-Allow-Origin', '*')
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS, PUT, DELETE')
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization')
+  res.setHeader('Access-Control-Max-Age', '3600')
+  
+  // Handle preflight OPTIONS request
+  if (req.method === 'OPTIONS') {
+    res.status(200).end()
+    return
+  }
+  
+  next()
+})
 
 /**
  * Serve log files (.txt, .csv, .json) from the logs directory
@@ -122,23 +147,44 @@ app.post('/api/analytics/reset', (req, res) => {
   }
 })
 
-/**
- * Reset triggered alerts by clearing the alerts JSON file
- */
+/** Return the durable cutoff used to hide previously triggered CSV alerts. */
+app.get('/api/alerts/reset-status', (req, res) => {
+  try {
+    const resetFile = path.join(LOGS_DIR, 'triggered_alerts_reset.json')
+    const resetState = fs.existsSync(resetFile)
+      ? JSON.parse(fs.readFileSync(resetFile, 'utf8'))
+      : { resetAt: '', dismissedIds: [] }
+    res.json({
+      success: true,
+      resetAt: resetState.resetAt || '',
+      dismissedIds: Array.isArray(resetState.dismissedIds) ? resetState.dismissedIds : [],
+    })
+  } catch (error) {
+    console.error('Error reading triggered-alert reset marker:', error)
+    res.status(500).json({ success: false, error: 'Failed to read triggered-alert reset marker' })
+  }
+})
+
+/** Hide existing triggered alerts without deleting their CSV audit history. */
 app.post('/api/alerts/reset', (req, res) => {
   try {
     const alertsFile = path.join(LOGS_DIR, 'ema21_triggered_alerts.json')
-    const now = new Date().toISOString()
+    const resetFile = path.join(LOGS_DIR, 'triggered_alerts_reset.json')
+    const resetAt = new Date().toISOString()
+    const dismissedIds = Array.isArray(req.body?.alertIds)
+      ? [...new Set(req.body.alertIds.filter((id) => typeof id === 'string'))]
+      : []
 
-    // Write empty alerts structure
+    fs.writeFileSync(resetFile, JSON.stringify({ resetAt, dismissedIds }, null, 2), 'utf8')
     const emptyAlerts = { alerts: [] }
     fs.writeFileSync(alertsFile, JSON.stringify(emptyAlerts, null, 2), 'utf8')
-    console.log(`Alerts cleared at ${now}`)
+    console.log(`Triggered alerts hidden from ${resetAt}`)
 
     res.json({
       success: true,
-      message: 'Triggered alerts cleared successfully',
-      timestamp: now,
+      message: 'Existing triggered alerts hidden successfully',
+      resetAt,
+      dismissedIds,
     })
   } catch (error) {
     console.error('Error resetting alerts:', error)

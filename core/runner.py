@@ -174,9 +174,15 @@ def _persist_setup_status_monitoring(
     if pd.isna(candle_time):
         return
     symbol = str(getattr(side_state, "option_symbol", None) or side)
+    ohlc = ""
+    if all(field in candle and pd.notna(candle[field]) for field in ("open", "high", "low", "close")):
+        ohlc = (
+            f" | O={float(candle['open']):.2f} H={float(candle['high']):.2f}"
+            f" L={float(candle['low']):.2f} C={float(candle['close']):.2f}"
+        )
     message = (
         f"{side} EMA21 setup | {symbol} | {status} | "
-        f"candle={candle_time.strftime('%H:%M:%S')}"
+        f"candle={candle_time.strftime('%H:%M:%S')}{ohlc}"
     )
     row = {
         "timestamp": datetime.now().astimezone().isoformat(),
@@ -1128,6 +1134,12 @@ class LiveFeedRunner:
         base = add_indicators(base.reset_index(drop=True), self.cfg)
         session_start = datetime.combine(today, self.cfg.market_open)
         session_end = datetime.combine(today, self.cfg.market_close)
+        # Make session times tz-aware if broker data is tz-aware (to avoid comparison errors)
+        if base["datetime"].dt.tz is not None:
+            import pytz
+            tz = base["datetime"].dt.tz
+            session_start = pytz.UTC.localize(session_start).astimezone(tz)
+            session_end = pytz.UTC.localize(session_end).astimezone(tz)
         base = base[(base["datetime"] >= session_start) & (base["datetime"] < session_end)]
         return base.reset_index(drop=True)
 
@@ -1636,6 +1648,12 @@ class MultiEngineLiveFeedRunner:
         base = add_indicators(base.reset_index(drop=True), self.cfg)
         session_start = datetime.combine(today, self.cfg.market_open)
         session_end = datetime.combine(today, self.cfg.market_close)
+        # Make session times tz-aware if broker data is tz-aware (to avoid comparison errors)
+        if base["datetime"].dt.tz is not None:
+            import pytz
+            tz = base["datetime"].dt.tz
+            session_start = pytz.UTC.localize(session_start).astimezone(tz)
+            session_end = pytz.UTC.localize(session_end).astimezone(tz)
         base = base[(base["datetime"] >= session_start) & (base["datetime"] < session_end)]
         return base.reset_index(drop=True)
 
@@ -1703,6 +1721,12 @@ class MultiEngineLiveFeedRunner:
                 prev_row = data.iloc[pos_in_full - 1]
             for _, engine in self.engines:
                 engine.process_option_candle(side, row, prev_row)
+                _persist_candle_monitoring(
+                    str(engine._side_state(side).option_symbol or side),
+                    row,
+                    self.cfg.timeframe_minutes,
+                    row.get("ema21"),
+                )
                 _persist_setup_status_monitoring(
                     engine,
                     side,

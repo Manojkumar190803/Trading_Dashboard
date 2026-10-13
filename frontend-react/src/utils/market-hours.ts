@@ -9,14 +9,10 @@
  * @returns true if market is open, false otherwise
  */
 export const isMarketOpen = (): boolean => {
-  const now = new Date()
-  
-  // Get IST time (UTC+5:30)
-  const istTime = new Date(now.toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }))
-  
-  const hours = istTime.getHours()
-  const minutes = istTime.getMinutes()
-  const dayOfWeek = istTime.getDay() // 0 = Sunday, 1 = Monday, ..., 5 = Friday, 6 = Saturday
+  const parts = getISTDateTimeParts(new Date())
+  const hours = Number(parts.hour)
+  const minutes = Number(parts.minute)
+  const dayOfWeek = weekdayNumber(parts.weekday)
   
   // Check if it's a weekday (Mon-Fri = 1-5)
   const isWeekday = dayOfWeek >= 1 && dayOfWeek <= 5
@@ -41,27 +37,23 @@ export const isMarketOpen = (): boolean => {
  */
 export const getSecondsUntilMarketOpen = (): number => {
   const now = new Date()
-  const istTime = new Date(now.toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }))
-  
-  // Create market open time for tomorrow or today
-  let nextOpen = new Date(istTime)
-  nextOpen.setHours(9, 15, 0, 0)
-  
-  // If today is after market close or it's weekend, set to next weekday
-  const dayOfWeek = istTime.getDay()
-  
-  if (istTime.getTime() > nextOpen.getTime()) {
-    // After market close today, move to tomorrow
-    nextOpen.setDate(nextOpen.getDate() + 1)
+  const parts = getISTDateTimeParts(now)
+  const currentIST = Date.UTC(
+    Number(parts.year), Number(parts.month) - 1, Number(parts.day),
+    Number(parts.hour), Number(parts.minute), Number(parts.second), now.getMilliseconds()
+  )
+  const nextOpen = new Date(Date.UTC(
+    Number(parts.year), Number(parts.month) - 1, Number(parts.day), 9, 15
+  ))
+
+  if (weekdayNumber(parts.weekday) === 0 || weekdayNumber(parts.weekday) === 6 || currentIST >= nextOpen.getTime()) {
+    nextOpen.setUTCDate(nextOpen.getUTCDate() + 1)
   }
-  
-  // Skip weekends
-  const daysToAdd = nextOpen.getDay() === 0 ? 1 : (nextOpen.getDay() === 6 ? 2 : 0)
-  if (daysToAdd > 0) {
-    nextOpen.setDate(nextOpen.getDate() + daysToAdd)
+  while (nextOpen.getUTCDay() === 0 || nextOpen.getUTCDay() === 6) {
+    nextOpen.setUTCDate(nextOpen.getUTCDate() + 1)
   }
-  
-  const diffMs = nextOpen.getTime() - now.getTime()
+
+  const diffMs = nextOpen.getTime() - currentIST
   return Math.max(0, Math.floor(diffMs / 1000))
 }
 
@@ -75,8 +67,7 @@ export const getMarketStatus = (): {
   secondsUntilChange: number
 } => {
   const now = new Date()
-  const istTime = new Date(now.toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }))
-  
+  const parts = getISTDateTimeParts(now)
   const open = isMarketOpen()
   
   if (!open) {
@@ -92,9 +83,12 @@ export const getMarketStatus = (): {
   }
   
   // Calculate seconds until market close (3:30 PM)
-  const closeTime = new Date(istTime)
-  closeTime.setHours(15, 30, 0, 0)
-  const secondsUntil = Math.max(0, Math.floor((closeTime.getTime() - now.getTime()) / 1000))
+  const currentIST = Date.UTC(
+    Number(parts.year), Number(parts.month) - 1, Number(parts.day),
+    Number(parts.hour), Number(parts.minute), Number(parts.second), now.getMilliseconds()
+  )
+  const closeTime = Date.UTC(Number(parts.year), Number(parts.month) - 1, Number(parts.day), 15, 30)
+  const secondsUntil = Math.max(0, Math.floor((closeTime - currentIST) / 1000))
   const mins = Math.floor(secondsUntil / 60)
   
   return {
@@ -117,4 +111,24 @@ export const formatTimeUntilMarketChange = (seconds: number): string => {
     return `${hours}h ${minutes}m`
   }
   return `${minutes}m`
+}
+
+const getISTDateTimeParts = (date: Date): Record<string, string> => {
+  return Object.fromEntries(
+    new Intl.DateTimeFormat('en-GB', {
+      timeZone: 'Asia/Kolkata',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      weekday: 'short',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hourCycle: 'h23',
+    }).formatToParts(date).map(({ type, value }) => [type, value])
+  )
+}
+
+const weekdayNumber = (weekday: string): number => {
+  return ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'].indexOf(weekday)
 }

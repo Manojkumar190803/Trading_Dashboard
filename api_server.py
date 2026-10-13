@@ -691,7 +691,10 @@ def get_instruments():
         from core.db_connection import DatabaseConnection
         
         session = DatabaseConnection.get_session()
-        instruments = session.query(Instrument).filter_by(status="ACTIVE").all()
+        query = session.query(Instrument)
+        if request.args.get("includeArchived", "").lower() != "true":
+            query = query.filter_by(status="ACTIVE")
+        instruments = query.all()
         
         return jsonify({
             "instruments": [
@@ -725,42 +728,55 @@ def get_instruments():
 @app.route("/api/instruments", methods=["POST"])
 def create_instrument():
     """Create a new instrument in database."""
+    session = None
     try:
         from core.db_models import Instrument
         from core.db_connection import DatabaseConnection
         
         data = request.json
         session = DatabaseConnection.get_session()
+        name = str(data.get("name") or "").strip()
+        existing = session.query(Instrument).filter_by(name=name).first()
+
+        if existing and existing.status == "ACTIVE":
+            return jsonify({"error": f"Instrument '{name}' is already active"}), 409
         
-        # Create instrument
-        instrument = Instrument(
-            name=data.get("name"),
-            broker_symbol=data.get("brokerSymbol"),
-            strategy=data.get("strategy"),
-            monitoring_start_time=data.get("monitoringStartTime"),
-            monitoring_end_time=data.get("monitoringEndTime"),
-            lot_size_adjustment=float(data.get("lotSizeAdjustment", 1.0)),
-            calculated_lot_size=int(data.get("calculatedLotSize")),
-            premium_min_price=float(data.get("premiumMinPrice")) if data.get("premiumMinPrice") else None,
-            premium_max_price=float(data.get("premiumMaxPrice")) if data.get("premiumMaxPrice") else None,
-            product_type=data.get("productType", "SPOT"),
-            status="ACTIVE"
-        )
-        
-        session.add(instrument)
+        instrument = existing or Instrument(name=name)
+        instrument.name = name
+        instrument.broker_symbol = data.get("brokerSymbol")
+        instrument.strategy = data.get("strategy")
+        instrument.monitoring_start_time = data.get("monitoringStartTime")
+        instrument.monitoring_end_time = data.get("monitoringEndTime")
+        instrument.lot_size_adjustment = float(data.get("lotSizeAdjustment", 1.0))
+        instrument.calculated_lot_size = int(data.get("calculatedLotSize"))
+        instrument.premium_min_price = float(data.get("premiumMinPrice")) if data.get("premiumMinPrice") else None
+        instrument.premium_max_price = float(data.get("premiumMaxPrice")) if data.get("premiumMaxPrice") else None
+        instrument.product_type = data.get("productType", "SPOT")
+        instrument.status = "ACTIVE"
+
+        if existing:
+            logger.info("Restoring archived instrument: %s", name)
+        else:
+            session.add(instrument)
+
         session.commit()
-        
-        logger.info(f"✅ Instrument created: {instrument.name}")
-        
+
+        logger.info("✅ Instrument created or restored: %s", instrument.name)
+
         return jsonify({
             "id": instrument.id,
             "name": instrument.name,
-            "message": "Instrument created successfully"
-        }), 201
-        
+            "message": "Instrument restored successfully" if existing else "Instrument created successfully",
+        }), 200 if existing else 201
+
     except Exception as e:
+        if session is not None:
+            session.rollback()
+        error_message = str(e)
+        if "uq_instrument_name" in error_message:
+            return jsonify({"error": "An instrument with this name already exists"}), 409
         logger.error(f"Error creating instrument: {e}")
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"error": error_message}), 500
 
 
 @app.route("/api/instruments/<int:instrument_id>", methods=["PUT"])

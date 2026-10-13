@@ -11,6 +11,7 @@ import { useToast } from '@/components/Toast'
 import { useInstruments } from '@/hooks/useInstruments'
 import { clsx } from 'clsx'
 import { isMarketOpen } from '@/utils/market-hours'
+import Papa from 'papaparse'
 
 interface LogEntry {
   id: string
@@ -21,6 +22,11 @@ interface LogEntry {
   strategy?: string
   details?: string
   type?: string
+  setupName?: string
+  instrument?: string
+  setupStatus?: string
+  candleTime?: string
+  candleOhlc?: { open: string; high: string; low: string; close: string }
 }
 
 interface AlertEntry {
@@ -33,11 +39,21 @@ interface AlertEntry {
   status: string
 }
 
+interface ActiveSymbol {
+  name: string
+  baseSymbol: string
+  strike: string
+  strategy: string
+  hasCE: boolean
+  hasPE: boolean
+}
+
 const Logs: React.FC = () => {
   const { logs: storeLogs, setLogs: setStoreLogs, setInstruments: setStoreInstruments } = useAppStore()
   const { instruments: apiInstruments } = useInstruments()
   const [logs, setLogs] = useState<LogEntry[]>([])
   const [alerts, setAlerts] = useState<AlertEntry[]>([])
+  const [dismissedAlertIds, setDismissedAlertIds] = useState<Set<string>>(new Set())
   const [previousLogCount, setPreviousLogCount] = useState(0)
   const [previousAlertCount, setPreviousAlertCount] = useState(0)
   const [isInitialLoad, setIsInitialLoad] = useState(true)
@@ -262,6 +278,7 @@ const Logs: React.FC = () => {
         // Get today's date for monitoring file
         const today = new Date()
         const dateStr = today.toISOString().split('T')[0].replace(/-/g, '')
+        // Backend is on host machine localhost:4000, accessible from host browser
         const monitoringFile = `http://localhost:4000/logs/monitoring_${dateStr}.csv?t=${Date.now()}`
         
         console.log('🔍 Fetching monitoring file:', monitoringFile)
@@ -279,39 +296,59 @@ const Logs: React.FC = () => {
         const text = await response.text()
         console.log('📄 File size:', text.length, 'bytes')
         
-        // Parse CSV format
-        const lines = text.split('\n').filter((line) => line.trim().length > 0)
-        const headers = lines[0].split(',')
-        
-        console.log('📋 CSV headers:', headers)
-        console.log('📋 Total lines (including header):', lines.length)
-        
-        // Parse monitoring file for DATA entries (3m candles)
-        const logs: LogEntry[] = []
-        for (let i = 1; i < lines.length; i++) {
-          const line = lines[i]
-          if (line.includes('DATA') && line.includes('3m candle')) {
-            // Parse CSV line - be careful with commas in message field
-            const parts = line.split(',')
-            if (parts.length >= 7) {
-              const timestamp = parts[0]
-              const category = parts[1]
-              const symbol = parts[3]
-              const message = parts.slice(7).join(',') // Message might have commas
-              
-              // Extract the side (CE or PE) from the symbol
-              const side = symbol.includes('CE') ? 'CE' : 'PE'
-              logs.push({
-                id: `log-${i}`,
-                timestamp: new Date(timestamp).toISOString(),
-                level: 'INFO',
-                message: `${symbol} ${message}`,
-                strategy: 'EMA21',
-                type: 'CANDLE'
-              })
-            }
-          }
-        }
+        const parsed = Papa.parse<Record<string, string>>(text, { header: true, skipEmptyLines: true })
+        console.log('📋 Monitoring rows:', parsed.data.length)
+
+        const candleDataByKey = new Map<string, LogEntry['candleOhlc']>()
+        parsed.data.forEach((row) => {
+          if (row.category?.trim() !== 'DATA') return
+          const candleMatch = row.message?.match(/3m candle\s+(\d{2}:\d{2}:\d{2})\s+O=([\d.]+)\s+H=([\d.]+)\s+L=([\d.]+)\s+C=([\d.]+)/i)
+          const symbol = row.symbol?.trim()
+          if (!candleMatch || !symbol) return
+          candleDataByKey.set(`${symbol}|${candleMatch[1]}`, {
+            open: candleMatch[2],
+            high: candleMatch[3],
+            low: candleMatch[4],
+            close: candleMatch[5],
+          })
+        })
+
+        const logs: LogEntry[] = parsed.data.flatMap((row, index) => {
+          if (row.category?.trim() !== 'SETUP_STATUS' || !row.timestamp || !row.message) return []
+
+          const parts = row.message.split('|').map((part) => part.trim())
+          const setupName = parts[0] || 'EMA21 setup'
+          const instrument = row.symbol?.trim() || parts[1] || ''
+          const side = setupName.match(/^(CE|PE)\b/i)?.[1]?.toUpperCase()
+          const strategy = setupName.match(/^(?:CE|PE)\s+(.+?)\s+setup$/i)?.[1] || 'EMA21'
+          const parsedTimestamp = new Date(row.timestamp)
+          if (Number.isNaN(parsedTimestamp.getTime())) return []
+          const candleTime = row.message.match(/candle\s*=\s*(\d{2}:\d{2}:\d{2})/i)?.[1] || ''
+          const setupOhlcMatch = row.message.match(/\bO=([\d.]+)\s+H=([\d.]+)\s+L=([\d.]+)\s+C=([\d.]+)/i)
+          const setupOhlc = setupOhlcMatch
+            ? {
+                open: setupOhlcMatch[1],
+                high: setupOhlcMatch[2],
+                low: setupOhlcMatch[3],
+                close: setupOhlcMatch[4],
+              }
+            : undefined
+
+          return [{
+            id: `setup-${index}-${row.timestamp}`,
+            timestamp: parsedTimestamp.toISOString(),
+            level: 'INFO' as const,
+            category: row.category,
+            message: row.message,
+            strategy,
+            type: side || 'SETUP',
+            setupName,
+            instrument,
+            setupStatus: parts[2] || row.status?.trim() || 'WAITING',
+            candleTime,
+            candleOhlc: setupOhlc || candleDataByKey.get(`${instrument}|${candleTime}`),
+          }]
+        }).sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime())
         
         console.log('✅ Parsed logs:', logs.length)
         setStoreLogs(logs)
@@ -348,10 +385,22 @@ const Logs: React.FC = () => {
         const today = new Date()
         const dateStr = today.toISOString().split('T')[0].replace(/-/g, '')
         
+        const persistedDismissedIds = new Set(dismissedAlertIds)
+        try {
+          const resetResponse = await fetch(`http://localhost:4000/api/alerts/reset-status?t=${Date.now()}`)
+          if (resetResponse.ok) {
+            const resetData = await resetResponse.json()
+            for (const id of resetData.dismissedIds || []) persistedDismissedIds.add(id)
+          }
+        } catch (error) {
+          console.warn('Unable to read triggered-alert reset marker:', error)
+        }
+
         // Fetch alerts for all configured instruments (NIFTY, BANKNIFTY, etc.)
         const allAlerts: AlertEntry[] = []
         
         for (const instrument of apiInstruments) {
+          // Backend is on host machine localhost:4000, accessible from host browser
           const alertsFile = `http://localhost:4000/logs/trade_alerts_${instrument.brokerSymbol}_${dateStr}.csv?t=${Date.now()}`
           
           console.log('🔍 Fetching alerts file:', alertsFile)
@@ -369,41 +418,40 @@ const Logs: React.FC = () => {
             const text = await response.text()
             console.log('📄 Alerts file size:', text.length, 'bytes', `for ${instrument.brokerSymbol}`)
             
-            const lines = text.split('\n').filter(line => line.trim().length > 0)
-            console.log('📋 Total alert lines:', lines.length, `for ${instrument.brokerSymbol}`)
-            
-            // Parse CSV: timestamp,strategy,category,message
-            lines.forEach((line, idx) => {
-              if (idx === 0) return // Skip header
-              
-              // Simple CSV parsing - handle quoted fields
-              const parts = line.split(',')
-              if (parts.length >= 4) {
-                const timestamp = parts[0].trim()
-                const strategyRaw = parts[1].trim()
-                const category = parts[2].trim()
-                const message = parts.slice(3).join(',').trim()
-                
-                // Clean up strategy name - remove "SignalProvider" suffix
-                const strategy = strategyRaw.replace('SignalProvider', '').trim() || 'EMA21'
-                
-                // Extract symbol from message (e.g., "NIFTY13OCT2622600PE")
-                const symbolMatch = message.match(/([A-Z]+\d+[A-Z]+\d+(?:CE|PE))/)
-                const symbol = symbolMatch ? symbolMatch[1] : instrument.brokerSymbol
-                
-                // Determine status based on category
-                const status = category.includes('ENTRY') || category.includes('SIGNAL') ? 'ACTIVE' : 'CLOSED'
-                
-                allAlerts.push({
-                  id: `${timestamp}_${symbol}`,
-                  timestamp: new Date(`${timestamp}+05:30`).toISOString(),
-                  strategy: strategy,
-                  alert_type: category,
-                  message: message,
-                  symbol: symbol,
-                  status: status
-                } as AlertEntry)
-              }
+            const rows = Papa.parse<Record<string, string>>(text, { header: true, skipEmptyLines: true }).data
+            console.log('📋 Parsed alert rows:', rows.length, `for ${instrument.brokerSymbol}`)
+
+            rows.forEach((row) => {
+              const timestamp = row.timestamp?.trim()
+              const message = row.message?.trim()
+              if (!timestamp || !message) return
+
+              const timestampWithZone = /(?:Z|[+-]\d{2}:?\d{2})$/i.test(timestamp)
+                ? timestamp
+                : `${timestamp}+05:30`
+              const parsedDate = new Date(timestampWithZone)
+              if (Number.isNaN(parsedDate.getTime())) return
+
+              const symbolMatch = message.match(/([A-Z]+\d+[A-Z]+\d+\d+(?:CE|PE))/)
+              const symbol = row.symbol?.trim() || symbolMatch?.[1] || instrument.brokerSymbol
+              const strategy = row.strategy?.replace('SignalProvider', '').trim() || instrument.strategy || 'EMA21'
+              const alertType = row.category?.trim() || row.alert_type?.trim() ||
+                (/entry|signal/i.test(message) ? 'ENTRY' : /exit|closed/i.test(message) ? 'EXIT' : 'ALERT')
+              const sourceStatus = row.status?.trim().toUpperCase()
+              const status = sourceStatus === 'ACTIVE' || sourceStatus === 'CLOSED'
+                ? sourceStatus
+                : /ENTRY|SIGNAL/i.test(alertType) ? 'ACTIVE' : 'CLOSED'
+              const id = `alert_${timestamp}_${symbol}_${strategy}_${alertType}`
+
+              allAlerts.push({
+                id,
+                timestamp: parsedDate.toISOString(),
+                strategy,
+                alert_type: alertType,
+                message,
+                symbol,
+                status,
+              })
             })
           } catch (err) {
             console.error(`❌ Error loading alerts for ${instrument.brokerSymbol}:`, err)
@@ -414,7 +462,9 @@ const Logs: React.FC = () => {
         
         console.log('✅ Parsed all alerts:', allAlerts.length)
         // Sort alerts by timestamp in descending order (newest first)
-        const sortedAlerts = [...allAlerts].sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime())
+        const sortedAlerts = [...allAlerts]
+          .filter((alert) => !persistedDismissedIds.has(alert.id))
+          .sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime())
         setAlerts(sortedAlerts)
       } catch (error) {
         console.error('❌ Error loading alerts:', error)
@@ -427,7 +477,7 @@ const Logs: React.FC = () => {
     const interval = setInterval(loadAlertsFromData, 2000)
     
     return () => clearInterval(interval)
-  }, [apiInstruments])
+  }, [apiInstruments, dismissedAlertIds])
 
   const [filterLevel, setFilterLevel] = useState<LogEntry['level'] | 'ALL'>('ALL')
   const [filterStrategy, setFilterStrategy] = useState<string>('ALL')
@@ -453,131 +503,82 @@ const Logs: React.FC = () => {
     return `${hours}:${minutes}:${seconds}`
   }
 
-  // Extract candle data from log message: "SYMBOL 3m candle O: X H: Y L: Z C: W V: Q"
-  const parseCandleData = (message: string): { close: string; high: string; low: string; volume: string } | null => {
-    const candleMatch = message.match(/O=([\d.]+)\s+H=([\d.]+)\s+L=([\d.]+)\s+C=([\d.]+)/)
-    if (candleMatch && candleMatch[4]) {
-      return {
-        close: parseFloat(candleMatch[4]).toFixed(2),
-        high: parseFloat(candleMatch[2]).toFixed(2),
-        low: parseFloat(candleMatch[3]).toFixed(2),
-        volume: '', // EMA data not shown in sidebar
-      }
-    }
-    return null
+  const parseOptionSymbol = (symbol: string) => {
+    const match = symbol.match(/^([A-Z]+)(\d{1,2}[A-Z]{3}\d{2})(\d+)(CE|PE)$/i)
+    return match
+      ? {
+          baseSymbol: match[1].toUpperCase(),
+          expiry: match[2].toUpperCase(),
+          strike: match[3],
+          side: match[4].toUpperCase(),
+        }
+      : null
   }
 
-  // Extract active symbols from logs - grouped by base instrument with latest candle data
-  const getActiveSymbols = (): Array<{
-    baseSymbol: string
-    strike: string
-    strategy: string
-    hasCE: boolean
-    ceCandleData: { close: string; high: string; low: string; volume: string } | null
-    hasPE: boolean
-    peCandleData: { close: string; high: string; low: string; volume: string } | null
-  }> => {
-    const symbolMap = new Map<string, {
-      strike: string
-      strategy: string
-      hasCE: boolean
-      ceCandleData: { close: string; high: string; low: string; volume: string } | null
-      hasPE: boolean
-      peCandleData: { close: string; high: string; low: string; volume: string } | null
-    }>()
-    
-    // Process logs in reverse order to get latest candle data first
-    ;[...logs].reverse().forEach((log) => {
-      // Extract symbols from messages like "NIFTY13OCT2622600CE" or "BANKNIFTY13OCT2645000PE"
-      const symbolMatch = log.message.match(/([A-Z]+\d+[A-Z]+\d+(?:CE|PE))/g)
-      if (symbolMatch && log.strategy !== 'All') {
-        symbolMatch.forEach((sym) => {
-          const isCE = sym.endsWith('CE')
-          // Extract base symbol (everything before the date part)
-          const baseMatch = sym.match(/^([A-Z]+)\d+/)
-          const baseSymbol: string = baseMatch ? baseMatch[1] : sym.substring(0, 10)
-          
-          // Extract strike price (digits between expiry and CE/PE, skipping the 2-digit year)
-          // Format: NIFTY13OCT26[22600]CE where 26 is year, 22600 is strike
-          const strikeMatch = sym.match(/^[A-Z]+\d+[A-Z]+\d{2}(\d+)(?:CE|PE)$/)
-          const strike: string = strikeMatch ? strikeMatch[1] : '—'
-          
-          const mapKey = `${baseSymbol}:${strike}`
-          
-          if (!symbolMap.has(mapKey)) {
-            symbolMap.set(mapKey, {
-              strike,
-              strategy: log.strategy || 'Default',
-              hasCE: false,
-              ceCandleData: null,
-              hasPE: false,
-              peCandleData: null,
-            })
-          }
-          const entry = symbolMap.get(mapKey)!
-          if (isCE) {
-            entry.hasCE = true
-            // Only set candle data if not already set (first/latest entry)
-            if (!entry.ceCandleData && log.message.includes('3m candle')) {
-              entry.ceCandleData = parseCandleData(log.message)
-            }
-          } else {
-            entry.hasPE = true
-            // Only set candle data if not already set (first/latest entry)
-            if (!entry.peCandleData && log.message.includes('3m candle')) {
-              entry.peCandleData = parseCandleData(log.message)
-            }
-          }
-        })
-      }
-    })
-    
-    const symbolsFromLogs = Array.from(symbolMap.entries())
-      .map(([mapKey, data]) => {
-        const baseSymbol = mapKey.split(':')[0]
-        return {
-          baseSymbol,
-          ...data,
-        }
-      })
-      .slice(0, 4)
-    
-    // Combine symbols from logs with configured Active instruments
-    // Show all available symbols up to 4 total, with logs taking priority
-    const configuredSymbols = apiInstruments
-      .filter((inst) => inst.status) // Only ACTIVE
-      .map((inst) => {
-        // Try to extract strike from brokerSymbol if available
-        // Format: NIFTY13OCT26[22600]CE where 26 is year, 22600 is strike
-        const strikeMatch = inst.brokerSymbol.match(/^[A-Z]+\d+[A-Z]+\d{2}(\d+)(?:CE|PE)?$/)
-        // Fallback to premiumOptionStrike field if configured
-        const strike = strikeMatch ? strikeMatch[1] : (inst.premiumOptionStrike ? String(inst.premiumOptionStrike) : '—')
-        const baseMatch = inst.brokerSymbol.match(/^([A-Z]+)\d+/)
-        const baseSymbol = baseMatch ? baseMatch[1] : inst.brokerSymbol
-        
-        return {
-          baseSymbol,
-          strike,
-          strategy: inst.strategy,
-          hasCE: true,
-          ceCandleData: null,
-          hasPE: true,
-          peCandleData: null,
-        }
-      })
-    
-    // Merge symbols from logs with configured instruments
-    // Avoid duplicates by checking baseSymbol
-    const mergedSymbols = [...symbolsFromLogs]
-    const logSymbolBases = new Set(symbolsFromLogs.map(s => s.baseSymbol))
-    
-    for (const configured of configuredSymbols) {
-      if (!logSymbolBases.has(configured.baseSymbol)) {
-        mergedSymbols.push(configured)
+  const getInstrumentVisual = (baseSymbol: string) => {
+    if (baseSymbol === 'BANKNIFTY') {
+      return {
+        frame: 'border-accent-yellow/45 border-l-accent-yellow bg-accent-yellow/5',
+        header: 'border-accent-yellow/30 bg-accent-yellow/10',
+        badge: 'bg-accent-yellow/20 text-accent-yellow',
+        name: 'text-accent-yellow',
       }
     }
-    
-    return mergedSymbols.slice(0, 4)
+    if (baseSymbol === 'NIFTY') {
+      return {
+        frame: 'border-accent-cyan/45 border-l-accent-cyan bg-accent-cyan/5',
+        header: 'border-accent-cyan/30 bg-accent-cyan/10',
+        badge: 'bg-accent-cyan/20 text-accent-cyan',
+        name: 'text-accent-cyan',
+      }
+    }
+    return {
+      frame: 'border-accent-green/45 border-l-accent-green bg-accent-green/5',
+      header: 'border-accent-green/30 bg-accent-green/10',
+      badge: 'bg-accent-green/20 text-accent-green',
+      name: 'text-accent-green',
+    }
+  }
+
+  const normalizeStrategy = (strategy: string): string => {
+    const normalized = strategy.toUpperCase().replace(/[^A-Z0-9]/g, '')
+    return normalized === '21EMA' ? 'EMA21' : normalized
+  }
+
+  const hasFreshLog = (log: LogEntry): boolean => {
+    const ageMs = Date.now() - new Date(log.timestamp).getTime()
+    return Number.isFinite(ageMs) && ageMs >= 0 && ageMs <= 10 * 60 * 1000
+  }
+
+  // Use configured active instruments as the source of truth; setup logs only supply their live ATM strike.
+  const getActiveSymbols = (): ActiveSymbol[] => {
+    return apiInstruments
+      .filter((instrument) => instrument.status)
+      .map((instrument) => {
+        const configuredContract = parseOptionSymbol(instrument.brokerSymbol)
+        const baseMatch = instrument.brokerSymbol.match(/^([A-Z]+)\d+/)
+        const baseSymbol = configuredContract?.baseSymbol
+          || (baseMatch ? baseMatch[1] : instrument.brokerSymbol.toUpperCase())
+        const latestSetup = [...logs].reverse().find((log) => {
+          const contract = parseOptionSymbol(log.instrument || '')
+          return contract?.baseSymbol === baseSymbol
+            && normalizeStrategy(log.strategy || '') === normalizeStrategy(instrument.strategy)
+            && hasFreshLog(log)
+        })
+        const latestContract = latestSetup ? parseOptionSymbol(latestSetup.instrument || '') : null
+        const strike = configuredContract?.strike
+          || (instrument.premiumOptionStrike ? String(instrument.premiumOptionStrike) : undefined)
+          || latestContract?.strike
+          || '—'
+        return {
+          name: instrument.name,
+          baseSymbol,
+          strike,
+          strategy: instrument.strategy,
+          hasCE: true,
+          hasPE: true,
+        }
+      })
   }
 
   // Filter logs - exclude INFO level logs
@@ -634,25 +635,122 @@ const Logs: React.FC = () => {
 
   // Extract 3-minute logs (containing "setup" or "candle" keywords) for a specific strategy and side
   const getThreeMinuteLogs = (strategy: string, side: 'CE' | 'PE'): LogEntry[] => {
+    const activeBases = new Set(
+      getActiveSymbols()
+        .filter((instrument) => normalizeStrategy(instrument.strategy) === normalizeStrategy(strategy))
+        .map((instrument) => instrument.baseSymbol)
+    )
     return logs.filter((log) => {
-      const isCorrectStrategy = log.strategy === strategy
-      const hasCorrectSide = log.message.includes(side)
+      const contract = parseOptionSymbol(log.instrument || '')
+      const isCorrectStrategy = normalizeStrategy(log.strategy || '') === normalizeStrategy(strategy)
+      const hasCorrectSide = log.type === side
+      const isActiveInstrument = contract !== null && activeBases.has(contract.baseSymbol)
       const is3MinuteLog = log.message.toLowerCase().includes('setup') || 
                            log.message.toLowerCase().includes('candle')
-      return isCorrectStrategy && hasCorrectSide && is3MinuteLog
+      return isCorrectStrategy && hasCorrectSide && isActiveInstrument && is3MinuteLog
     })
   }
 
-  // Get the most recent (current) setup log for a side
-  const getCurrentSetup = (logs: LogEntry[]): LogEntry | null => {
-    if (logs.length === 0) return null
-    return logs[logs.length - 1] // Last log is most recent
+  const getInstrumentSetups = (strategy: string, side: 'CE' | 'PE') => {
+    return getActiveSymbols()
+      .filter((instrument) => normalizeStrategy(instrument.strategy) === normalizeStrategy(strategy))
+      .map((instrument) => {
+        const matchingLogs = getThreeMinuteLogs(strategy, side).filter((log) => {
+          const contract = parseOptionSymbol(log.instrument || '')
+          return contract?.baseSymbol === instrument.baseSymbol
+            && (instrument.strike === '—' || contract.strike === instrument.strike)
+            && Boolean(log.candleOhlc)
+            && hasFreshLog(log)
+        })
+        return {
+          instrument,
+          current: matchingLogs[matchingLogs.length - 1] || null,
+          previous: matchingLogs.length > 1 ? matchingLogs[matchingLogs.length - 2] : null,
+        }
+      })
   }
 
-  // Get the second most recent (previous) setup event for a side
-  const getPreviousSetup = (logs: LogEntry[]): LogEntry | null => {
-    if (logs.length < 2) return null
-    return logs[logs.length - 2] // Second to last
+  const getSetupFields = (log: LogEntry | null) => {
+    if (!log) return null
+    const parts = log.message.split('|').map((part) => part.trim())
+    const symbol = log.instrument || parts[1] || ''
+    const symbolMatch = symbol.match(/^([A-Z]+)(\d{1,2}[A-Z]{3}\d{2})(\d+)(CE|PE)$/)
+    const instrument = symbolMatch
+      ? `${symbolMatch[1]} ${symbolMatch[2]} ${symbolMatch[3]} ${symbolMatch[4]}`
+      : symbol || '—'
+
+    return {
+      setupName: log.setupName || parts[0] || `${log.strategy || 'EMA21'} setup`,
+      instrument,
+      status: log.setupStatus || parts[2] || '—',
+      candleTime: log.candleTime || log.message.match(/candle\s*=\s*(\d{2}:\d{2}:\d{2})/i)?.[1] || '—',
+      candleOhlc: log.candleOhlc,
+    }
+  }
+
+  const renderSetupFields = (
+    log: LogEntry | null,
+    accentClass: string,
+    fallbackInstrument?: ActiveSymbol,
+    fallbackSetupName = 'No candle data',
+    fallbackSide?: 'CE' | 'PE'
+  ) => {
+    const contract = parseOptionSymbol(log?.instrument || '')
+    const baseSymbol = contract?.baseSymbol || fallbackInstrument?.baseSymbol || 'INSTRUMENT'
+    const strike = contract?.strike || fallbackInstrument?.strike || '—'
+    const expiry = contract?.expiry
+    const side = contract?.side || fallbackSide || ''
+    const visual = getInstrumentVisual(baseSymbol)
+    const fields = log
+      ? getSetupFields(log)
+      : fallbackInstrument
+        ? {
+            setupName: fallbackSetupName,
+            instrument: `${baseSymbol} ${strike} ${fallbackSide || ''}`.trim(),
+            status: '—',
+            candleTime: '—',
+            candleOhlc: undefined,
+          }
+        : null
+    if (!fields) return null
+
+    return (
+      <dl className={`grid grid-cols-2 gap-x-3 gap-y-2 overflow-hidden rounded border border-l-4 px-3 py-2 text-xs ${accentClass} ${visual.frame}`}>
+        <div className={`col-span-2 -mx-3 -mt-2 flex items-center justify-between gap-2 border-b px-3 py-2 ${visual.header}`}>
+          <div className="flex min-w-0 items-center gap-2">
+            <span className={`shrink-0 rounded px-1.5 py-0.5 text-[10px] font-bold uppercase tracking-wider ${visual.badge}`}>
+              INDEX
+            </span>
+            <span className={`truncate text-sm font-black ${visual.name}`}>{baseSymbol}</span>
+          </div>
+          <span className={`shrink-0 rounded px-2 py-1 font-mono text-xs font-bold ${visual.badge}`}>
+            {expiry ? `${expiry} · ` : ''}{strike} {side}
+          </span>
+        </div>
+        <div className="min-w-0">
+          <dt className="text-text-tertiary">Setup</dt>
+          <dd className="mt-0.5 break-words font-semibold text-text-primary">{fields.setupName}</dd>
+        </div>
+        <div>
+          <dt className="text-text-tertiary">Status</dt>
+          <dd className="mt-0.5 font-semibold text-text-primary">{fields.status}</dd>
+        </div>
+        <div className="col-span-2">
+          <dt className="text-text-tertiary">Candle time</dt>
+          <dd className="mt-0.5 font-mono font-semibold text-text-primary">{fields.candleTime}</dd>
+        </div>
+        <div className="col-span-2 grid grid-cols-4 gap-2 border-t border-bg-tertiary/30 pt-2">
+          {(['open', 'high', 'low', 'close'] as const).map((value) => (
+            <div key={value}>
+              <dt className="text-text-tertiary">{value.toUpperCase()}</dt>
+              <dd className="mt-0.5 font-mono font-semibold text-text-primary">
+                {fields.candleOhlc?.[value] || '—'}
+              </dd>
+            </div>
+          ))}
+        </div>
+      </dl>
+    )
   }
 
   // Get completed 3-minute candle history (all logs for this side)
@@ -665,35 +763,96 @@ const Logs: React.FC = () => {
 
   // Get unique strategies that have 3-minute logs
   const getActiveStrategies = (): string[] => {
-    const activeStrategies = new Set<string>()
-    logs.forEach((log) => {
-      if (log.strategy && (log.message.toLowerCase().includes('setup') || 
-                           log.message.toLowerCase().includes('candle'))) {
-        activeStrategies.add(log.strategy)
-      }
-    })
-    return Array.from(activeStrategies)
+    return Array.from(new Set(getActiveSymbols().map((instrument) => instrument.strategy)))
   }
 
-  // Reset triggered alerts - note: since we only load recent 60-second alerts,
-  // clearing will prevent old ones from reappearing
-  const resetAlerts = () => {
+  const renderActiveInstrumentCards = () => getActiveSymbols().map((instrument) => {
+    const visual = getInstrumentVisual(instrument.baseSymbol)
+    return (
+      <div
+        key={instrument.baseSymbol}
+        className={`rounded border border-l-4 px-3 py-2 ${visual.frame}`}
+      >
+        <div className="flex items-center justify-between gap-2">
+          <div className="flex min-w-0 items-center gap-2">
+            <span className={`rounded px-1.5 py-0.5 text-[10px] font-bold uppercase tracking-wider ${visual.badge}`}>
+              INDEX
+            </span>
+            <span className={`truncate text-sm font-black ${visual.name}`}>{instrument.baseSymbol}</span>
+          </div>
+          <span className="shrink-0 text-[10px] font-semibold uppercase text-text-tertiary">
+            {instrument.strategy}
+          </span>
+        </div>
+        <div className="mt-2 flex items-center gap-2">
+          <span className="text-[10px] font-semibold uppercase text-text-tertiary">ATM</span>
+          <span className={`font-mono text-sm font-bold ${visual.name}`}>
+            {instrument.strike === '—' ? 'Pending' : instrument.strike}
+          </span>
+          {instrument.hasCE && (
+            <span className="rounded bg-accent-cyan/20 px-1.5 py-0.5 text-[10px] font-bold text-accent-cyan">CE</span>
+          )}
+          {instrument.hasPE && (
+            <span className="rounded bg-accent-red/20 px-1.5 py-0.5 text-[10px] font-bold text-accent-red">PE</span>
+          )}
+        </div>
+      </div>
+    )
+  })
+
+  // Reset hides existing CSV alerts using a durable cutoff without deleting audit records.
+  const resetAlerts = async () => {
     if (!confirm('Are you sure you want to clear all triggered alerts?')) {
       return
     }
-    // Clear the alerts array
-    setAlerts([])
-    setPreviousAlertCount(0)
-    toast.addToast({
-      type: 'success',
-      title: '✅ Alerts Cleared',
-      message: 'All triggered alerts have been cleared',
-      duration: 3000,
-    })
+    
+    try {
+      const idsToDismiss = Array.from(new Set([
+        ...dismissedAlertIds,
+        ...alerts.map((alert) => alert.id),
+      ]))
+      const response = await fetch('http://localhost:4000/api/alerts/reset', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ alertIds: idsToDismiss }),
+      })
+      
+      if (!response.ok) {
+        throw new Error(`HTTP error! status: ${response.status}`)
+      }
+      
+      const data = await response.json()
+      setDismissedAlertIds(new Set(data.dismissedIds || idsToDismiss))
+      setAlerts([])
+      setPreviousAlertCount(0)
+      toast.clearAll()
+      
+      toast.addToast({
+        type: 'success',
+        title: '✅ Alerts Cleared',
+        message: 'Existing alerts are hidden; new alerts will continue to appear',
+        duration: 3000,
+      })
+      
+      console.log('✅ Alerts cleared successfully')
+    } catch (error) {
+      console.error('Failed to reset alerts:', error)
+      toast.addToast({
+        type: 'error',
+        title: '❌ Reset Failed',
+        message: 'Failed to clear alerts. Please try again.',
+        duration: 4000,
+      })
+    }
   }
 
-  // Clear all toast messages
+  // Clear visible alert rows and toast messages for this page session.
   const clearAllMessages = () => {
+    setDismissedAlertIds((current) => new Set([...current, ...alerts.map((alert) => alert.id)]))
+    setAlerts([])
+    setPreviousAlertCount(0)
     toast.clearAll()
   }
 
@@ -880,7 +1039,7 @@ const Logs: React.FC = () => {
                   <Clock size={14} className="text-text-secondary mt-0.5 flex-shrink-0" />
                   <div className="text-xs">
                     <p className="text-text-secondary font-semibold uppercase tracking-wide">Next Open</p>
-                    <p className="text-text-primary font-mono font-bold mt-1">09:00:00 AM IST</p>
+                    <p className="text-text-primary font-mono font-bold mt-1">09:15:00 AM IST</p>
                   </div>
                 </div>
               </div>
@@ -919,25 +1078,16 @@ const Logs: React.FC = () => {
                   <div className="flex items-center justify-center w-10 h-10 rounded-lg bg-accent-cyan/20">
                     <TrendingUp size={20} className="text-accent-cyan" />
                   </div>
-                  <p className="text-xs uppercase text-text-secondary font-semibold">Active Symbols</p>
+                  <p className="text-xs uppercase text-text-secondary font-semibold">Active Instruments</p>
                 </div>
-                <p className="text-xs text-text-tertiary">Last: {getLatestCandleTime()}</p>
+                <div className="text-right">
+                  <p className="text-xs font-bold text-accent-green">{getActiveSymbols().length} monitored</p>
+                  <p className="text-[10px] text-text-tertiary">Last: {getLatestCandleTime()}</p>
+                </div>
               </div>
-              <div className="space-y-2 pl-4">
+              <div className="grid grid-cols-1 gap-2 pl-4">
                 {getActiveSymbols().length > 0 ? (
-                  getActiveSymbols().map((symbol, idx) => (
-                    <div key={idx} className="flex items-center gap-3">
-                      <p className="text-sm text-text-secondary font-semibold">
-                        {symbol.strategy} <span className="text-text-tertiary/60">-</span> {symbol.baseSymbol} <span className="text-accent-cyan font-bold">{symbol.strike}</span>
-                        {symbol.hasCE && (
-                          <span className="ml-2 px-1.5 py-0.5 text-xs font-bold rounded bg-accent-cyan/20 text-accent-cyan">CE</span>
-                        )}
-                        {symbol.hasPE && (
-                          <span className="ml-1 px-1.5 py-0.5 text-xs font-bold rounded bg-accent-red/20 text-accent-red">PE</span>
-                        )}
-                      </p>
-                    </div>
-                  ))
+                  renderActiveInstrumentCards()
                 ) : (
                   <div className="space-y-1">
                     <p className="text-sm text-text-secondary">No active symbols</p>
@@ -956,29 +1106,17 @@ const Logs: React.FC = () => {
                   <div className="flex items-center justify-center w-10 h-10 rounded-lg bg-bg-tertiary/20">
                     <TrendingUp size={20} className="text-text-secondary" />
                   </div>
-                  <p className="text-xs uppercase text-text-secondary font-semibold">Active Symbols</p>
+                  <p className="text-xs uppercase text-text-secondary font-semibold">Active Instruments</p>
                 </div>
-                <p className="text-xs text-text-tertiary">Waiting...</p>
+                <p className="text-xs font-semibold text-text-tertiary">{getActiveSymbols().length} monitored</p>
               </div>
-              <div className="space-y-2 pl-4">
+              <div className="grid grid-cols-1 gap-2 pl-4">
                 {getActiveSymbols().length > 0 ? (
-                  getActiveSymbols().map((symbol, idx) => (
-                    <div key={idx} className="flex items-center gap-3">
-                      <p className="text-sm text-text-secondary font-semibold">
-                        {symbol.strategy} <span className="text-text-tertiary/60">-</span> {symbol.baseSymbol} <span className="text-text-tertiary font-bold">{symbol.strike}</span>
-                        {symbol.hasCE && (
-                          <span className="ml-2 px-1.5 py-0.5 text-xs font-bold rounded bg-bg-tertiary/30 text-text-secondary">CE</span>
-                        )}
-                        {symbol.hasPE && (
-                          <span className="ml-1 px-1.5 py-0.5 text-xs font-bold rounded bg-bg-tertiary/30 text-text-secondary">PE</span>
-                        )}
-                      </p>
-                    </div>
-                  ))
+                  renderActiveInstrumentCards()
                 ) : (
                   <div className="space-y-1">
                     <p className="text-sm text-text-secondary">No active symbols</p>
-                    <p className="text-xs text-text-secondary/60">Market is closed</p>
+                    <p className="text-xs text-text-secondary/60">Market closed - resume monitoring at 9:15 AM IST</p>
                   </div>
                 )}
               </div>
@@ -1051,6 +1189,8 @@ const Logs: React.FC = () => {
           return strategies.map((strategy) => {
             const ceLogs = getThreeMinuteLogs(strategy, 'CE')
             const peLogs = getThreeMinuteLogs(strategy, 'PE')
+            const ceInstrumentSetups = getInstrumentSetups(strategy, 'CE')
+            const peInstrumentSetups = getInstrumentSetups(strategy, 'PE')
             const historyLogs = get3MinuteCandleHistory(ceLogs)
             const historyLogsP = get3MinuteCandleHistory(peLogs)
 
@@ -1071,37 +1211,48 @@ const Logs: React.FC = () => {
                         <div className="w-3 h-3 bg-accent-cyan rounded-full"></div>
                         <h4 className="text-sm font-bold text-accent-cyan">CE · Call option</h4>
                       </div>
-                      <div className="text-xs text-text-tertiary font-semibold">{Math.min(ceLogs.length, 60)} latest rows</div>
+                      <div className="text-xs text-text-tertiary font-semibold">{Math.min(ceLogs.length, 25)} latest rows</div>
                     </div>
 
                     {!isMarketOpen() ? (
                       <div className="text-center py-12">
                         <AlertCircle size={32} className="mx-auto mb-3 text-accent-cyan/50" />
                         <p className="text-sm font-semibold text-accent-cyan mb-1">Waiting for Market Open</p>
-                        <p className="text-xs text-text-tertiary">Signals will appear here during market hours (9 AM - 3:30 PM IST)</p>
+                        <p className="text-xs text-text-tertiary">Signals will appear here during market hours (9:15 AM - 3:30 PM IST)</p>
                       </div>
-                    ) : ceLogs.length > 0 ? (
+                    ) : ceInstrumentSetups.length > 0 ? (
                       <div className="space-y-3">
                         {/* Current setup */}
-                        {getCurrentSetup(ceLogs) && (
-                          <div className="space-y-2">
-                            <p className="text-xs font-bold text-accent-cyan uppercase tracking-wider">Current setup</p>
-                            <div className="text-xs space-y-1 px-3 py-2 bg-bg-secondary/50 rounded border border-accent-cyan/30 font-mono text-text-primary">
-                              <p>{getCurrentSetup(ceLogs)?.message}</p>
+                        <div className="space-y-2">
+                          <p className="text-xs font-bold text-accent-cyan uppercase tracking-wider">Current setup</p>
+                          {ceInstrumentSetups.map(({ instrument, current }) => (
+                            <div key={instrument.baseSymbol}>
+                              {renderSetupFields(
+                                current,
+                                'border-accent-cyan/30',
+                                instrument,
+                                'No candle data',
+                                'CE'
+                              )}
                             </div>
-                          </div>
-                        )}
+                          ))}
+                        </div>
 
                         {/* Previous setup event */}
-                        {getPreviousSetup(ceLogs) && (
-                          <div className="space-y-2">
-                            <p className="text-xs font-bold text-text-secondary uppercase tracking-wider">Previous setup event</p>
-                            <p className="text-xs text-text-tertiary">Time: {formatTime(getPreviousSetup(ceLogs)?.timestamp || '')}</p>
-                            <div className="text-xs space-y-1 px-3 py-2 bg-bg-secondary/50 rounded border border-accent-cyan/30 font-mono text-text-primary">
-                              <p>{getPreviousSetup(ceLogs)?.message}</p>
+                        <div className="space-y-2">
+                          <p className="text-xs font-bold text-text-secondary uppercase tracking-wider">Previous setup event</p>
+                          {ceInstrumentSetups.map(({ instrument, previous }) => (
+                            <div key={instrument.baseSymbol}>
+                              {renderSetupFields(
+                                previous,
+                                'border-accent-cyan/30',
+                                instrument,
+                                'No previous candle',
+                                'CE'
+                              )}
                             </div>
-                          </div>
-                        )}
+                          ))}
+                        </div>
 
                         {/* Completed 3-minute candles */}
                         <div className="space-y-2">
@@ -1109,24 +1260,26 @@ const Logs: React.FC = () => {
                           {historyLogs.length > 0 ? (
                             <div className="bg-bg-secondary/30 rounded border border-accent-cyan/30 overflow-hidden">
                               {/* Table Header */}
-                              <div className="grid grid-cols-3 gap-3 px-3 py-2 bg-bg-secondary/50 border-b border-accent-cyan/30 font-bold text-text-secondary text-xs sticky top-0">
-                                <div>Time</div>
-                                <div>Level</div>
-                                <div>Message</div>
+                              <div className="grid grid-cols-4 gap-2 px-3 py-2 bg-bg-secondary/50 border-b border-accent-cyan/30 font-bold text-text-secondary text-xs sticky top-0">
+                                <div>Setup</div>
+                                <div>Instrument</div>
+                                <div>Status</div>
+                                <div>Candle time</div>
                               </div>
-                              {/* Table Body - Max 60 rows */}
+                              {/* Table Body - Max 25 rows */}
                               <div className="max-h-96 overflow-y-auto">
-                                {historyLogs.slice(0, 60).map((log, idx) => (
-                                  <div key={idx} className="grid grid-cols-3 gap-3 px-3 py-2 border-b border-accent-cyan/10 text-xs text-text-secondary hover:bg-bg-secondary/20 transition-colors">
-                                    <div className="font-mono text-text-tertiary">{formatTime(log.timestamp)}</div>
-                                    <div>
-                                      <Badge size="sm" variant={getLevelColor(log.level)}>
-                                        {log.level}
-                                      </Badge>
+                                {historyLogs.slice(0, 25).map((log, idx) => {
+                                  const fields = getSetupFields(log)
+                                  if (!fields) return null
+                                  return (
+                                    <div key={idx} className="grid grid-cols-4 gap-2 px-3 py-2 border-b border-accent-cyan/10 text-xs text-text-secondary hover:bg-bg-secondary/20 transition-colors">
+                                      <div className="break-words text-text-primary">{fields.setupName}</div>
+                                      <div className="break-words text-text-primary">{fields.instrument}</div>
+                                      <div className="break-words">{fields.status}</div>
+                                      <div className="font-mono">{fields.candleTime}</div>
                                     </div>
-                                    <div className="text-text-primary break-words" title={log.message}>{log.message}</div>
-                                  </div>
-                                ))}
+                                  )
+                                })}
                               </div>
                             </div>
                           ) : (
@@ -1149,37 +1302,48 @@ const Logs: React.FC = () => {
                         <div className="w-3 h-3 bg-accent-red rounded-full"></div>
                         <h4 className="text-sm font-bold text-accent-red">PE · Put option</h4>
                       </div>
-                      <div className="text-xs text-text-tertiary font-semibold">{Math.min(peLogs.length, 60)} latest rows</div>
+                      <div className="text-xs text-text-tertiary font-semibold">{Math.min(peLogs.length, 25)} latest rows</div>
                     </div>
 
                     {!isMarketOpen() ? (
                       <div className="text-center py-12">
                         <AlertCircle size={32} className="mx-auto mb-3 text-accent-red/50" />
                         <p className="text-sm font-semibold text-accent-red mb-1">Waiting for Market Open</p>
-                        <p className="text-xs text-text-tertiary">Signals will appear here during market hours (9 AM - 3:30 PM IST)</p>
+                        <p className="text-xs text-text-tertiary">Signals will appear here during market hours (9:15 AM - 3:30 PM IST)</p>
                       </div>
-                    ) : peLogs.length > 0 ? (
+                    ) : peInstrumentSetups.length > 0 ? (
                       <div className="space-y-3">
                         {/* Current setup */}
-                        {getCurrentSetup(peLogs) && (
-                          <div className="space-y-2">
-                            <p className="text-xs font-bold text-accent-red uppercase tracking-wider">Current setup</p>
-                            <div className="text-xs space-y-1 px-3 py-2 bg-bg-secondary/50 rounded border border-accent-red/30 font-mono text-text-primary">
-                              <p>{getCurrentSetup(peLogs)?.message}</p>
+                        <div className="space-y-2">
+                          <p className="text-xs font-bold text-accent-red uppercase tracking-wider">Current setup</p>
+                          {peInstrumentSetups.map(({ instrument, current }) => (
+                            <div key={instrument.baseSymbol}>
+                              {renderSetupFields(
+                                current,
+                                'border-accent-red/30',
+                                instrument,
+                                'No candle data',
+                                'PE'
+                              )}
                             </div>
-                          </div>
-                        )}
+                          ))}
+                        </div>
 
                         {/* Previous setup event */}
-                        {getPreviousSetup(peLogs) && (
-                          <div className="space-y-2">
-                            <p className="text-xs font-bold text-text-secondary uppercase tracking-wider">Previous setup event</p>
-                            <p className="text-xs text-text-tertiary">Time: {formatTime(getPreviousSetup(peLogs)?.timestamp || '')}</p>
-                            <div className="text-xs space-y-1 px-3 py-2 bg-bg-secondary/50 rounded border border-accent-red/30 font-mono text-text-primary">
-                              <p>{getPreviousSetup(peLogs)?.message}</p>
+                        <div className="space-y-2">
+                          <p className="text-xs font-bold text-text-secondary uppercase tracking-wider">Previous setup event</p>
+                          {peInstrumentSetups.map(({ instrument, previous }) => (
+                            <div key={instrument.baseSymbol}>
+                              {renderSetupFields(
+                                previous,
+                                'border-accent-red/30',
+                                instrument,
+                                'No previous candle',
+                                'PE'
+                              )}
                             </div>
-                          </div>
-                        )}
+                          ))}
+                        </div>
 
                         {/* Completed 3-minute candles */}
                         <div className="space-y-2">
@@ -1187,24 +1351,26 @@ const Logs: React.FC = () => {
                           {historyLogsP.length > 0 ? (
                             <div className="bg-bg-secondary/30 rounded border border-accent-red/30 overflow-hidden">
                               {/* Table Header */}
-                              <div className="grid grid-cols-3 gap-3 px-3 py-2 bg-bg-secondary/50 border-b border-accent-red/30 font-bold text-text-secondary text-xs sticky top-0">
-                                <div>Time</div>
-                                <div>Level</div>
-                                <div>Message</div>
+                              <div className="grid grid-cols-4 gap-2 px-3 py-2 bg-bg-secondary/50 border-b border-accent-red/30 font-bold text-text-secondary text-xs sticky top-0">
+                                <div>Setup</div>
+                                <div>Instrument</div>
+                                <div>Status</div>
+                                <div>Candle time</div>
                               </div>
-                              {/* Table Body - Max 60 rows */}
+                              {/* Table Body - Max 25 rows */}
                               <div className="max-h-96 overflow-y-auto">
-                                {historyLogsP.slice(0, 60).map((log, idx) => (
-                                  <div key={idx} className="grid grid-cols-3 gap-3 px-3 py-2 border-b border-accent-red/10 text-xs text-text-secondary hover:bg-bg-secondary/20 transition-colors">
-                                    <div className="font-mono text-text-tertiary">{formatTime(log.timestamp)}</div>
-                                    <div>
-                                      <Badge size="sm" variant={getLevelColor(log.level)}>
-                                        {log.level}
-                                      </Badge>
+                                {historyLogsP.slice(0, 25).map((log, idx) => {
+                                  const fields = getSetupFields(log)
+                                  if (!fields) return null
+                                  return (
+                                    <div key={idx} className="grid grid-cols-4 gap-2 px-3 py-2 border-b border-accent-red/10 text-xs text-text-secondary hover:bg-bg-secondary/20 transition-colors">
+                                      <div className="break-words text-text-primary">{fields.setupName}</div>
+                                      <div className="break-words text-text-primary">{fields.instrument}</div>
+                                      <div className="break-words">{fields.status}</div>
+                                      <div className="font-mono">{fields.candleTime}</div>
                                     </div>
-                                    <div className="text-text-primary break-words" title={log.message}>{log.message}</div>
-                                  </div>
-                                ))}
+                                  )
+                                })}
                               </div>
                             </div>
                           ) : (
@@ -1240,29 +1406,27 @@ const Logs: React.FC = () => {
             <button
               onClick={clearAllMessages}
               className="flex items-center gap-2 px-3 py-1.5 text-xs font-medium text-accent-red/70 hover:text-accent-red bg-accent-red/10 hover:bg-accent-red/20 rounded transition-all"
-              title="Clear all alert toast messages"
+              title="Clear visible alert rows and toast messages"
             >
               <X size={14} />
               Clear Messages
             </button>
-            {alerts.length > 0 && (
-              <>
-                <button
-                  onClick={exportAlertsToCSV}
-                  className="flex items-center gap-2 px-3 py-1.5 text-xs font-medium text-white/70 hover:text-white bg-bg-tertiary/50 hover:bg-bg-tertiary/80 rounded transition-all"
-                >
-                  <Download size={14} />
-                  Export
-                </button>
-                <button
-                  onClick={resetAlerts}
-                  className="flex items-center gap-2 px-3 py-1.5 text-xs font-medium text-white/70 hover:text-white bg-bg-tertiary/50 hover:bg-bg-tertiary/80 rounded transition-all hover:bg-red-900/30"
-                >
-                  <RotateCcw size={14} />
-                  Reset
-                </button>
-              </>
-            )}
+            <button
+              onClick={exportAlertsToCSV}
+              disabled={alerts.length === 0}
+              className="flex items-center gap-2 px-3 py-1.5 text-xs font-medium text-white/70 hover:text-white bg-bg-tertiary/50 hover:bg-bg-tertiary/80 rounded transition-all disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              <Download size={14} />
+              Export
+            </button>
+            <button
+              onClick={resetAlerts}
+              className="flex items-center gap-2 px-3 py-1.5 text-xs font-medium text-white/70 hover:text-white bg-bg-tertiary/50 hover:bg-bg-tertiary/80 rounded transition-all hover:bg-red-900/30"
+              title="Hide existing triggered alerts without deleting CSV history"
+            >
+              <RotateCcw size={14} />
+              Reset
+            </button>
           </div>
         </div>
 
@@ -1299,11 +1463,16 @@ const Logs: React.FC = () => {
                         {alert.message}
                       </td>
                       <td className="px-4 py-2 text-center">
-                        <Badge 
-                          variant={alert.status === 'PENDING' ? 'warning' : 'success'}
+                        <span 
+                          className={clsx(
+                            'inline-block px-3 py-1 rounded-full text-xs font-bold border',
+                            alert.status === 'ACTIVE' 
+                              ? 'bg-green-500/20 text-green-400 border-green-500/50' 
+                              : 'bg-red-500/20 text-red-400 border-red-500/50'
+                          )}
                         >
                           {alert.status}
-                        </Badge>
+                        </span>
                       </td>
                     </tr>
                   ))}

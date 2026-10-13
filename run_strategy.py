@@ -370,12 +370,8 @@ def _run_multi_script_live(
     _setup_logging(args.log_level)
     _load_dotenv_if_present()
     
-    # Create a broker (shared across all scripts)
-    base_cfg = StrategyConfig()
-    broker = _build_broker(base_cfg, dry_run=dry_run)
-    
-    # Create engines for each script
-    engines: list[tuple[str, BaseStrategyEngine]] = []
+    # Each script has its own spot feed, ATM lock, option symbols, and checkpoint.
+    runners: list[tuple[str, LiveFeedRunner]] = []
     for script in scripts:
         # Create fresh config for each script, discovering its profile
         cfg = StrategyConfig()
@@ -410,26 +406,37 @@ def _run_multi_script_live(
         if args.max_sl is not None:
             risk.max_sl_per_day = args.max_sl
         
+        broker = _build_broker(cfg, dry_run=dry_run)
         engine = BaseStrategyEngine(cfg, risk, broker, signal_provider)
         engine.persist_alerts = True
         engine.diagnose = diagnose
         engine.verbose = verbose
-        
-        # Use script as the engine identifier
-        engines.append((script, engine))
+
+        runners.append((script, LiveFeedRunner(engine, broker, cfg)))
         logger.info("Created engine for script=%s strategy=%s", script, strategy_name)
     
     print("[ORDER ROUTING] " + ("PAPER mode: orders are simulated" if dry_run else "LIVE mode: orders will be sent to OpenAlgo"))
     
-    # Run all engines together
-    base_cfg = StrategyConfig()
-    runner = MultiEngineLiveFeedRunner(engines, broker, base_cfg)
+    threads = [
+        threading.Thread(
+            target=runner.run_forever,
+            name=f"{script.lower()}-live-feed",
+        )
+        for script, runner in runners
+    ]
+    for thread in threads:
+        thread.start()
+
     try:
-        logger.info("Starting multi-script live runner for scripts=%s strategy=%s", scripts, strategy_name)
-        runner.run_forever()
+        logger.info("Starting independent live runners for scripts=%s strategy=%s", scripts, strategy_name)
+        for thread in threads:
+            thread.join()
     except KeyboardInterrupt:
         logger.info("interrupted; stopping runner")
-        runner.stop()
+        for _, runner in runners:
+            runner.stop()
+        for thread in threads:
+            thread.join()
 
 
 def _run_mixed_live(

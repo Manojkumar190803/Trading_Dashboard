@@ -28,12 +28,11 @@ interface FormData {
 
 const Instruments: React.FC = () => {
   const { trailingStopsConfig, setTrailingStopsConfig, resetTrailingStopsConfig } = useAppStore()
-  const { instruments, isLoading, error, addInstrument: apiAddInstrument, updateInstrument: apiUpdateInstrument, deleteInstrument: apiDeleteInstrument, toggleInstrument: apiToggleInstrument } = useInstruments()
+  const { instruments, isLoading, error, addInstrument: apiAddInstrument, updateInstrument: apiUpdateInstrument, deleteInstrument: apiDeleteInstrument, toggleInstrument: apiToggleInstrument } = useInstruments(true)
   const [showForm, setShowForm] = useState(false)
   const [editingId, setEditingId] = useState<string | null>(null)
   const [searchTerm, setSearchTerm] = useState('')
   const [strategyFilter, setStrategyFilter] = useState<string>('ALL')
-  const [filterStatus, setFilterStatus] = useState<string>('ALL')
   const [symbolSuggestions, setSymbolSuggestions] = useState<string[]>([])
   const [showSymbolDropdown, setShowSymbolDropdown] = useState(false)
   const symbolDropdownRef = useRef<HTMLDivElement>(null)
@@ -136,9 +135,10 @@ const Instruments: React.FC = () => {
   const filteredInstruments = instruments.filter((inst) => {
     const matchSearch = inst.name.toLowerCase().includes(searchTerm.toLowerCase())
     const matchStrategy = strategyFilter === 'ALL' || inst.strategy === strategyFilter
-    const matchStatus = filterStatus === 'ALL' || (filterStatus === 'ACTIVE' ? inst.status : !inst.status)
-    return matchSearch && matchStrategy && matchStatus
+    return matchSearch && matchStrategy
   })
+  const activeInstruments = filteredInstruments.filter((instrument) => instrument.status)
+  const inactiveInstruments = filteredInstruments.filter((instrument) => !instrument.status)
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault()
@@ -215,6 +215,14 @@ const Instruments: React.FC = () => {
     setShowForm(true)
   }
 
+  const handleToggle = async (inst: Instrument) => {
+    const result = await apiToggleInstrument(inst.id)
+    if (!result.success) {
+      const action = inst.status ? 'deactivate' : 'activate'
+      alert(`Unable to ${action} ${inst.name}: ${result.error}`)
+    }
+  }
+
   const handleCancel = () => {
     setShowForm(false)
     setEditingId(null)
@@ -249,7 +257,7 @@ const Instruments: React.FC = () => {
       </div>
 
       {/* Filters */}
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
         <input
           type="text"
           placeholder="Search by name..."
@@ -266,15 +274,6 @@ const Instruments: React.FC = () => {
           {STRATEGIES.map((strat) => (
             <option key={strat} value={strat}>{strat}</option>
           ))}
-        </select>
-        <select
-          value={filterStatus}
-          onChange={(e) => setFilterStatus(e.target.value)}
-          className="px-4 py-2 bg-bg-secondary border border-bg-tertiary rounded-lg text-text-primary focus:outline-none focus:border-accent-cyan focus:ring-1 focus:ring-accent-cyan"
-        >
-          <option value="ALL">All Status</option>
-          <option value="ACTIVE">Active</option>
-          <option value="INACTIVE">Inactive</option>
         </select>
       </div>
 
@@ -471,10 +470,10 @@ const Instruments: React.FC = () => {
 
       {/* Instruments Table */}
       <div className="bg-bg-secondary rounded-lg border border-bg-tertiary overflow-hidden">
-        {filteredInstruments.length === 0 ? (
+        {activeInstruments.length === 0 ? (
           <div className="text-center py-12">
             <AlertCircle size={48} className="mx-auto text-text-tertiary mb-4" />
-            <p className="text-text-secondary">No instruments configured yet. Add one to get started!</p>
+            <p className="text-text-secondary">No active instruments match these filters.</p>
           </div>
         ) : (
           <div className="overflow-x-auto">
@@ -491,7 +490,7 @@ const Instruments: React.FC = () => {
                 </tr>
               </thead>
               <tbody>
-                {filteredInstruments.map((inst) => (
+                {activeInstruments.map((inst) => (
                   <tr
                     key={inst.id}
                     className="border-b border-bg-tertiary hover:bg-bg-primary/50 transition-colors"
@@ -548,13 +547,14 @@ const Instruments: React.FC = () => {
                     <td className="px-6 py-4">
                       <div className="flex items-center justify-center gap-2">
                         <button
-                          onClick={() => apiToggleInstrument(inst.id)}
+                          onClick={() => void handleToggle(inst)}
+                          aria-label={inst.status ? `Deactivate ${inst.name}` : `Activate ${inst.name}`}
                           className={`p-2 rounded transition-colors ${
                             inst.status 
                               ? 'text-accent-green hover:text-accent-cyan hover:bg-accent-green/10' 
                               : 'text-accent-red hover:text-accent-cyan hover:bg-accent-red/10'
                           }`}
-                          title={inst.status ? 'Archive (Hide from active list)' : 'Restore (Enable monitoring)'}
+                          title={inst.status ? 'Deactivate instrument' : 'Activate instrument'}
                         >
                           <Power size={18} />
                         </button>
@@ -734,8 +734,56 @@ const Instruments: React.FC = () => {
         )}
       </div>
 
+      {inactiveInstruments.length > 0 && (
+        <section className="space-y-4" aria-labelledby="inactive-instruments-heading">
+          <div className="flex items-center justify-between border-b border-accent-yellow/30 pb-3">
+            <div>
+              <h2 id="inactive-instruments-heading" className="text-lg font-bold text-accent-yellow">
+                Inactive Instruments
+              </h2>
+              <p className="mt-1 text-xs text-text-secondary">
+                Saved configurations, excluded from monitoring until activated.
+              </p>
+            </div>
+            <span className="rounded-full border border-accent-yellow/30 bg-accent-yellow/10 px-3 py-1 text-xs font-bold text-accent-yellow">
+              {inactiveInstruments.length} inactive
+            </span>
+          </div>
+          <div className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-3">
+            {inactiveInstruments.map((instrument) => (
+              <div
+                key={instrument.id}
+                className="flex items-center justify-between gap-4 rounded-lg border border-l-4 border-accent-yellow/40 border-l-accent-yellow bg-gradient-to-r from-accent-yellow/10 to-bg-secondary/60 p-4"
+              >
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2">
+                    <AlertCircle size={16} className="shrink-0 text-accent-yellow" />
+                    <h3 className="truncate font-bold text-text-primary">{instrument.name}</h3>
+                    <span className="shrink-0 rounded bg-accent-yellow/15 px-2 py-0.5 text-[10px] font-bold uppercase text-accent-yellow">
+                      Inactive
+                    </span>
+                  </div>
+                  <p className="mt-1 truncate pl-6 font-mono text-xs text-text-secondary">
+                    {instrument.brokerSymbol} <span className="px-1 text-text-tertiary">·</span> {instrument.strategy}
+                  </p>
+                </div>
+                <button
+                  onClick={() => void handleToggle(instrument)}
+                  aria-label={`Activate ${instrument.name}`}
+                  title={`Activate ${instrument.name}`}
+                  className="flex shrink-0 items-center gap-2 rounded border border-accent-green/40 bg-accent-green/10 px-3 py-2 text-xs font-bold text-accent-green transition-colors hover:bg-accent-green/20"
+                >
+                  <Power size={15} />
+                  Activate
+                </button>
+              </div>
+            ))}
+          </div>
+        </section>
+      )}
+
       {/* Summary */}
-      {filteredInstruments.length > 0 && (
+      {instruments.length > 0 && (
         <div className="grid grid-cols-3 gap-4">
           <div className="bg-bg-secondary rounded-lg border border-bg-tertiary p-4">
             <p className="text-text-secondary text-sm mb-1">Total Instruments</p>

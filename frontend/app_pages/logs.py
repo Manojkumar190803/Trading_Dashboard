@@ -864,9 +864,22 @@ def _setup_candle_timestamp(message: object, timestamp: pd.Timestamp) -> pd.Time
     )
 
 
-def _latest_persisted_option_symbols(target_date: date) -> dict[str, str]:
-    """Recover the worker's current CE/PE symbols for the dashboard header."""
-    latest: dict[str, tuple[pd.Timestamp, str]] = {}
+def _option_symbol_root(symbol: object) -> str:
+    match = re.match(r"^([A-Z]+)\d", str(symbol or "").strip().upper())
+    return match.group(1) if match else ""
+
+
+def _option_symbol_strike(symbol: object) -> int | None:
+    match = re.fullmatch(
+        r"[A-Z]+\d{2}[A-Z]{3}\d{2}(\d+)(?:CE|PE)",
+        str(symbol or "").strip().upper(),
+    )
+    return int(match.group(1)) if match else None
+
+
+def _latest_persisted_option_symbols(target_date: date) -> dict[str, dict[str, str]]:
+    """Recover the latest CE/PE symbols grouped by their option index root."""
+    latest: dict[tuple[str, str], tuple[int, pd.Timestamp, str]] = {}
     for path in sorted(LOGS_DIR.glob("monitoring_*.csv")):
         try:
             monitoring_df = pd.read_csv(path)
@@ -876,7 +889,8 @@ def _latest_persisted_option_symbols(target_date: date) -> dict[str, str]:
         if not required.issubset(monitoring_df.columns):
             continue
         for _, row in monitoring_df.iterrows():
-            if str(row.get("category") or "").upper() != "SETUP_STATUS":
+            category = str(row.get("category") or "").upper()
+            if category not in {"SETUP_STATUS", "DATA"}:
                 continue
             timestamp = pd.to_datetime(row.get("timestamp"), errors="coerce")
             if pd.isna(timestamp):
@@ -888,13 +902,35 @@ def _latest_persisted_option_symbols(target_date: date) -> dict[str, str]:
             if timestamp.date() != target_date:
                 continue
             message = str(row.get("message") or "").upper()
-            side = "CE" if message.startswith("CE ") else "PE" if message.startswith("PE ") else ""
-            symbol = str(row.get("symbol") or "").strip()
-            if side and symbol and symbol != "-" and (
-                side not in latest or timestamp >= latest[side][0]
-            ):
-                latest[side] = (timestamp, symbol)
-    return {side: value[1] for side, value in latest.items()}
+            if category == "DATA":
+                if "3M CANDLE" not in message:
+                    continue
+                candidates = [
+                    (symbol[-2:], symbol)
+                    for symbol in re.findall(
+                        r"\b([A-Z]+\d{2}[A-Z]{3}\d{2}\d+(?:CE|PE))\b",
+                        message,
+                    )
+                ]
+                source_priority = 1
+            else:
+                side = "CE" if message.startswith("CE ") else "PE" if message.startswith("PE ") else ""
+                symbol = str(row.get("symbol") or "").strip().upper()
+                candidates = [(side, symbol)] if side and symbol and symbol != "-" else []
+                source_priority = 0
+
+            for side, symbol in candidates:
+                root = _option_symbol_root(symbol)
+                key = (root, side)
+                rank = (source_priority, timestamp)
+                if root and side in {"CE", "PE"} and (
+                    key not in latest or rank >= latest[key][:2]
+                ):
+                    latest[key] = (source_priority, timestamp, symbol)
+    symbols_by_root: dict[str, dict[str, str]] = {}
+    for (root, side), (_, _, symbol) in latest.items():
+        symbols_by_root.setdefault(root, {})[side] = symbol
+    return symbols_by_root
 
 
 def _combined_logs_for_date(engine: BaseStrategyEngine | None, target_date: date) -> pd.DataFrame:
@@ -1442,20 +1478,39 @@ for instrument in selected_instruments:
     if state_runtime is not None and state_runtime.active_keys:
         state_engine = state_runtime.engines.get(state_runtime.active_keys[0])
     state_snapshot = state_engine.get_status_snapshot() if state_engine is not None else {}
+    instrument_config = dict(instrument_configs.get(instrument) or {})
+    if not instrument_config:
+        instrument_config = dict((state.get("source_params") or {}).get("instrument_config") or {})
+    instrument_root = str(
+        instrument_config.get("option_index_symbol")
+        or instrument_config.get("spot_symbol")
+        or ""
+    ).strip().upper()
+    if not instrument_root:
+        instrument_name = re.sub(r"[^A-Z0-9]", "", instrument.upper())
+        instrument_root = next(
+            (root for root in ("BANKNIFTY", "NIFTY", "SENSEX") if root in instrument_name),
+            instrument_name,
+        )
     spot = str(
-        dict(instrument_configs.get(instrument) or {}).get("symbol")
+        instrument_config.get("symbol")
         or (state.get("source_params") or {}).get("openalgo_symbol")
         or instrument
     )
     ce_symbol = state_snapshot.get("ce_symbol")
     pe_symbol = state_snapshot.get("pe_symbol")
     atm_strike = state_snapshot.get("atm_strike")
-    ce_symbol = ce_symbol or persisted_option_symbols.get("CE")
-    pe_symbol = pe_symbol or persisted_option_symbols.get("PE")
+    if ce_symbol and _option_symbol_root(ce_symbol) != instrument_root:
+        ce_symbol = None
+        atm_strike = None
+    if pe_symbol and _option_symbol_root(pe_symbol) != instrument_root:
+        pe_symbol = None
+        atm_strike = None
+    persisted_symbols = persisted_option_symbols.get(instrument_root, {})
+    ce_symbol = ce_symbol or persisted_symbols.get("CE")
+    pe_symbol = pe_symbol or persisted_symbols.get("PE")
     if not atm_strike:
-        strike_match = re.search(r"(\d+)(?:CE|PE)$", str(ce_symbol or pe_symbol or ""))
-        if strike_match:
-            atm_strike = int(strike_match.group(1))
+        atm_strike = _option_symbol_strike(ce_symbol or pe_symbol)
     if ce_symbol or pe_symbol:
         instrument_symbol_labels.append(
             f"{instrument}: ATM {int(atm_strike) if atm_strike else '-'} | "
