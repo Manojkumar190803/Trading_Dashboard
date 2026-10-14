@@ -8,6 +8,18 @@
 /* Dark Theme (Default) */
 :root {
   color-scheme: dark;
+  --bg-primary-rgb: 10 14 39;
+  --bg-secondary-rgb: 17 25 51;
+  --bg-tertiary-rgb: 26 31 58;
+  --bg-surface-rgb: 35 45 77;
+  --text-primary-rgb: 242 248 255;
+  --text-secondary-rgb: 169 194 204;
+  --text-tertiary-rgb: 142 156 176;
+  --accent-cyan-rgb: 89 208 255;
+  --accent-green-rgb: 39 212 138;
+  --accent-red-rgb: 255 95 109;
+  --accent-yellow-rgb: 255 190 50;
+  --accent-blue-rgb: 74 158 255;
 }
 
 /* ==================== Custom Global Styles ==================== */

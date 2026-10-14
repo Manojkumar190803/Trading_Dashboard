@@ -410,7 +410,7 @@ export const useRealWalletData = (shouldFetch = true, interval = 1000) => {
 /**
  * Hook to fetch daily P&L analytics
  */
-export const useDailyPnL = () => {
+export const useDailyPnL = (year: number, month: number) => {
   const [dailyData, setDailyData] = useState<{
     month: string
     year: number
@@ -433,7 +433,7 @@ export const useDailyPnL = () => {
       setIsLoading(true)
       setError(null)
       
-      const response = await fetch('/api/analytics/daily')
+      const response = await fetch(`/api/analytics/daily?year=${year}&month=${month}`)
       if (response.ok) {
         const data = await response.json()
         setDailyData(data)
@@ -444,7 +444,7 @@ export const useDailyPnL = () => {
     } finally {
       setIsLoading(false)
     }
-  }, [])
+  }, [year, month])
 
   useEffect(() => {
     fetchDailyData()
@@ -454,7 +454,10 @@ export const useDailyPnL = () => {
 
   const resetDaily = useCallback(async () => {
     try {
-      const response = await fetch('/api/analytics/daily/reset', { method: 'POST' })
+      const response = await fetch(
+        `/api/analytics/daily/reset?year=${year}&month=${month}`,
+        { method: 'POST' }
+      )
       if (response.ok) {
         // Refetch after reset
         await fetchDailyData()
@@ -462,7 +465,7 @@ export const useDailyPnL = () => {
     } catch (err) {
       console.error('Failed to reset daily analytics:', err)
     }
-  }, [fetchDailyData])
+  }, [fetchDailyData, year, month])
 
   return { dailyData, isLoading, error, refetch: fetchDailyData, reset: resetDaily }
 }

@@ -316,7 +316,11 @@ app.get('/api/analytics/summary', async (req, res) => {
 app.get('/api/analytics/daily', async (req, res) => {
   try {
     const backendUrl = process.env.BACKEND_URL || 'http://strategy_worker:5003'
-    const response = await fetch(`${backendUrl}/api/analytics/daily`)
+    const query = new URLSearchParams()
+    if (typeof req.query.year === 'string') query.set('year', req.query.year)
+    if (typeof req.query.month === 'string') query.set('month', req.query.month)
+    const suffix = query.size ? `?${query.toString()}` : ''
+    const response = await fetch(`${backendUrl}/api/analytics/daily${suffix}`)
     const data = await response.json()
     res.json(data)
   } catch (error) {
@@ -328,7 +332,11 @@ app.get('/api/analytics/daily', async (req, res) => {
 app.post('/api/analytics/daily/reset', async (req, res) => {
   try {
     const backendUrl = process.env.BACKEND_URL || 'http://strategy_worker:5003'
-    const response = await fetch(`${backendUrl}/api/analytics/daily/reset`, {
+    const query = new URLSearchParams()
+    if (typeof req.query.year === 'string') query.set('year', req.query.year)
+    if (typeof req.query.month === 'string') query.set('month', req.query.month)
+    const suffix = query.size ? `?${query.toString()}` : ''
+    const response = await fetch(`${backendUrl}/api/analytics/daily/reset${suffix}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(req.body),

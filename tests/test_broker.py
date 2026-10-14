@@ -132,6 +132,39 @@ def test_openalgo_broker_get_ltp_paths(fake_openalgo):
     assert broker.get_ltp("NIFTY") == 0.0
 
 
+def test_openalgo_broker_backs_off_after_quote_rate_limit(fake_openalgo, monkeypatch):
+    broker = OpenAlgoBroker(api_key="k", host="h", dry_run=True)
+    client = fake_openalgo["client"]
+    clock = [100.0]
+    calls = [0]
+    monkeypatch.setattr("core.broker.time_module.monotonic", lambda: clock[0])
+
+    def _rate_limited_quotes(*_args, **_kwargs):
+        calls[0] += 1
+        return {"status": "error", "message": "HTTP 429 Too Many Requests"}
+
+    client.quotes = _rate_limited_quotes
+    symbol = "NIFTY08AUG2625000CE"
+
+    assert broker.get_ltp(symbol) == 0.0
+    assert broker.get_ltp(symbol) == 0.0
+    assert calls[0] == 1
+
+    clock[0] += 5.0
+    assert broker.get_ltp(symbol) == 0.0
+    assert calls[0] == 2
+    assert broker.get_ltp(symbol) == 0.0
+    assert calls[0] == 2
+
+    clock[0] += 10.0
+    client.quotes = lambda *_args, **_kwargs: {
+        "status": "success",
+        "data": {"ltp": 123.45},
+    }
+    assert broker.get_ltp(symbol) == 123.45
+    assert broker.get_ltp(symbol) == 123.45
+
+
 def test_openalgo_broker_latches_positionbook_auth_failure(fake_openalgo, caplog):
     broker = OpenAlgoBroker(api_key="k", host="h")
     client = fake_openalgo["client"]

@@ -1433,7 +1433,15 @@ const Logs: React.FC = () => {
         <Card className="border border-bg-tertiary/50">
           {alerts.length > 0 ? (
             <div className="overflow-x-auto">
-              <table className="w-full text-xs">
+              <table className="w-full min-w-[900px] table-fixed text-xs">
+                <colgroup>
+                  <col className="w-[12%]" />
+                  <col className="w-[15%]" />
+                  <col className="w-[16%]" />
+                  <col className="w-[12%]" />
+                  <col className="w-[35%]" />
+                  <col className="w-[10%]" />
+                </colgroup>
                 <thead>
                   <tr className="border-b border-bg-tertiary/50 bg-bg-tertiary/30">
                     <th className="px-4 py-2 text-left font-semibold text-text-secondary">Time</th>
@@ -1459,7 +1467,7 @@ const Logs: React.FC = () => {
                       <td className="px-4 py-2 text-text-tertiary">
                         {alert.alert_type.replace(/_/g, ' ').toUpperCase()}
                       </td>
-                      <td className="px-4 py-2 text-text-primary max-w-xs truncate">
+                      <td className="px-4 py-2 text-text-primary max-w-xl whitespace-normal break-words [overflow-wrap:anywhere]">
                         {alert.message}
                       </td>
                       <td className="px-4 py-2 text-center">

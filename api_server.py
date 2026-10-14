@@ -11,6 +11,8 @@ logger = logging.getLogger("api_server")
 
 app = Flask(__name__)
 CORS(app)
+DAILY_PNL_FILE = Path("logs") / "daily_pnl.json"
+DASHBOARD_DATA_FILE = Path("logs") / "dashboard_data.json"
 
 # Initialize database connection
 try:
@@ -267,170 +269,123 @@ def get_analytics_summary():
         return jsonify({"error": str(e)}), 500
 
 
+def _load_daily_pnl_from_database(year: int, month: int) -> dict[str, dict[str, float | int]]:
+    """Aggregate database daily summaries by calendar day for the requested month."""
+    from sqlalchemy import func
+    from core.db_connection import DatabaseSession
+    from core.db_models import DailyPnL
+
+    with DatabaseSession() as session:
+        records = session.query(DailyPnL).filter(
+            func.extract("year", DailyPnL.trade_date) == year,
+            func.extract("month", DailyPnL.trade_date) == month,
+        ).all()
+
+    daily_pnl = {}
+    for record in records:
+        day_key = str(record.trade_date.day)
+        day_data = daily_pnl.setdefault(day_key, {"pnl": 0.0, "trades": 0})
+        day_data["pnl"] += float(record.net_pnl or 0)
+        day_data["trades"] += int(record.total_trades or 0)
+    return daily_pnl
+
+
 @app.route("/api/analytics/daily", methods=["GET"])
 def get_daily_analytics():
-    """
-    Get daily P&L breakdown for the current month.
-    Fetches from database (actual trades) and JSON file (stored snapshots).
-    
-    Returns:
-    {
-        "month": "October 2026",
-        "days": {
-            "1": {"pnl": 0, "trades": 0, "color": "gray"},
-            "5": {"pnl": -1085.5, "trades": 2, "color": "dark-red"},
-            ...
-        },
-        "month_summary": {
-            "total_pnl": -1085.5,
-            "best_day": {"day": 5, "pnl": 0},
-            "worst_day": {"day": 5, "pnl": -1085.5},
-            "winning_days": 0,
-            "losing_days": 1
-        }
-    }
-    """
+    """Return a month of daily P&L from persistent snapshots and the database."""
     try:
         import calendar
         from datetime import datetime
-        from sqlalchemy import func
-        
-        # Get current month/year
+
         today = datetime.now()
-        year = today.year
-        month = today.month
-        current_day = today.day
-        
-        # Try to load stored daily P&L data
-        daily_pnl_file = Path("logs") / "daily_pnl.json"
-        stored_daily_pnl = {}
-        
-        if daily_pnl_file.exists():
-            try:
-                with open(daily_pnl_file, "r") as f:
-                    stored_data = json.load(f)
-                    # Filter to current month only
-                    stored_month = stored_data.get(f"{year}-{month:02d}", {})
-                    stored_daily_pnl = stored_month
-            except:
-                pass
-        
-        # Read current dashboard data for today
-        dashboard_file = Path("logs") / "dashboard_data.json"
-        current_pnl = 0
-        current_trades = 0
-        
-        if dashboard_file.exists():
-            try:
-                with open(dashboard_file, "r") as f:
-                    data = json.load(f)
-                
-                # Current day P&L
-                current_pnl = sum(float(p.get("pnl", 0)) for p in data.get("positions", []))
-                current_trades = len([o for o in data.get("orders", {}).get("orders", []) 
-                                     if o.get("order_status") == "complete"])
-            except:
-                pass
-        
-        # Try to get daily P&L from database for past days
         try:
-            from core.db_connection import DatabaseSession
-            from core.db_models import DailyPnL
-            
-            with DatabaseSession() as session:
-                # Query all trades for this month
-                daily_pnls = session.query(DailyPnL).filter(
-                    func.extract('year', DailyPnL.trade_date) == year,
-                    func.extract('month', DailyPnL.trade_date) == month
-                ).all()
-                
-                # Aggregate by day
-                for daily_pnl in daily_pnls:
-                    day_str = str(daily_pnl.trade_date.day)
-                    if day_str not in stored_daily_pnl:
-                        stored_daily_pnl[day_str] = {
-                            "pnl": 0,
-                            "trades": 0
-                        }
-                    
-                    # Sum up P&L for all strategies on this day
-                    stored_daily_pnl[day_str]["pnl"] += float(daily_pnl.net_pnl or 0)
-                    stored_daily_pnl[day_str]["trades"] += int(daily_pnl.total_trades or 0)
-                
-                logger.info(f"Loaded {len(daily_pnls)} daily P&L records from database for {year}-{month:02d}")
+            year = int(request.args.get("year", today.year))
+            month = int(request.args.get("month", today.month))
+        except (TypeError, ValueError):
+            return jsonify({"error": "year and month must be integers"}), 400
+        if year < 1900 or year > 2200 or month < 1 or month > 12:
+            return jsonify({"error": "year or month is out of range"}), 400
+
+        archive = {}
+        if DAILY_PNL_FILE.exists():
+            try:
+                with DAILY_PNL_FILE.open("r", encoding="utf-8") as handle:
+                    archive = json.load(handle)
+            except (OSError, json.JSONDecodeError):
+                pass
+
+        month_key = f"{year}-{month:02d}"
+        stored_daily_pnl = dict(archive.get(month_key, {}))
+
+        # Database rows fill days that do not yet have an archive snapshot.
+        try:
+            database_daily_pnl = _load_daily_pnl_from_database(year, month)
+            for day_key, day_data in database_daily_pnl.items():
+                stored_daily_pnl.setdefault(day_key, day_data)
         except Exception as db_err:
-            logger.debug(f"Could not load from database: {db_err}")
-        
-        # Build calendar data for current month
+            logger.debug("Could not load daily P&L from database: %s", db_err)
+
+        current_day_data = None
+        if (year, month) == (today.year, today.month) and DASHBOARD_DATA_FILE.exists():
+            try:
+                from core.dashboard_data import _extract_daily_pnl_snapshot_data
+
+                with DASHBOARD_DATA_FILE.open("r", encoding="utf-8") as handle:
+                    data = json.load(handle)
+                data_timestamp = datetime.fromisoformat(data.get("timestamp", ""))
+                if data_timestamp.date() == today.date():
+                    pnl, trades, has_daily_data = _extract_daily_pnl_snapshot_data(data, today.date())
+                    if has_daily_data:
+                        current_day_data = {"pnl": pnl, "trades": trades}
+            except (OSError, ValueError, TypeError):
+                pass
+
         days_in_month = calendar.monthrange(year, month)[1]
         days = {}
-        
         for day in range(1, days_in_month + 1):
             day_key = str(day)
-            
-            if day < current_day:
-                # Past days - use stored/database data
-                if day_key in stored_daily_pnl:
-                    day_data = stored_daily_pnl[day_key]
-                    pnl = day_data.get("pnl", 0)
-                    trades = day_data.get("trades", 0)
-                else:
-                    pnl = 0
-                    trades = 0
-            elif day == current_day:
-                # Today - use live data combined with any stored data
-                if day_key in stored_daily_pnl:
-                    # Add to today's live data
-                    pnl = current_pnl + stored_daily_pnl[day_key].get("pnl", 0)
-                    trades = current_trades + stored_daily_pnl[day_key].get("trades", 0)
-                else:
-                    pnl = current_pnl
-                    trades = current_trades
-            else:
-                # Future days
-                pnl = 0
-                trades = 0
-            
-            # Determine color based on P&L magnitude
-            if trades == 0:
+            day_data = stored_daily_pnl.get(day_key, {})
+            if (
+                day == today.day
+                and (year, month) == (today.year, today.month)
+                and current_day_data is not None
+            ):
+                day_data = current_day_data
+            pnl = float(day_data.get("pnl", 0) or 0)
+            trades = int(day_data.get("trades", 0) or 0)
+            if trades == 0 and pnl == 0:
                 color = "gray"
             elif pnl < -2000:
-                color = "dark-red"  # Very big loss
+                color = "dark-red"
             elif pnl < 0:
-                color = "red"       # Normal loss
+                color = "red"
             elif pnl < 2000:
-                color = "green"     # Normal profit
+                color = "green"
             else:
-                color = "dark-green"  # Very big profit
-            
+                color = "dark-green"
             days[day_key] = {
                 "pnl": round(pnl, 2),
                 "trades": trades,
                 "color": color
             }
-        
-        # Calculate month summary
-        pnl_values = [d["pnl"] for d in days.values()]
-        total_pnl = sum(pnl_values)
-        winning_days = sum(1 for p in pnl_values if p > 0)
-        losing_days = sum(1 for p in pnl_values if p < 0)
-        
+
+        trading_days = [data for data in days.values() if data["trades"] > 0]
+        total_pnl = sum(data["pnl"] for data in trading_days)
+        winning_days = sum(1 for data in trading_days if data["pnl"] > 0)
+        losing_days = sum(1 for data in trading_days if data["pnl"] < 0)
         best_day = None
         worst_day = None
         best_pnl = float('-inf')
         worst_pnl = float('inf')
-        
         for day_str, day_data in days.items():
-            if day_data["trades"] > 0:  # Only consider days with trades
+            if day_data["trades"] > 0:
                 if day_data["pnl"] > best_pnl:
                     best_pnl = day_data["pnl"]
                     best_day = int(day_str)
                 if day_data["pnl"] < worst_pnl:
                     worst_pnl = day_data["pnl"]
                     worst_day = int(day_str)
-        
-        logger.info(f"Daily analytics: Month P&L={total_pnl}, Best Day={best_day}, Worst Day={worst_day}, Total Days={sum(1 for d in days.values() if d['trades'] > 0)}")
-        
+
         return jsonify({
             "month": f"{calendar.month_name[month]} {year}",
             "year": year,
@@ -442,7 +397,7 @@ def get_daily_analytics():
                 "worst_day": {"day": worst_day, "pnl": round(worst_pnl, 2) if worst_day else 0},
                 "winning_days": winning_days,
                 "losing_days": losing_days,
-                "total_trading_days": sum(1 for d in days.values() if d["trades"] > 0)
+                "total_trading_days": len(trading_days)
             }
         }), 200
         
@@ -453,31 +408,44 @@ def get_daily_analytics():
 
 @app.route("/api/analytics/daily/reset", methods=["POST"])
 def reset_daily_analytics():
-    """Reset daily P&L data for current month."""
+    """Reset daily P&L data for the selected month."""
     try:
         from datetime import datetime
-        
-        daily_pnl_file = Path("logs") / "daily_pnl.json"
-        
-        # Load existing data
-        all_data = {}
-        if daily_pnl_file.exists():
-            with open(daily_pnl_file, "r") as f:
-                all_data = json.load(f)
-        
-        # Clear current month
+        from sqlalchemy import func
+
         today = datetime.now()
-        current_month_key = f"{today.year}-{today.month:02d}"
-        all_data[current_month_key] = {}
-        
-        # Save back
-        with open(daily_pnl_file, "w") as f:
-            json.dump(all_data, f, indent=2)
-        
-        logger.info(f"Reset daily analytics for {current_month_key}")
-        
-        return jsonify({"success": True, "message": f"Daily analytics reset for {current_month_key}"}), 200
-        
+        try:
+            year = int(request.args.get("year", today.year))
+            month = int(request.args.get("month", today.month))
+        except (TypeError, ValueError):
+            return jsonify({"error": "year and month must be integers"}), 400
+        if year < 1900 or year > 2200 or month < 1 or month > 12:
+            return jsonify({"error": "year or month is out of range"}), 400
+
+        all_data = {}
+        if DAILY_PNL_FILE.exists():
+            with DAILY_PNL_FILE.open("r", encoding="utf-8") as handle:
+                all_data = json.load(handle)
+        month_key = f"{year}-{month:02d}"
+        all_data[month_key] = {}
+        temporary_path = DAILY_PNL_FILE.with_suffix(DAILY_PNL_FILE.suffix + ".tmp")
+        temporary_path.write_text(json.dumps(all_data, indent=2), encoding="utf-8")
+        os.replace(temporary_path, DAILY_PNL_FILE)
+
+        try:
+            from core.db_connection import DatabaseSession
+            from core.db_models import DailyPnL
+            with DatabaseSession() as session:
+                session.query(DailyPnL).filter(
+                    func.extract("year", DailyPnL.trade_date) == year,
+                    func.extract("month", DailyPnL.trade_date) == month,
+                ).delete(synchronize_session=False)
+                session.commit()
+        except Exception as db_err:
+            logger.debug("Could not reset daily P&L database rows: %s", db_err)
+
+        logger.info("Reset daily analytics for %s", month_key)
+        return jsonify({"success": True, "message": f"Daily analytics reset for {month_key}"}), 200
     except Exception as e:
         logger.error(f"Error resetting daily analytics: {e}")
         return jsonify({"error": str(e)}), 500

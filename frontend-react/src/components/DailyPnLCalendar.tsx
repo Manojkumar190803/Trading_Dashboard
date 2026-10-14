@@ -1,14 +1,25 @@
 import React, { useMemo } from 'react'
 import { clsx } from 'clsx'
+import { ChevronLeft, ChevronRight } from 'lucide-react'
 
 interface DailyPnLCalendarProps {
   dailyData: {
     month: string
+    year: number
+    month_num: number
     days: Record<string, { pnl: number; trades: number; color: string }>
   } | null
+  selectedYear: number
+  selectedMonth: number
+  onSelectMonth: (year: number, month: number) => void
   onExport?: () => void
   onReset?: () => void
 }
+
+const MONTHS = [
+  'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+  'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec',
+]
 
 const DayCell: React.FC<{
   day: number
@@ -49,15 +60,15 @@ const DayCell: React.FC<{
 
 const DailyPnLCalendar: React.FC<DailyPnLCalendarProps> = ({
   dailyData,
+  selectedYear,
+  selectedMonth,
+  onSelectMonth,
   onExport,
   onReset,
 }) => {
   const calendarWeeks = useMemo(() => {
-    if (!dailyData) return []
-
-    const days = dailyData.days
-    const dayCount = Object.keys(days).length
-    const firstDay = new Date(new Date().getFullYear(), new Date().getMonth(), 1).getDay()
+    const dayCount = new Date(selectedYear, selectedMonth, 0).getDate()
+    const firstDay = new Date(selectedYear, selectedMonth - 1, 1).getDay()
     
     const weeks: (number | null)[] [] = []
     let currentWeek: (number | null)[] = new Array(firstDay).fill(null)
@@ -78,40 +89,80 @@ const DailyPnLCalendar: React.FC<DailyPnLCalendarProps> = ({
     }
 
     return weeks
-  }, [dailyData])
+  }, [selectedMonth, selectedYear])
 
-  if (!dailyData) {
-    return (
-      <div className="bg-gray-800 rounded-lg p-4 text-gray-400">
-        Loading calendar data...
-      </div>
-    )
-  }
+  const monthLabel = new Intl.DateTimeFormat('en-US', {
+    month: 'long',
+    year: 'numeric',
+  }).format(new Date(selectedYear, selectedMonth - 1, 1))
+  const nextYearDisabled = selectedYear >= new Date().getFullYear()
 
   return (
     <div className="bg-gray-800 rounded-lg p-4 border border-gray-700">
       {/* Header */}
-      <div className="flex items-center justify-between mb-4">
-        <h3 className="text-lg font-bold text-white">{dailyData.month}</h3>
-        <div className="flex gap-2">
-          {onExport && (
+      <div className="mb-4 space-y-3">
+        <div className="flex items-center justify-between gap-3">
+          <div className="flex min-w-0 items-center gap-2">
             <button
-              onClick={onExport}
-              className="px-3 py-1 bg-blue-600 hover:bg-blue-700 text-white text-xs rounded transition-colors"
-              title="Export daily P&L as CSV"
+              onClick={() => onSelectMonth(selectedYear - 1, selectedMonth)}
+              aria-label="Previous year"
+              title="Previous year"
+              className="rounded p-1 text-gray-300 hover:bg-gray-700 hover:text-white"
             >
-              Export
+              <ChevronLeft size={18} />
             </button>
-          )}
-          {onReset && (
+            <h3 className="truncate text-lg font-bold text-white">{monthLabel}</h3>
             <button
-              onClick={onReset}
-              className="px-3 py-1 bg-red-600 hover:bg-red-700 text-white text-xs rounded transition-colors"
-              title="Reset daily P&L data"
+              onClick={() => onSelectMonth(selectedYear + 1, selectedMonth)}
+              aria-label="Next year"
+              title="Next year"
+              disabled={nextYearDisabled}
+              className="rounded p-1 text-gray-300 hover:bg-gray-700 hover:text-white disabled:cursor-not-allowed disabled:opacity-40"
             >
-              Reset
+              <ChevronRight size={18} />
             </button>
-          )}
+          </div>
+          <div className="flex shrink-0 gap-2">
+            {onExport && (
+              <button
+                onClick={onExport}
+                className="px-3 py-1 bg-blue-600 hover:bg-blue-700 text-white text-xs rounded transition-colors"
+                title="Export daily P&L as CSV"
+              >
+                Export
+              </button>
+            )}
+            {onReset && (
+              <button
+                onClick={onReset}
+                className="px-3 py-1 bg-red-600 hover:bg-red-700 text-white text-xs rounded transition-colors"
+                title="Reset daily P&L data"
+              >
+                Reset
+              </button>
+            )}
+          </div>
+        </div>
+        <div className="grid grid-cols-6 gap-1 sm:grid-cols-12" aria-label="Select month">
+          {MONTHS.map((month, index) => {
+            const monthNumber = index + 1
+            const selected = selectedMonth === monthNumber
+            return (
+              <button
+                key={month}
+                type="button"
+                onClick={() => onSelectMonth(selectedYear, monthNumber)}
+                aria-pressed={selected}
+                title={`${new Intl.DateTimeFormat('en-US', { month: 'long' }).format(new Date(2000, index, 1))} ${selectedYear}`}
+                className={clsx(
+                  'rounded px-1 py-1.5 text-xs font-semibold transition-colors',
+                  selected ? 'bg-cyan-600 text-white' : 'bg-gray-700 text-gray-300 hover:bg-gray-600 hover:text-white'
+                )}
+              >
+                {month}
+              </button>
+            )
+          })}
         </div>
       </div>
 
@@ -133,7 +184,7 @@ const DailyPnLCalendar: React.FC<DailyPnLCalendarProps> = ({
                 return <div key={`empty-${dayIdx}`} className="w-full aspect-square" />
               }
 
-              const dayData = dailyData.days[day.toString()]
+              const dayData = dailyData?.days[day.toString()]
               return (
                 <DayCell
                   key={day}

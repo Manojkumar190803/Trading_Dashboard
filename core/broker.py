@@ -177,6 +177,8 @@ class OpenAlgoBroker(BrokerInterface):
         self.dry_run = dry_run
         self.position_book_available = False
         self._positionbook_auth_failed = False
+        self._quote_rate_limit_streak: dict[str, int] = {}
+        self._quote_retry_after: dict[str, float] = {}
         self._nearest_expiry_cache: dict[tuple[str, str, int, int, str, str], Optional[date]] = {}
         logger.info(
             "OpenAlgoBroker initialized host=%s ws_url=%s product=%s dry_run=%s",
@@ -295,26 +297,38 @@ class OpenAlgoBroker(BrokerInterface):
         quote_symbol = symbol.split(":", 1)[-1]
         if quote_symbol.endswith("-INDEX"):
             quote_symbol = quote_symbol.removesuffix("-INDEX")
-        for attempt in range(3):
-            try:
-                resp = self.client.quotes(symbol=quote_symbol, exchange=exchange)
-            except Exception as exc:
-                logger.warning("quotes(%s) error: %s", quote_symbol, exc)
-                return 0.0
+        now = time_module.monotonic()
+        if now < self._quote_retry_after.get(quote_symbol, 0.0):
+            return 0.0
 
-            if isinstance(resp, dict) and resp.get("status") == "success":
-                data = resp.get("data") or {}
-                ltp = data.get("ltp") or resp.get("ltp")
-                if ltp is not None:
-                    return round(float(ltp), 2)
+        try:
+            resp = self.client.quotes(symbol=quote_symbol, exchange=exchange)
+        except Exception as exc:
+            logger.warning("quotes(%s) error: %s", quote_symbol, exc)
+            return 0.0
 
-            message = str(resp.get("message") if isinstance(resp, dict) else resp)
-            if "429" not in message or attempt == 2:
-                logger.warning("quotes(%s) unexpected response: %s", quote_symbol, resp)
-                return 0.0
-            delay = 0.5 * (attempt + 1)
-            logger.warning("quotes(%s) rate-limited; retrying in %.1fs", symbol, delay)
-            time_module.sleep(delay)
+        if isinstance(resp, dict) and resp.get("status") == "success":
+            data = resp.get("data") or {}
+            ltp = data.get("ltp") or resp.get("ltp")
+            if ltp is not None:
+                self._quote_rate_limit_streak.pop(quote_symbol, None)
+                self._quote_retry_after.pop(quote_symbol, None)
+                return round(float(ltp), 2)
+
+        message = str(resp.get("message") if isinstance(resp, dict) else resp)
+        if "429" in message:
+            streak = self._quote_rate_limit_streak.get(quote_symbol, 0) + 1
+            self._quote_rate_limit_streak[quote_symbol] = streak
+            delay = min(5.0 * (2 ** (streak - 1)), 60.0)
+            self._quote_retry_after[quote_symbol] = now + delay
+            logger.warning(
+                "quotes(%s) rate-limited; suppressing requests for %.1fs",
+                quote_symbol,
+                delay,
+            )
+            return 0.0
+
+        logger.warning("quotes(%s) unexpected response: %s", quote_symbol, resp)
         return 0.0
 
     def get_position_book(self) -> list[dict[str, object]]:

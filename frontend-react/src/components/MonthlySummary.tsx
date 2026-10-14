@@ -3,6 +3,7 @@ import { formatCurrency } from '@/utils/format'
 import { clsx } from 'clsx'
 
 interface MonthlySummaryProps {
+  month: string
   monthSummary: {
     total_pnl: number
     best_day: { day: number | null; pnl: number }
@@ -42,7 +43,7 @@ const MetricCard: React.FC<{
   )
 }
 
-const MonthlySummary: React.FC<MonthlySummaryProps> = ({ monthSummary }) => {
+const MonthlySummary: React.FC<MonthlySummaryProps> = ({ month, monthSummary }) => {
   if (!monthSummary) {
     return (
       <div className="bg-gray-800 rounded-lg p-4 text-gray-400">
@@ -56,7 +57,7 @@ const MonthlySummary: React.FC<MonthlySummaryProps> = ({ monthSummary }) => {
   return (
     <div className="bg-gray-800 rounded-lg p-4 border border-gray-700 space-y-4">
       {/* Title */}
-      <h3 className="text-lg font-bold text-white mb-4">Monthly Summary</h3>
+      <h3 className="text-lg font-bold text-white mb-4">{month} Summary</h3>
 
       {/* Total Month P&L - Prominent */}
       <div

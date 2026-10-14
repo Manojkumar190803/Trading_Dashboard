@@ -30,6 +30,18 @@
 
 html.light {
   color-scheme: light;
+  --bg-primary-rgb: 255 255 255;
+  --bg-secondary-rgb: 248 250 252;
+  --bg-tertiary-rgb: 241 245 249;
+  --bg-surface-rgb: 239 246 255;
+  --text-primary-rgb: 15 23 42;
+  --text-secondary-rgb: 51 65 85;
+  --text-tertiary-rgb: 100 116 139;
+  --accent-cyan-rgb: 8 113 136;
+  --accent-green-rgb: 4 120 87;
+  --accent-red-rgb: 185 28 28;
+  --accent-yellow-rgb: 146 64 14;
+  --accent-blue-rgb: 37 99 235;
   
   /* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
   /* 1. BACKGROUND COLORS - Clean White Foundation */
@@ -92,197 +104,6 @@ html.light {
 /* ═══════════════════════════════════════════════════════════════════════════════
    LIGHT MODE - ELEMENT OVERRIDES
    ═══════════════════════════════════════════════════════════════════════════════ */
-
-/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
-/* Body & Text Elements */
-/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
-
-html.light body {
-  @apply !bg-white !text-slate-900;
-  color: #0F172A;
-  background-color: #FFFFFF;
-}
-
-html.light h1,
-html.light h2,
-html.light h3,
-html.light h4,
-html.light h5,
-html.light h6 {
-  @apply !text-slate-900;
-  color: #0F172A;
-  font-weight: 600;
-}
-
-html.light p,
-html.light span,
-html.light a {
-  color: #334155;
-}
-
-html.light a {
-  color: #3B82F6;
-  transition: color 0.2s;
-}
-
-html.light a:hover {
-  color: #1E40AF;
-}
-
-/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
-/* Background Color Variables */
-/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
-
-html.light [class*="bg-bg-primary"],
-html.light .bg-bg-primary {
-  @apply !bg-white !important;
-  background-color: #FFFFFF !important;
-}
-
-html.light [class*="bg-bg-secondary"],
-html.light .bg-bg-secondary {
-  @apply !bg-slate-50 !important;
-  background-color: #F8FAFC !important;
-}
-
-html.light [class*="bg-bg-tertiary"],
-html.light .bg-bg-tertiary {
-  @apply !bg-slate-100 !important;
-  background-color: #F1F5F9 !important;
-}
-
-html.light [class*="bg-bg-surface"],
-html.light .bg-bg-surface {
-  @apply !bg-blue-50 !important;
-  background-color: #EFF6FF !important;
-}
-
-/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
-/* Text Color Variables */
-/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
-
-html.light [class*="text-text-primary"],
-html.light .text-text-primary {
-  @apply !text-slate-900 !important;
-  color: #0F172A !important;
-}
-
-html.light [class*="text-text-secondary"],
-html.light .text-text-secondary {
-  @apply !text-slate-600 !important;
-  color: #334155 !important;
-}
-
-html.light [class*="text-text-tertiary"],
-html.light .text-text-tertiary {
-  @apply !text-slate-500 !important;
-  color: #64748B !important;
-}
-
-/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
-/* Accent Colors - Primary & Variants */
-/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
-
-html.light [class*="accent-blue"],
-html.light .text-blue-600,
-html.light .border-blue-600 {
-  color: #3B82F6 !important;
-  border-color: #3B82F6 !important;
-}
-
-html.light [class*="bg-accent-blue"],
-html.light .bg-blue-50 {
-  @apply !bg-blue-50 !important;
-  background-color: #EFF6FF !important;
-}
-
-html.light [class*="accent-green"],
-html.light .text-green-600 {
-  color: #10B981 !important;
-}
-
-html.light [class*="bg-accent-green"],
-html.light .bg-green-50 {
-  @apply !bg-green-50 !important;
-  background-color: #F0FDF4 !important;
-}
-
-html.light [class*="accent-red"],
-html.light .text-red-600 {
-  color: #EF4444 !important;
-}
-
-html.light [class*="bg-accent-red"],
-html.light .bg-red-50 {
-  @apply !bg-red-50 !important;
-  background-color: #FEF2F2 !important;
-}
-
-html.light [class*="accent-yellow"],
-html.light .text-yellow-600 {
-  color: #F59E0B !important;
-}
-
-html.light [class*="bg-accent-yellow"],
-html.light .bg-yellow-50 {
-  @apply !bg-yellow-50 !important;
-  background-color: #FFFBEB !important;
-}
-
-html.light [class*="accent-cyan"],
-html.light .text-cyan-600 {
-  color: #06B6D4 !important;
-}
-
-html.light [class*="bg-accent-cyan"],
-html.light .bg-cyan-50 {
-  @apply !bg-cyan-50 !important;
-  background-color: #F0F9FF !important;
-}
-
-html.light [class*="accent-purple"],
-html.light .text-purple-600 {
-  color: #8B5CF6 !important;
-}
-
-html.light [class*="bg-accent-purple"],
-html.light .bg-purple-50 {
-  @apply !bg-purple-50 !important;
-  background-color: #F5F3FF !important;
-}
-
-/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
-/* Borders & Dividers */
-/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
-
-html.light [class*="border"],
-html.light hr {
-  @apply !border-slate-200 !important;
-  border-color: #E2E8F0 !important;
-}
-
-html.light .divide-slate-200 > * + * {
-  @apply !border-slate-200 !important;
-  border-color: #E2E8F0 !important;
-}
-
-/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
-/* Cards & Containers */
-/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
-
-html.light [class*="card"],
-html.light [class*="card"],
-html.light [class*="Card"] {
-  background-color: #FFFFFF !important;
-  border-color: #E2E8F0 !important;
-  box-shadow: 0 1px 3px 0 rgba(15, 23, 42, 0.1);
-  transition: box-shadow 0.2s;
-}
-
-html.light [class*="card"]:hover,
-html.light [class*="Card"]:hover {
-  box-shadow: 0 4px 6px -1px rgba(15, 23, 42, 0.15);
-}
 
 /* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
 /* Buttons */

@@ -1,48 +1,29 @@
 import type { Config } from 'tailwindcss'
 import defaultTheme from 'tailwindcss/defaultTheme'
 
-const darkColors = {
-  bg: {
-    primary: '#0a0e27',
-    secondary: '#111933',
-    tertiary: '#1a1f3a',
-    surface: '#232d4d',
-  },
-  text: {
-    primary: '#f2f8ff',
-    secondary: '#a9c2cc',
-    tertiary: '#8e9cb0',
-  },
-}
-
-const lightColors = {
-  bg: {
-    primary: '#ffffff',
-    secondary: '#f5f7fa',
-    tertiary: '#e8ecf1',
-    surface: '#e0e5ed',
-  },
-  text: {
-    primary: '#0a0e27',
-    secondary: '#4a5568',
-    tertiary: '#718096',
-  },
-}
-
 export default {
   content: ['./index.html', './src/**/*.{js,ts,jsx,tsx}'],
   darkMode: 'class',
   theme: {
     extend: {
       colors: {
-        bg: darkColors.bg,
-        text: darkColors.text,
+        bg: {
+          primary: 'rgb(var(--bg-primary-rgb) / <alpha-value>)',
+          secondary: 'rgb(var(--bg-secondary-rgb) / <alpha-value>)',
+          tertiary: 'rgb(var(--bg-tertiary-rgb) / <alpha-value>)',
+          surface: 'rgb(var(--bg-surface-rgb) / <alpha-value>)',
+        },
+        text: {
+          primary: 'rgb(var(--text-primary-rgb) / <alpha-value>)',
+          secondary: 'rgb(var(--text-secondary-rgb) / <alpha-value>)',
+          tertiary: 'rgb(var(--text-tertiary-rgb) / <alpha-value>)',
+        },
         accent: {
-          cyan: '#59d0ff',
-          green: '#27d48a',
-          red: '#ff5f6d',
-          yellow: '#ffbe32',
-          blue: '#4a9eff',
+          cyan: 'rgb(var(--accent-cyan-rgb) / <alpha-value>)',
+          green: 'rgb(var(--accent-green-rgb) / <alpha-value>)',
+          red: 'rgb(var(--accent-red-rgb) / <alpha-value>)',
+          yellow: 'rgb(var(--accent-yellow-rgb) / <alpha-value>)',
+          blue: 'rgb(var(--accent-blue-rgb) / <alpha-value>)',
         },
       },
       fontFamily: {
@@ -104,7 +85,8 @@ export default {
     },
   },
   plugins: [
-    function ({ addBase, theme }: any) {
+    function ({ addBase, addVariant, theme }: any) {
+      addVariant('light', 'html.light &')
       addBase({
         'body': {
           color: theme('colors.text.primary'),

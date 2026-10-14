@@ -25,7 +25,7 @@ import {
 } from '@/components/UI'
 import DailyPnLCalendar from '@/components/DailyPnLCalendar'
 import MonthlySummary from '@/components/MonthlySummary'
-import { useAnalyticsTrades, useAnalyticsSummary, useEquityCurve, useAnalyticsSummaryFromAPI, useDailyPnL } from '@/hooks'
+import { useAnalyticsTrades, useAnalyticsSummary, useAnalyticsSummaryFromAPI, useDailyPnL } from '@/hooks'
 import { formatCurrency, formatPercent, getValueColor, formatNumber } from '@/utils/format'
 import { exportAnalyticsCSV, resetAnalytics } from '@/utils/csv-export'
 import { clsx } from 'clsx'
@@ -34,7 +34,15 @@ const Analytics: React.FC = () => {
   const { trades, refetch } = useAnalyticsTrades()
   const tradesSummary = useAnalyticsSummary(trades)
   const { summary: apiSummary } = useAnalyticsSummaryFromAPI()
-  const { dailyData, reset: resetDaily } = useDailyPnL()
+  const [selectedPeriod, setSelectedPeriod] = useState(() => {
+    const now = new Date()
+    return { year: now.getFullYear(), month: now.getMonth() + 1 }
+  })
+  const { dailyData, reset: resetDaily } = useDailyPnL(selectedPeriod.year, selectedPeriod.month)
+  const selectedDailyData = dailyData?.year === selectedPeriod.year
+    && dailyData.month_num === selectedPeriod.month
+    ? dailyData
+    : null
   
   // Use API summary if available, otherwise fall back to trades-based summary
   const summary = apiSummary.trades_completed > 0 ? {
@@ -47,7 +55,6 @@ const Analytics: React.FC = () => {
     profit_factor: apiSummary.profit_factor,
   } : tradesSummary
   
-  const curve = useEquityCurve(trades)
   const [isResetting, setIsResetting] = useState(false)
   const [equityChartType, setEquityChartType] = useState<'area' | 'bar' | 'line'>('area')
   const [performanceChartType, setPerformanceChartType] = useState<'bar' | 'line'>('bar')
@@ -83,28 +90,27 @@ const Analytics: React.FC = () => {
     }
   }, [refetch])
 
-  // Generate equity curve data - flat when no trades
+  const dailyPnlPoints = useMemo(() => {
+    if (!selectedDailyData) return []
+
+    return Object.entries(selectedDailyData.days)
+      .map(([day, data]) => ({ day: Number(day), pnl: data.pnl, trades: data.trades }))
+      .filter((day) => day.trades > 0)
+      .sort((left, right) => left.day - right.day)
+      .map((day) => ({
+        ...day,
+        date: new Date(selectedPeriod.year, selectedPeriod.month - 1, day.day)
+          .toLocaleDateString('en-IN', { day: 'numeric', month: 'short' }),
+      }))
+  }, [selectedDailyData, selectedPeriod.month, selectedPeriod.year])
+
   const equityCurveData = useMemo(() => {
-    if (curve.length === 0) {
-      // Flat equity curve when no trades
-      return [
-        { datetime: '09:30', total_pnl: 0 },
-        { datetime: '10:00', total_pnl: 0 },
-        { datetime: '10:30', total_pnl: 0 },
-        { datetime: '11:00', total_pnl: 0 },
-        { datetime: '11:30', total_pnl: 0 },
-        { datetime: '12:00', total_pnl: 0 },
-      ]
-    }
-    return curve.map((c) => ({
-      ...c,
-      datetime: new Date(c.datetime).toLocaleTimeString('en-IN', {
-        hour: '2-digit',
-        minute: '2-digit',
-        hour12: true,
-      }),
-    }))
-  }, [curve])
+    let cumulativePnl = 0
+    return dailyPnlPoints.map((day) => {
+      cumulativePnl += day.pnl
+      return { datetime: day.date, total_pnl: cumulativePnl }
+    })
+  }, [dailyPnlPoints])
 
   // Trade distribution by result
   const tradeDistribution = [
@@ -116,25 +122,15 @@ const Analytics: React.FC = () => {
     },
   ]
 
-  // Performance data for daily charts (calculated from trades)
+  // Daily gains and losses come from the same persisted values as the calendar.
   const performanceData = useMemo(() => {
-    if (trades.length === 0) {
-      return []
-    }
-
-    const grouped: Record<string, number> = {}
-    trades.forEach((trade) => {
-      const date = new Date(trade.timestamp).toLocaleDateString('en-IN')
-      grouped[date] = (grouped[date] || 0) + trade.pnl
-    })
-
-    return Object.entries(grouped).map(([date, pnl]) => ({
+    return dailyPnlPoints.map(({ date, pnl }) => ({
       date,
       pnl,
-      gain: pnl > 0 ? pnl : 0,
-      loss: pnl < 0 ? Math.abs(pnl) : 0,
+      gain: Math.max(pnl, 0),
+      loss: Math.max(-pnl, 0),
     }))
-  }, [trades])
+  }, [dailyPnlPoints])
 
   const CustomTooltip = ({ active, payload }: any) => {
     if (active && payload && payload.length) {
@@ -224,7 +220,7 @@ const Analytics: React.FC = () => {
             <div>
               <h3 className="text-lg font-semibold text-text-primary">Equity Curve</h3>
               <p className="text-xs text-text-secondary mt-1">
-                Cumulative profit/loss progression
+                Cumulative daily P&amp;L for selected month
               </p>
             </div>
             <div className="flex items-center gap-2">
@@ -269,7 +265,11 @@ const Analytics: React.FC = () => {
 
           <Card>
             <div className="w-full h-48">
-              {equityChartType === 'area' && (
+              {equityCurveData.length === 0 ? (
+                <div className="flex h-full items-center justify-center">
+                  <EmptyState title={selectedDailyData ? 'No P&L history for this month' : 'Loading monthly P&L...'} />
+                </div>
+              ) : equityChartType === 'area' ? (
                 <ResponsiveContainer width="100%" height="100%">
                   <AreaChart data={equityCurveData}>
                     <defs>
@@ -299,11 +299,11 @@ const Analytics: React.FC = () => {
                       stroke="#59d0ff"
                       fillOpacity={1}
                       fill="url(#colorPnl)"
+                      dot={{ r: 4, fill: '#59d0ff' }}
                     />
                   </AreaChart>
                 </ResponsiveContainer>
-              )}
-              {equityChartType === 'bar' && (
+              ) : equityChartType === 'bar' ? (
                 <ResponsiveContainer width="100%" height="100%">
                   <BarChart data={equityCurveData}>
                     <CartesianGrid
@@ -324,8 +324,7 @@ const Analytics: React.FC = () => {
                     <Bar dataKey="total_pnl" fill="#59d0ff" />
                   </BarChart>
                 </ResponsiveContainer>
-              )}
-              {equityChartType === 'line' && (
+              ) : (
                 <ResponsiveContainer width="100%" height="100%">
                   <LineChart data={equityCurveData}>
                     <CartesianGrid
@@ -348,7 +347,7 @@ const Analytics: React.FC = () => {
                       dataKey="total_pnl"
                       stroke="#59d0ff"
                       strokeWidth={2}
-                      dot={false}
+                      dot={{ r: 4, fill: '#59d0ff' }}
                     />
                   </LineChart>
                 </ResponsiveContainer>
@@ -408,7 +407,7 @@ const Analytics: React.FC = () => {
       </div>
 
       {/* Daily Performance */}
-      {performanceData.length > 0 && (
+      {selectedDailyData && (
         <div className="w-full">
           <div className="mb-3 flex items-center justify-between">
             <div>
@@ -444,7 +443,11 @@ const Analytics: React.FC = () => {
 
           <Card>
             <div className="w-full h-48">
-              {performanceChartType === 'bar' && (
+              {performanceData.length === 0 ? (
+                <div className="flex h-full items-center justify-center">
+                  <EmptyState title="No trading days recorded this month" />
+                </div>
+              ) : performanceChartType === 'bar' ? (
                 <ResponsiveContainer width="100%" height="100%">
                   <BarChart data={performanceData}>
                     <CartesianGrid
@@ -464,8 +467,7 @@ const Analytics: React.FC = () => {
                     <Bar dataKey="loss" stackId="a" fill="#ff5f6d" name="Losses" />
                   </BarChart>
                 </ResponsiveContainer>
-              )}
-              {performanceChartType === 'line' && (
+              ) : (
                 <ResponsiveContainer width="100%" height="100%">
                   <LineChart data={performanceData}>
                     <CartesianGrid
@@ -555,13 +557,16 @@ const Analytics: React.FC = () => {
       {/* Daily P&L Calendar & Monthly Summary */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
         <DailyPnLCalendar
-          dailyData={dailyData}
+          dailyData={selectedDailyData}
+          selectedYear={selectedPeriod.year}
+          selectedMonth={selectedPeriod.month}
+          onSelectMonth={(year, month) => setSelectedPeriod({ year, month })}
           onExport={() => {
             // Export daily P&L data
-            if (dailyData) {
+            if (selectedDailyData) {
               const csvContent = [
                 'Day,P&L,Trades',
-                ...Object.entries(dailyData.days).map(
+                ...Object.entries(selectedDailyData.days).map(
                   ([day, data]) => `${day},${data.pnl},${data.trades}`
                 ),
               ].join('\n')
@@ -570,15 +575,22 @@ const Analytics: React.FC = () => {
               const url = window.URL.createObjectURL(blob)
               const a = document.createElement('a')
               a.href = url
-              a.download = `daily_pnl_${dailyData.month.replace(' ', '_')}.csv`
+              a.download = `daily_pnl_${selectedDailyData.month.replace(' ', '_')}.csv`
               a.click()
               window.URL.revokeObjectURL(url)
             }
           }}
-          onReset={resetDaily}
+          onReset={() => {
+            if (window.confirm(`Clear saved P&L history for ${selectedDailyData?.month || 'this month'}?`)) {
+              void resetDaily()
+            }
+          }}
         />
 
-        <MonthlySummary monthSummary={dailyData?.month_summary || null} />
+        <MonthlySummary
+          month={selectedDailyData?.month || `${selectedPeriod.year}-${String(selectedPeriod.month).padStart(2, '0')}`}
+          monthSummary={selectedDailyData?.month_summary || null}
+        />
       </div>
     </div>
   )

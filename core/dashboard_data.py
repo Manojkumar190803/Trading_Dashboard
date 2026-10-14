@@ -3,11 +3,106 @@
 import json
 import logging
 import os
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
 logger = logging.getLogger("core.dashboard_data")
+
+
+def _extract_daily_pnl_snapshot_data(
+    dashboard_data: dict,
+    trading_date: date,
+) -> tuple[float, int, bool]:
+    positions = dashboard_data.get("positions") or []
+    account = dashboard_data.get("account") or {}
+    position_values = []
+    for position in positions:
+        if not isinstance(position, dict):
+            continue
+        value = next(
+            (
+                position[key]
+                for key in ("pnl", "total_pnl_today", "today_realized_pnl")
+                if position.get(key) is not None
+            ),
+            None,
+        )
+        if value is not None:
+            position_values.append(float(value))
+
+    if position_values:
+        pnl = sum(position_values)
+        has_pnl_data = True
+    else:
+        account_pnl = next(
+            (
+                account[key]
+                for key in ("today_realized_pnl", "realized_pnl", "m2mrealized")
+                if account.get(key) is not None
+            ),
+            None,
+        )
+        has_pnl_data = account_pnl is not None
+        pnl = float(account_pnl or 0)
+
+    orders_data = dashboard_data.get("orders") or {}
+    orders = orders_data.get("orders", []) if isinstance(orders_data, dict) else orders_data
+    completed_orders_today = 0
+    for order in orders:
+        if not isinstance(order, dict) or str(order.get("order_status", "")).lower() != "complete":
+            continue
+        timestamp = order.get("timestamp") or order.get("created_at") or order.get("order_timestamp")
+        if not timestamp:
+            continue
+        try:
+            order_time = timestamp if isinstance(timestamp, datetime) else datetime.fromisoformat(
+                str(timestamp).replace("Z", "+00:00")
+            )
+            if order_time.tzinfo is not None:
+                local_timezone = datetime.now().astimezone().tzinfo
+                order_time = order_time.astimezone(local_timezone)
+        except (TypeError, ValueError):
+            continue
+        if order_time.date() == trading_date:
+            completed_orders_today += 1
+
+    return pnl, completed_orders_today, has_pnl_data or completed_orders_today > 0
+
+
+def _write_daily_pnl_snapshot(
+    dashboard_data: dict,
+    archive_path: Path,
+    snapshot_time: Optional[datetime] = None,
+) -> bool:
+    """Persist the latest daily dashboard P&L without accumulating poll snapshots."""
+    captured_at = snapshot_time or datetime.now()
+    position_pnl, trade_count, has_daily_data = _extract_daily_pnl_snapshot_data(
+        dashboard_data,
+        captured_at.date(),
+    )
+    if not has_daily_data:
+        return False
+
+    month_key = captured_at.strftime("%Y-%m")
+    day_key = str(captured_at.day)
+    archive_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with archive_path.open("r", encoding="utf-8") as handle:
+            archive = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        archive = {}
+
+    month_data = archive.setdefault(month_key, {})
+    month_data[day_key] = {
+        "pnl": round(position_pnl, 2),
+        "trades": trade_count,
+        "updated_at": captured_at.isoformat(),
+    }
+    temporary_path = archive_path.with_suffix(archive_path.suffix + ".tmp")
+    temporary_path.write_text(json.dumps(archive, indent=2), encoding="utf-8")
+    os.replace(temporary_path, archive_path)
+    return True
 
 
 class DashboardDataProvider:
@@ -181,6 +276,8 @@ class DashboardDataProvider:
 
         with open(output_path, "w") as f:
             json.dump(data, f, indent=2)
+
+        _write_daily_pnl_snapshot(data, output_path.parent / "daily_pnl.json")
 
         logger.info(f"Dashboard data written to {output_path}")
         return str(output_path)

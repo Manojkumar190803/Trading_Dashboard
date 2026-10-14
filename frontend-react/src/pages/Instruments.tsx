@@ -15,6 +15,26 @@ const LOT_SIZE_MAP: Record<string, number> = {
   'SENSEX': 20,
 }
 
+const strategyBadgeClass = (strategy: string) => clsx(
+  'px-3 py-1 rounded-full text-xs font-medium',
+  strategy === '21EMA'
+    ? 'bg-accent-cyan/20 text-accent-cyan'
+    : strategy === 'HD'
+      ? 'bg-accent-blue/20 text-accent-blue'
+      : strategy === 'CD'
+        ? 'bg-accent-green/20 text-accent-green'
+        : strategy === 'TC'
+          ? 'bg-accent-yellow/20 text-accent-yellow'
+          : strategy === '2BC'
+            ? 'bg-accent-red/20 text-accent-red'
+            : 'bg-accent-purple/20 text-accent-purple'
+)
+
+const formatMonitoringWindow = (startTime?: string, endTime?: string) => {
+  if (!startTime && !endTime) return '—'
+  return `${startTime || '—'} → ${endTime || '—'}`
+}
+
 interface FormData {
   name: string
   brokerSymbol: string
@@ -500,37 +520,16 @@ const Instruments: React.FC = () => {
                     </td>
                     <td className="px-6 py-4 text-text-secondary font-mono text-sm">{inst.brokerSymbol}</td>
                     <td className="px-6 py-4">
-                      <span
-                        className={clsx(
-                          'px-3 py-1 rounded-full text-xs font-medium',
-                          inst.strategy === '21EMA'
-                            ? 'bg-accent-cyan/20 text-accent-cyan'
-                            : inst.strategy === 'HD'
-                              ? 'bg-accent-blue/20 text-accent-blue'
-                              : inst.strategy === 'CD'
-                                ? 'bg-accent-green/20 text-accent-green'
-                                : inst.strategy === 'TC'
-                                  ? 'bg-accent-yellow/20 text-accent-yellow'
-                                  : inst.strategy === '2BC'
-                                    ? 'bg-accent-red/20 text-accent-red'
-                                    : 'bg-accent-purple/20 text-accent-purple'
-                        )}
-                      >
-                        {inst.strategy}
-                      </span>
+                      <span className={strategyBadgeClass(inst.strategy)}>{inst.strategy}</span>
                     </td>
                     <td className="px-6 py-4 text-text-secondary font-mono">{inst.lotSize || calculateLotSize(inst.name)}</td>
                     <td className="px-6 py-4 text-text-secondary text-sm">
-                      {inst.strategy === '21EMA' ? (
-                        <span className="text-text-tertiary">—</span>
-                      ) : (
-                        <span>
-                          {(inst as any).premiumMinPrice?.toFixed(2) || '—'} - {(inst as any).premiumMaxPrice?.toFixed(2) || '—'}
-                        </span>
+                      <div>{formatMonitoringWindow(inst.monitoringStartTime, inst.monitoringEndTime)}</div>
+                      {inst.strategy !== '21EMA' && (
+                        <div className="mt-1 text-xs text-text-tertiary">
+                          Premium: {(inst as any).premiumMinPrice?.toFixed(2) || '—'} - {(inst as any).premiumMaxPrice?.toFixed(2) || '—'}
+                        </div>
                       )}
-                    </td>
-                    <td className="px-6 py-4 text-text-secondary text-sm">
-                      {inst.monitoringStartTime} → {inst.monitoringEndTime}
                     </td>
                     <td className="px-6 py-4">
                       <div className="flex items-center gap-2">
@@ -736,48 +735,96 @@ const Instruments: React.FC = () => {
 
       {inactiveInstruments.length > 0 && (
         <section className="space-y-4" aria-labelledby="inactive-instruments-heading">
-          <div className="flex items-center justify-between border-b border-accent-yellow/30 pb-3">
+          <div className="flex items-center justify-between border-b border-accent-red/30 pb-3">
             <div>
-              <h2 id="inactive-instruments-heading" className="text-lg font-bold text-accent-yellow">
+              <h2 id="inactive-instruments-heading" className="text-lg font-bold text-accent-red">
                 Inactive Instruments
               </h2>
               <p className="mt-1 text-xs text-text-secondary">
                 Saved configurations, excluded from monitoring until activated.
               </p>
             </div>
-            <span className="rounded-full border border-accent-yellow/30 bg-accent-yellow/10 px-3 py-1 text-xs font-bold text-accent-yellow">
+            <span className="rounded-full border border-accent-red/30 bg-accent-red/10 px-3 py-1 text-xs font-bold text-accent-red">
               {inactiveInstruments.length} inactive
             </span>
           </div>
-          <div className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-3">
-            {inactiveInstruments.map((instrument) => (
-              <div
-                key={instrument.id}
-                className="flex items-center justify-between gap-4 rounded-lg border border-l-4 border-accent-yellow/40 border-l-accent-yellow bg-gradient-to-r from-accent-yellow/10 to-bg-secondary/60 p-4"
-              >
-                <div className="min-w-0">
-                  <div className="flex items-center gap-2">
-                    <AlertCircle size={16} className="shrink-0 text-accent-yellow" />
-                    <h3 className="truncate font-bold text-text-primary">{instrument.name}</h3>
-                    <span className="shrink-0 rounded bg-accent-yellow/15 px-2 py-0.5 text-[10px] font-bold uppercase text-accent-yellow">
-                      Inactive
-                    </span>
-                  </div>
-                  <p className="mt-1 truncate pl-6 font-mono text-xs text-text-secondary">
-                    {instrument.brokerSymbol} <span className="px-1 text-text-tertiary">·</span> {instrument.strategy}
-                  </p>
-                </div>
-                <button
-                  onClick={() => void handleToggle(instrument)}
-                  aria-label={`Activate ${instrument.name}`}
-                  title={`Activate ${instrument.name}`}
-                  className="flex shrink-0 items-center gap-2 rounded border border-accent-green/40 bg-accent-green/10 px-3 py-2 text-xs font-bold text-accent-green transition-colors hover:bg-accent-green/20"
-                >
-                  <Power size={15} />
-                  Activate
-                </button>
-              </div>
-            ))}
+          <div className="overflow-x-auto rounded-lg border border-bg-tertiary bg-bg-secondary">
+            <table className="w-full min-w-[850px]">
+              <thead>
+                <tr className="border-b border-bg-tertiary bg-bg-primary">
+                  <th className="px-6 py-4 text-left text-sm font-semibold text-text-secondary">Name</th>
+                  <th className="px-6 py-4 text-left text-sm font-semibold text-text-secondary">Broker Symbol</th>
+                  <th className="px-6 py-4 text-left text-sm font-semibold text-text-secondary">Strategy</th>
+                  <th className="px-6 py-4 text-left text-sm font-semibold text-text-secondary">Lot Size</th>
+                  <th className="px-6 py-4 text-left text-sm font-semibold text-text-secondary">Monitoring</th>
+                  <th className="px-6 py-4 text-left text-sm font-semibold text-text-secondary">Status</th>
+                  <th className="px-6 py-4 text-center text-sm font-semibold text-text-secondary">Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {inactiveInstruments.map((instrument) => (
+                  <tr key={instrument.id} className="border-b border-bg-tertiary last:border-0 hover:bg-bg-primary/50 transition-colors">
+                    <td className="px-6 py-4">
+                      <span className="font-semibold text-text-primary">{instrument.name}</span>
+                    </td>
+                    <td className="px-6 py-4 font-mono text-sm text-text-secondary">{instrument.brokerSymbol}</td>
+                    <td className="px-6 py-4">
+                      <span className={strategyBadgeClass(instrument.strategy)}>{instrument.strategy}</span>
+                    </td>
+                    <td className="px-6 py-4 font-mono text-text-secondary">
+                      {instrument.lotSize || calculateLotSize(instrument.name)}
+                    </td>
+                    <td className="px-6 py-4 text-sm text-text-secondary">
+                      <div>{formatMonitoringWindow(instrument.monitoringStartTime, instrument.monitoringEndTime)}</div>
+                      {instrument.strategy !== '21EMA' && (
+                        <div className="mt-1 text-xs text-text-tertiary">
+                          Premium: {(instrument as any).premiumMinPrice?.toFixed(2) || '—'} - {(instrument as any).premiumMaxPrice?.toFixed(2) || '—'}
+                        </div>
+                      )}
+                    </td>
+                    <td className="px-6 py-4">
+                      <div className="flex items-center gap-2 text-accent-red">
+                        <AlertCircle size={18} />
+                        <span>Inactive</span>
+                      </div>
+                    </td>
+                    <td className="px-6 py-4">
+                      <div className="flex items-center justify-center gap-2">
+                        <button
+                          onClick={() => void handleToggle(instrument)}
+                          aria-label={`Activate ${instrument.name}`}
+                          title={`Activate ${instrument.name}`}
+                          className="rounded p-2 text-accent-red transition-colors hover:bg-accent-red/10 hover:text-accent-cyan"
+                        >
+                          <Power size={18} />
+                        </button>
+                        <button
+                          onClick={() => handleEdit(instrument)}
+                          aria-label={`Edit ${instrument.name}`}
+                          title="Edit instrument settings"
+                          className="rounded p-2 text-text-secondary transition-colors hover:bg-bg-tertiary hover:text-accent-cyan"
+                        >
+                          <Edit2 size={18} />
+                        </button>
+                        <button
+                          onClick={() => {
+                            const confirmMessage = `⚠️ PERMANENT DELETE\n\n"${instrument.name}" will be permanently removed from the database.\n\nThis action CANNOT be undone.\n\nAre you sure?`
+                            if (window.confirm(confirmMessage)) {
+                              apiDeleteInstrument(instrument.id)
+                            }
+                          }}
+                          aria-label={`Delete ${instrument.name}`}
+                          title="Permanently delete (cannot undo)"
+                          className="rounded p-2 text-text-secondary transition-colors hover:bg-accent-red/10 hover:text-accent-red"
+                        >
+                          <Trash2 size={18} />
+                        </button>
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
           </div>
         </section>
       )}
