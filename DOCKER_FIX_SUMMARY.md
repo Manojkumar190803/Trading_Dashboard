@@ -1,5 +1,40 @@
 # Docker Container Fix - Summary
 
+## Current Runtime and Reliability Updates (2026-10-20)
+
+### Dashboard-controlled strategy execution
+
+- In Compose, `strategy_worker` runs `api_server.py` only; it no longer starts
+   the image-default `NIFTY BANKNIFTY` strategy list.
+- `hd_strategy_daemon` polls `GET /api/instruments` every five seconds and
+   starts runners only for `ACTIVE` instruments. Inactive and archived rows are
+   excluded. Despite its legacy name, Compose clears `STRATEGY_FILTER` so all
+   configured strategy types can be managed.
+- Deactivation stops that strategy process on the next poll. It does not cancel
+   orders already submitted to OpenAlgo or close existing broker positions.
+
+### Database and dashboard reliability
+
+- Instrument API routes close SQLAlchemy sessions on success and error paths and
+   roll back failed writes to prevent connection-pool exhaustion.
+- Startup initialization adds missing `instruments.entry_cutoff_time` and
+   `instruments.max_initial_risk_points` columns without replacing existing rows.
+- The React dashboard health check probes `127.0.0.1:3000` inside its container.
+
+### Incident verification
+
+- The BANKNIFTY order was tagged `EMA21_Strategy` and came from the worker's
+   hard-coded script list, not the inactive HD configuration.
+- After rebuild, the worker ran only the API and the daemon started only the
+   active NIFTY 21EMA runner.
+- The incident BANKNIFTY order was cancelled with zero filled quantity.
+- Focused daemon/runtime tests passed (8 tests).
+
+See [DOCKER_GUIDE.md](DOCKER_GUIDE.md) for operating instructions and
+[DOCKER_ARCHITECTURE.md](DOCKER_ARCHITECTURE.md) for current service flow.
+
+---
+
 ## Problem Identified
 Docker containers for option buying strategies were not visible/running because the Dockerfile build was **failing**.
 
@@ -36,9 +71,9 @@ Fixed 4 Dockerfiles to remove problematic build-time copies:
 4. **Dockerfile.streamlit** (Streamlit Interface)
    - ✅ No changes needed (already correct)
 
-## Current Status
+## Historical Status (2026-10-07)
 
-### ✅ All 4 Containers Now Running:
+### Historical Snapshot: Four Containers Running
 
 | Service | Container | Port | Status | Function |
 |---------|-----------|------|--------|----------|

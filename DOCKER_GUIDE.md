@@ -1,13 +1,34 @@
 # Docker Guide for Trading Strategy Application
 
+## Current Compose Runtime
+
+In the current Compose deployment, `strategy_worker` serves the Flask API only.
+The legacy-named `hd_strategy_daemon` polls `GET /api/instruments` every five
+seconds and starts strategy runners only for `ACTIVE` dashboard instruments;
+inactive and archived rows are excluded. Compose clears `STRATEGY_FILTER`, so
+the daemon can run every configured strategy type. See
+[DOCKER_ARCHITECTURE.md](DOCKER_ARCHITECTURE.md) for service and data flow.
+
+Deactivation stops a strategy process on the next daemon poll and prevents
+future signals from it. It does not cancel an order already submitted to
+OpenAlgo or close a broker position; check and manage those broker-side states
+separately. Manual `run_strategy.py --mode live` commands bypass dashboard
+instrument status.
+
+The API initializes the schema on startup, including additive updates for
+missing `instruments.entry_cutoff_time` and `instruments.max_initial_risk_points`
+columns. Instrument API sessions are closed on every path and failed writes are
+rolled back. The React health check probes `127.0.0.1:3000` inside the container.
+
 ## Overview
 
 This guide explains how to run the trading strategy application using Docker. The setup includes:
 
 - **React Dashboard** (Modern Frontend) - Port 3000
 - **Streamlit Dashboard** (Legacy Frontend) - Port 8502
-- **Strategy Worker** (Backend Engine) - Runs strategy logic
-- **Nginx Reverse Proxy** - Serves React app and static files
+- **Strategy Worker** - Flask API on port 5003
+- **Strategy Daemon** - Starts live runners from active dashboard instruments
+- **Dashboard Exporter** - Writes broker account data to shared JSON files
 
 ## Prerequisites
 
@@ -60,26 +81,24 @@ docker-compose logs -f react_dashboard
 
 **Port**: 3000
 
-### Strategy Worker (Core Engine)
+### Strategy Worker (API and CLI Utilities)
 
 ```bash
-# Start strategy worker
+# Start the API worker
 docker-compose up -d strategy_worker
 
-# View live logs
+# View API logs
 docker-compose logs -f strategy_worker
 
-# Run in backtest mode
-docker-compose run --rm strategy_worker \
-  --mode backtest \
-  --start 2026-10-01 \
-  --end 2026-10-06
+# Run a one-off backtest (independent of dashboard instrument status)
+docker compose exec strategy_worker python3 run_strategy.py \
+  --script NIFTY --strategy ema21 --mode backtest \
+  --start 2026-10-01 --end 2026-10-06
 ```
 
-**Modes:**
-- `live` - Real-time trading
-- `backtest` - Historical analysis
-- `paper` - Paper trading
+Use the dashboard-managed daemon for live Docker trading. A manually started
+`run_strategy.py --mode live` process does not enforce dashboard instrument
+status.
 
 ### Streamlit Dashboard (Legacy UI)
 

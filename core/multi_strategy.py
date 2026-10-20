@@ -90,7 +90,10 @@ class MultiStrategyRuntime:
                     ]
                     if not matches.empty:
                         position = int(matches.index[-1])
-                        side_row = matches.iloc[-1]
+                        side_row = matches.iloc[-1].copy()
+                        if key == "hd":
+                            for indicator in ("ema13", "ema20", "ema50"):
+                                side_row[f"spot_{indicator}"] = row.get(indicator)
                         side_prev = side_frame.iloc[position - 1] if position > 0 else None
                         engine.process_option_candle(side, side_row, side_prev)
                         processed_option = True

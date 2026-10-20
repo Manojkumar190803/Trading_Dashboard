@@ -11,6 +11,7 @@ This daemon:
 from __future__ import annotations
 
 import json
+import fcntl
 import logging
 import os
 import subprocess
@@ -20,6 +21,8 @@ import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
+from urllib.error import URLError
+from urllib.request import urlopen
 
 logging.basicConfig(
     level=logging.INFO,
@@ -31,19 +34,51 @@ LOGS_DIR = Path(os.getenv('LOGS_DIR', 'logs'))
 CONFIG_FILE = LOGS_DIR / 'instruments_config.json'
 STATUS_FILE = LOGS_DIR / 'strategies_status.json'
 SCRIPTS_PID_FILE = LOGS_DIR / '.strategy_pids.json'
+DAEMON_LOCK_FILE = LOGS_DIR / '.strategy_daemon.lock'
 
 # Track running processes
 running_processes: dict[str, subprocess.Popen] = {}
 running_status: dict[str, Any] = {}
+process_log_handles: dict[str, Any] = {}
 
 
-def _load_config() -> dict[str, Any]:
-    """Load instruments config from React dashboard export."""
+def _load_trailing_config() -> dict[str, Any]:
     try:
         if CONFIG_FILE.exists():
-            return json.loads(CONFIG_FILE.read_text(encoding='utf-8'))
-    except (OSError, json.JSONDecodeError) as e:
-        logger.error(f"Failed to load config: {e}")
+            payload = json.loads(CONFIG_FILE.read_text(encoding='utf-8'))
+            trailing = payload.get('trailingStopsConfig', {})
+            return trailing if isinstance(trailing, dict) else {}
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning("could not load dashboard trailing settings: %s", exc)
+    return {}
+
+
+def _load_config() -> Optional[dict[str, Any]]:
+    """Load active instruments from the dashboard API, or its local export."""
+    api_url = os.getenv('STRATEGY_DASHBOARD_API_URL', '').strip()
+    if api_url:
+        try:
+            with urlopen(api_url, timeout=5) as response:
+                payload = json.loads(response.read().decode('utf-8'))
+            if not isinstance(payload, dict) or not isinstance(payload.get('instruments'), list):
+                logger.error("dashboard instrument API returned an invalid payload")
+                return None
+            payload['trailingStopsConfig'] = _load_trailing_config()
+            return payload
+        except (OSError, URLError, TimeoutError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            logger.warning("dashboard instrument API unavailable; keeping current processes: %s", exc)
+            return None
+
+    try:
+        if CONFIG_FILE.exists():
+            payload = json.loads(CONFIG_FILE.read_text(encoding='utf-8'))
+            if isinstance(payload, dict) and isinstance(payload.get('instruments'), list):
+                return payload
+            logger.error("dashboard instrument export has an invalid shape")
+            return None
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.error("failed to load dashboard export: %s", exc)
+        return None
     return {'instruments': []}
 
 
@@ -94,6 +129,28 @@ def _build_command(instrument: dict[str, Any]) -> list[str]:
     return cmd
 
 
+def _managed_instruments(config: dict[str, Any]) -> dict[Any, dict[str, Any]]:
+    strategy_filter = {
+        name.strip().upper()
+        for name in os.getenv('STRATEGY_FILTER', '').split(',')
+        if name.strip()
+    }
+    return {
+        instrument['id']: instrument
+        for instrument in config.get('instruments', [])
+        if isinstance(instrument, dict)
+        and 'id' in instrument
+        and (
+            instrument.get('status') is True
+            or str(instrument.get('status', '')).upper() == 'ACTIVE'
+        )
+        and (
+            not strategy_filter
+            or str(instrument.get('strategy', '')).upper() in strategy_filter
+        )
+    }
+
+
 def _start_strategy(instrument: dict[str, Any]) -> Optional[subprocess.Popen]:
     """Start monitoring a strategy for the given instrument."""
     inst_id = instrument.get('id', 'unknown')
@@ -109,16 +166,19 @@ def _start_strategy(instrument: dict[str, Any]) -> Optional[subprocess.Popen]:
         cmd = _build_command(instrument)
         logger.info(f"Starting strategy for {inst_name} ({strategy}): {' '.join(cmd)}")
         
-        # Start the process
+        safe_id = ''.join(char if char.isalnum() or char in '-_' else '_' for char in str(inst_id))
+        log_path = LOGS_DIR / f"strategy_{safe_id}.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_handle = log_path.open('a', encoding='utf-8')
         proc = subprocess.Popen(
             cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            env={**os.environ, 'PYTHONUNBUFFERED': '1'},
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
+            env=_strategy_environment(instrument, _current_trailing_config),
         )
-        
+
         running_processes[inst_id] = proc
+        process_log_handles[inst_id] = log_handle
         running_status[inst_id] = {
             'instrument_name': inst_name,
             'strategy': strategy,
@@ -130,6 +190,8 @@ def _start_strategy(instrument: dict[str, Any]) -> Optional[subprocess.Popen]:
         logger.info(f"Started {inst_name} (PID: {proc.pid})")
         return proc
     except Exception as e:
+        if 'log_handle' in locals():
+            log_handle.close()
         logger.error(f"Failed to start strategy for {inst_name}: {e}")
         running_status[inst_id] = {
             'instrument_name': inst_name,
@@ -139,6 +201,91 @@ def _start_strategy(instrument: dict[str, Any]) -> Optional[subprocess.Popen]:
             'failed_at': datetime.now().isoformat(),
         }
         return None
+
+
+def _strategy_environment(
+    instrument: dict[str, Any],
+    trailing_config: Optional[dict[str, Any]] = None,
+) -> dict[str, str]:
+    environment = {**os.environ, 'PYTHONUNBUFFERED': '1'}
+    strategy_key = str(instrument.get('strategy', '21EMA')).strip().upper()
+    if strategy_key in {'21EMA', 'EMA21'}:
+        strategy_key = 'EMA21'
+
+    if strategy_key == 'EMA21':
+        strategy_tag = environment.get('STRATEGY_NAME', 'Strategy')
+    else:
+        strategy_tag = strategy_key
+    environment['STRATEGY_NAME'] = strategy_tag
+    environment['SHARED_SL_COUNT_NAMESPACE'] = strategy_key
+    if strategy_key != 'EMA21':
+        environment.pop('SHARED_SL_COUNT_FILE', None)
+
+    if strategy_key != 'HD':
+        return environment
+
+    trailing = trailing_config or {}
+    lot_size_value = instrument.get('lotSizeAdjustment')
+    lot_size_adjustment = float(1 if lot_size_value is None else lot_size_value)
+    if lot_size_adjustment < 1 or not lot_size_adjustment.is_integer():
+        raise ValueError('HD lotSizeAdjustment must be a positive integer')
+
+    premium_min = instrument.get('premiumMinPrice')
+    premium_max = instrument.get('premiumMaxPrice')
+    max_initial_risk = instrument.get('maxInitialRiskPoints')
+    if max_initial_risk is None:
+        max_initial_risk = 20
+    values = {
+        'HD_PREMIUM_MIN_PRICE': 120 if premium_min is None else premium_min,
+        'HD_PREMIUM_MAX_PRICE': 180 if premium_max is None else premium_max,
+        'HD_MAX_OPTION_RISK_POINTS': max_initial_risk,
+        'HD_FULL_SIZE_LOTS': int(lot_size_adjustment),
+        'HD_MONITORING_START_TIME': instrument.get('monitoringStartTime') or '09:15',
+        'HD_MONITORING_END_TIME': instrument.get('monitoringEndTime') or '15:30',
+        'HD_ENTRY_CUTOFF': instrument.get('entryCutoffTime') or '14:40',
+        'HD_BREAKEVEN_RR': trailing.get('breakEvenRR')
+        if trailing.get('breakEvenRR') is not None else 1.25,
+        'HD_TRAIL_STEP_RR': trailing.get('trailStepRR')
+        if trailing.get('trailStepRR') is not None else 0.5,
+    }
+    environment.update({key: str(value) for key, value in values.items()})
+    return environment
+
+
+_current_trailing_config: dict[str, Any] = {}
+
+
+def _acquire_singleton_lock() -> Optional[Any]:
+    """Prevent a second manager from launching duplicate strategy processes."""
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    handle = DAEMON_LOCK_FILE.open('a+', encoding='utf-8')
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        handle.close()
+        return None
+
+    handle.seek(0)
+    handle.truncate()
+    handle.write(f'{os.getpid()}\n')
+    handle.flush()
+    return handle
+
+
+def _runtime_signature(instrument: dict[str, Any], trailing: dict[str, Any]) -> tuple[object, ...]:
+    return (
+        instrument.get('strategy'),
+        instrument.get('brokerSymbol'),
+        instrument.get('monitoringStartTime'),
+        instrument.get('premiumMinPrice'),
+        instrument.get('premiumMaxPrice'),
+        instrument.get('maxInitialRiskPoints'),
+        instrument.get('lotSizeAdjustment'),
+        instrument.get('entryCutoffTime'),
+        instrument.get('monitoringEndTime'),
+        trailing.get('breakEvenRR'),
+        trailing.get('trailStepRR'),
+    )
 
 
 def _stop_strategy(inst_id: str) -> None:
@@ -161,6 +308,9 @@ def _stop_strategy(inst_id: str) -> None:
             proc.wait()
         
         del running_processes[inst_id]
+        log_handle = process_log_handles.pop(inst_id, None)
+        if log_handle is not None:
+            log_handle.close()
         if inst_id in running_status:
             running_status[inst_id]['status'] = 'stopped'
             running_status[inst_id]['stopped_at'] = datetime.now().isoformat()
@@ -189,6 +339,9 @@ def _monitor_health() -> None:
             # Remove dead processes
             for inst_id in dead_pids:
                 del running_processes[inst_id]
+                log_handle = process_log_handles.pop(inst_id, None)
+                if log_handle is not None:
+                    log_handle.close()
             
             if dead_pids:
                 _save_status()
@@ -198,6 +351,7 @@ def _monitor_health() -> None:
 
 def monitor_instruments() -> None:
     """Main loop: monitor config file and manage strategy lifecycle."""
+    global _current_trailing_config
     last_config: dict[str, Any] = {}
     
     # Start health monitoring thread
@@ -212,24 +366,26 @@ def monitor_instruments() -> None:
             
             # Load current config
             current_config = _load_config()
-            current_instruments = {
-                inst['id']: inst for inst in current_config.get('instruments', [])
-            }
-            last_instruments = {
-                inst['id']: inst for inst in last_config.get('instruments', [])
-            }
+            if current_config is None:
+                continue
+            _current_trailing_config = current_config.get('trailingStopsConfig', {})
+            current_instruments = _managed_instruments(current_config)
+            last_instruments = _managed_instruments(last_config)
             
             # Find new or toggled instruments
             for inst_id, instrument in current_instruments.items():
-                was_active = last_instruments.get(inst_id, {}).get('status', False)
-                is_active = instrument.get('status', False)
+                was_active = inst_id in last_instruments
                 
-                if is_active and not was_active:
+                if inst_id not in running_processes:
                     # Instrument just became active
                     _start_strategy(instrument)
-                elif not is_active and was_active:
-                    # Instrument just became inactive
+                elif (
+                    was_active
+                    and _runtime_signature(instrument, _current_trailing_config)
+                    != _runtime_signature(last_instruments.get(inst_id, {}), last_config.get('trailingStopsConfig', {}))
+                ):
                     _stop_strategy(inst_id)
+                    _start_strategy(instrument)
             
             # Find removed instruments
             for inst_id in last_instruments:
@@ -258,7 +414,18 @@ def monitor_instruments() -> None:
 
 if __name__ == '__main__':
     try:
+        daemon_lock = _acquire_singleton_lock()
+    except OSError:
+        logger.exception("could not acquire the strategy daemon lock")
+        sys.exit(1)
+    if daemon_lock is None:
+        logger.error("another strategy daemon owns the shared logs directory; refusing to start")
+        sys.exit(1)
+
+    try:
         monitor_instruments()
     except Exception as e:
         logger.exception("Daemon crashed: %s", e)
         sys.exit(1)
+    finally:
+        daemon_lock.close()

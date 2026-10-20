@@ -6,12 +6,14 @@ interface InstrumentPayload {
   brokerSymbol: string
   monitoringStartTime: string
   monitoringEndTime: string
+  entryCutoffTime: string
   lotSizeAdjustment: number
   calculatedLotSize: number
   strategy: string
   productType: string
   premiumMinPrice?: number
   premiumMaxPrice?: number
+  maxInitialRiskPoints?: number
   status?: string
 }
 
@@ -37,6 +39,7 @@ export const useInstruments = (includeArchived = false) => {
         brokerSymbol: inst.brokerSymbol || inst.broker_symbol || inst.name.toUpperCase(),
         monitoringStartTime: inst.monitoringStartTime || inst.monitoring_start_time || '',
         monitoringEndTime: inst.monitoringEndTime || inst.monitoring_end_time || '',
+        entryCutoffTime: inst.entryCutoffTime || inst.entry_cutoff_time || '14:40',
         lotSizeAdjustment: inst.lotSizeAdjustment ?? inst.lot_size_adjustment ?? 1,
         lotSize: inst.calculatedLotSize || inst.calculated_lot_size,
         strategy: inst.strategy as any,
@@ -44,6 +47,7 @@ export const useInstruments = (includeArchived = false) => {
         status: inst.status === 'ACTIVE' || inst.status === true,
         premiumMinPrice: inst.premiumMinPrice || inst.premium_min_price,
         premiumMaxPrice: inst.premiumMaxPrice || inst.premium_max_price,
+        maxInitialRiskPoints: inst.maxInitialRiskPoints ?? inst.max_initial_risk_points ?? 20,
         premiumOptionStrike: inst.premiumOptionStrike || inst.premium_option_strike,
         createdAt: inst.createdAt || inst.created_at,
         updatedAt: inst.updatedAt || inst.updated_at,
@@ -76,12 +80,14 @@ export const useInstruments = (includeArchived = false) => {
           brokerSymbol: formData.brokerSymbol,
           monitoringStartTime: formData.monitoringStartTime,
           monitoringEndTime: formData.monitoringEndTime,
+          entryCutoffTime: formData.entryCutoffTime,
           lotSizeAdjustment: formData.lotSizeAdjustment,
           calculatedLotSize: formData.calculatedLotSize,
           strategy: formData.strategy,
           productType: formData.productType,
           premiumMinPrice: formData.premiumMinPrice,
           premiumMaxPrice: formData.premiumMaxPrice,
+          maxInitialRiskPoints: formData.maxInitialRiskPoints,
         }),
       })
       
@@ -107,12 +113,14 @@ export const useInstruments = (includeArchived = false) => {
               brokerSymbol: formData.brokerSymbol,
               monitoringStartTime: formData.monitoringStartTime,
               monitoringEndTime: formData.monitoringEndTime,
+              entryCutoffTime: formData.entryCutoffTime,
               lotSizeAdjustment: formData.lotSizeAdjustment,
               calculatedLotSize: formData.calculatedLotSize,
               strategy: formData.strategy,
               productType: formData.productType,
               premiumMinPrice: formData.premiumMinPrice,
               premiumMaxPrice: formData.premiumMaxPrice,
+              maxInitialRiskPoints: formData.maxInitialRiskPoints,
               status: 'ACTIVE',
             }),
           })
@@ -143,12 +151,14 @@ export const useInstruments = (includeArchived = false) => {
           brokerSymbol: formData.brokerSymbol,
           monitoringStartTime: formData.monitoringStartTime,
           monitoringEndTime: formData.monitoringEndTime,
+          entryCutoffTime: formData.entryCutoffTime,
           lotSizeAdjustment: formData.lotSizeAdjustment,
           calculatedLotSize: formData.calculatedLotSize,
           strategy: formData.strategy,
           productType: formData.productType,
           premiumMinPrice: formData.premiumMinPrice,
           premiumMaxPrice: formData.premiumMaxPrice,
+          maxInitialRiskPoints: formData.maxInitialRiskPoints,
         }),
       })
       

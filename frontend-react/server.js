@@ -206,19 +206,19 @@ app.post('/api/instruments/export', (req, res) => {
     
     const config = {
       exported_at: new Date().toISOString(),
+      trailingStopsConfig: req.body.trailingStopsConfig || {},
       instruments: instruments.map(inst => ({
         id: inst.id,
         name: inst.name,
         brokerSymbol: inst.brokerSymbol,
         strategy: inst.strategy,
         status: inst.status,
-        atmPrice: inst.atmPrice,
-        minPremium: inst.minPremium,
-        maxPremium: inst.maxPremium,
-        breakeven_rr: inst.breakeven_rr || 1.0,
-        trail_step_rr: inst.trail_step_rr || 0.5,
-        max_initial_risk_points: inst.max_initial_risk_points || 20.0,
+        premiumMinPrice: inst.premiumMinPrice,
+        premiumMaxPrice: inst.premiumMaxPrice,
+        maxInitialRiskPoints: inst.maxInitialRiskPoints,
+        calculatedLotSize: inst.calculatedLotSize,
         lotSizeAdjustment: inst.lotSizeAdjustment,
+        entryCutoffTime: inst.entryCutoffTime,
         monitoringStartTime: inst.monitoringStartTime,
         monitoringEndTime: inst.monitoringEndTime,
       }))

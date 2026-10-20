@@ -30,6 +30,7 @@ class _StubClient:
             }
         )
         self.last_placeorder_kwargs = None
+        self.last_optionchain_kwargs = None
         self.optionchain_response = {
             "status": "success",
             "data": {
@@ -54,6 +55,7 @@ class _StubClient:
         return self.history_response
 
     def optionchain(self, **kwargs):
+        self.last_optionchain_kwargs = kwargs
         return self.optionchain_response
 
 
@@ -110,6 +112,72 @@ def test_openalgo_broker_init_and_dry_run_order_paths(fake_openalgo):
     assert fake_openalgo["api_kwargs"] == {"api_key": "k", "host": "h"}
     assert broker.place_stop_limit_order("NIFTYCE", OrderSide.BUY, 2, 10.0, 10.5).startswith("DRY-SL-L-")
     assert broker.place_market_order("NIFTYCE", OrderSide.SELL, 2).startswith("DRY-MKT-")
+
+
+def test_openalgo_broker_fetches_chain_for_selected_expiry(fake_openalgo):
+    broker = OpenAlgoBroker(api_key="k", host="h", dry_run=True)
+
+    chain = broker.fetch_option_chain("NIFTY", "NSE_INDEX", "22OCT26")
+
+    assert chain == fake_openalgo["client"].optionchain_response
+    assert fake_openalgo["client"].last_optionchain_kwargs == {
+        "underlying": "NIFTY",
+        "exchange": "NSE_INDEX",
+        "expiry_date": "22OCT26",
+    }
+
+
+def test_openalgo_broker_fetches_chain_through_rest_when_sdk_lacks_method(fake_openalgo, monkeypatch):
+    broker = OpenAlgoBroker(api_key="k", host="h", dry_run=True)
+    client = fake_openalgo["client"]
+    client.optionchain = None
+    client.base_url = "http://openalgo:5000/api/v1/"
+    client.api_key = "test-key"
+    expected_response = {
+        "status": "success",
+        "chain": [
+            {"strike": 25000, "ce": {"symbol": "NIFTYCE", "ltp": 150}, "pe": None},
+        ],
+    }
+    request = {}
+
+    class _Response:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return expected_response
+
+    def _post(url, *, json, timeout):
+        request.update(url=url, json=json, timeout=timeout)
+        return _Response()
+
+    monkeypatch.setattr("core.broker.requests.post", _post)
+
+    chain = broker.fetch_option_chain("NIFTY", "NSE_INDEX", "22OCT26")
+
+    assert chain == expected_response
+    assert request == {
+        "url": "http://openalgo:5000/api/v1/optionchain",
+        "json": {
+            "apikey": "test-key",
+            "underlying": "NIFTY",
+            "exchange": "NSE_INDEX",
+            "expiry_date": "22OCT26",
+        },
+        "timeout": 15,
+    }
+
+
+def test_openalgo_broker_option_chain_failure_is_reported(fake_openalgo):
+    broker = OpenAlgoBroker(api_key="k", host="h", dry_run=True)
+    fake_openalgo["client"].optionchain_response = {
+        "status": "error",
+        "message": "no chain",
+    }
+
+    with pytest.raises(RuntimeError, match="option chain request failed"):
+        broker.fetch_option_chain("NIFTY", "NSE_INDEX", "22OCT26")
 
 
 def test_openalgo_broker_get_ltp_paths(fake_openalgo):

@@ -38,12 +38,42 @@ def _reset_signal_state(engine: BaseStrategyEngine, side_state) -> None:
         engine.signal_provider.reset_after_entry(side_state)
 
 
-def _atm_lock_path(trading_day: date, script: str) -> Path:
-    return Path("logs") / f"atm_lock_{script}_{trading_day:%Y%m%d}.json"
+def _atm_lock_path(
+    trading_day: date,
+    script: str,
+    strategy_key: Optional[str] = None,
+) -> Path:
+    suffix = "_HD" if strategy_key == "hd" else ""
+    return Path("logs") / f"atm_lock_{script}{suffix}_{trading_day:%Y%m%d}.json"
 
 
 def _trade_alert_path(trading_day: date, script: str) -> Path:
     return Path("logs") / f"trade_alerts_{script}_{trading_day:%Y%m%d}.csv"
+
+
+def _has_active_strategy_entry_alert(
+    alerts: list[dict[str, str]],
+    symbol: str,
+) -> bool:
+    events = [
+        alert
+        for alert in alerts
+        if symbol in str(alert.get("message") or "")
+        and alert.get("category") in {"ENTRY", "EXIT"}
+    ]
+    if not events:
+        return False
+    latest = max(events, key=lambda alert: str(alert.get("timestamp") or ""))
+    return latest.get("category") == "ENTRY"
+
+
+def _alert_order_ids(alerts: list[dict[str, str]]) -> set[str]:
+    ids: set[str] = set()
+    for alert in alerts:
+        match = re.search(r"\border_id=([^\s,]+)", str(alert.get("message") or ""))
+        if match:
+            ids.add(match.group(1))
+    return ids
 
 
 def _runner_checkpoint_path(trading_day: date, script: str, strategy: str) -> Path:
@@ -175,13 +205,15 @@ def _persist_setup_status_monitoring(
         return
     symbol = str(getattr(side_state, "option_symbol", None) or side)
     ohlc = ""
+    strategy_key = str(getattr(engine.signal_provider, "strategy_key", "ema21"))
+    strategy_label = strategy_key.upper()
     if all(field in candle and pd.notna(candle[field]) for field in ("open", "high", "low", "close")):
         ohlc = (
             f" | O={float(candle['open']):.2f} H={float(candle['high']):.2f}"
             f" L={float(candle['low']):.2f} C={float(candle['close']):.2f}"
         )
     message = (
-        f"{side} EMA21 setup | {symbol} | {status} | "
+        f"{side} {strategy_label} setup | {symbol} | {status} | "
         f"candle={candle_time.strftime('%H:%M:%S')}{ohlc}"
     )
     row = {
@@ -275,7 +307,12 @@ def _cancel_stale_ema21_pending(
 def _persist_atm_lock(engine: BaseStrategyEngine, spot_price: float) -> None:
     if not engine.state.atm_locked or not engine.state.trading_day:
         return
-    path = _atm_lock_path(engine.state.trading_day, engine.cfg.option_index_symbol)
+    strategy_key = "hd" if engine._is_hd_strategy() else None
+    path = _atm_lock_path(
+        engine.state.trading_day,
+        engine.cfg.option_index_symbol,
+        strategy_key,
+    )
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "trading_day": engine.state.trading_day.isoformat(),
@@ -289,14 +326,18 @@ def _persist_atm_lock(engine: BaseStrategyEngine, spot_price: float) -> None:
 
 
 def _restore_atm_lock(engine: BaseStrategyEngine, trading_day: date) -> bool:
-    path = _atm_lock_path(trading_day, engine.cfg.option_index_symbol)
+    strategy_key = "hd" if engine._is_hd_strategy() else None
+    path = _atm_lock_path(trading_day, engine.cfg.option_index_symbol, strategy_key)
     if not path.exists():
         return False
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
-        ce_symbol = str(payload["ce_symbol"])
-        pe_symbol = str(payload["pe_symbol"])
-        if not ce_symbol or not pe_symbol:
+        ce_value = payload.get("ce_symbol")
+        pe_value = payload.get("pe_symbol")
+        ce_symbol = ce_value if isinstance(ce_value, str) and ce_value else None
+        pe_symbol = pe_value if isinstance(pe_value, str) and pe_value else None
+        hd_strategy = engine._is_hd_strategy()
+        if not (ce_symbol or pe_symbol) or (not hd_strategy and not (ce_symbol and pe_symbol)):
             return False
     except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
         logger.warning("could not restore ATM lock from %s: %s", path, exc)
@@ -324,6 +365,20 @@ def _restore_atm_lock_from_positions(
         logger.warning("could not inspect positions while restoring ATM lock: %s", exc)
         return False
 
+    strategy_alerts: list[dict[str, str]] = []
+    if engine._is_hd_strategy():
+        alert_path = _trade_alert_path(trading_day, engine.cfg.option_index_symbol)
+        try:
+            if alert_path.exists():
+                with alert_path.open(newline="", encoding="utf-8") as handle:
+                    strategy_alerts = [
+                        row for row in csv.DictReader(handle)
+                        if row.get("strategy") == engine.strategy_name
+                    ]
+        except OSError as exc:
+            logger.warning("could not inspect HD alerts while restoring ATM lock: %s", exc)
+            return False
+
     for position in positions:
         symbol = str(position.get("symbol") or "")
         quantity = int(float(position.get("quantity") or 0))
@@ -334,6 +389,11 @@ def _restore_atm_lock_from_positions(
         except ValueError:
             continue
         if root != engine.cfg.option_index_symbol:
+            continue
+        if engine._is_hd_strategy() and not _has_active_strategy_entry_alert(
+            strategy_alerts,
+            symbol,
+        ):
             continue
         ce_symbol = build_option_symbol(root, expiry_code, strike, "CE")
         pe_symbol = build_option_symbol(root, expiry_code, strike, "PE")
@@ -523,11 +583,19 @@ def _restore_open_positions(engine: BaseStrategyEngine, broker: OpenAlgoBroker, 
             stale_uncertain_symbols.add(symbol)
     if uncertain_symbols:
         adopted_symbols: set[str] = set()
+        unresolved_open_buy_symbols: set[str] = set()
         if open_orders is not None:
             for order in open_orders:
                 symbol = str(order.get("symbol") or "")
                 action = str(order.get("action") or order.get("side") or "").upper()
                 order_id = str(order.get("orderid") or order.get("order_id") or "")
+                if (
+                    symbol in uncertain_symbols
+                    and action == "BUY"
+                    and not engine._is_strategy_order(order, _alert_order_ids(alerts))
+                ):
+                    unresolved_open_buy_symbols.add(symbol)
+                    continue
                 details = uncertain_details.get(symbol)
                 if symbol not in uncertain_symbols or action != "BUY" or not order_id or details is None:
                     continue
@@ -578,7 +646,12 @@ def _restore_open_positions(engine: BaseStrategyEngine, broker: OpenAlgoBroker, 
             for position in broker_positions
             if int(float(position.get("quantity") or 0)) > 0
         }
-        for symbol in sorted(uncertain_symbols - adopted_symbols - broker_symbols):
+        for symbol in sorted(
+            uncertain_symbols
+            - adopted_symbols
+            - broker_symbols
+            - unresolved_open_buy_symbols
+        ):
             already_cleared = any(
                 alert.category == "CANCEL" and symbol in alert.message
                 for alert in engine.alerts
@@ -605,6 +678,21 @@ def _restore_open_positions(engine: BaseStrategyEngine, broker: OpenAlgoBroker, 
         r"(?:alert_trigger|trigger)=([\d.]+),?\s+SL=([\d.]+)(?:, option_risk=([\d.]+))?"
     )
     for position in broker_positions:
+        position_strategy = next(
+            (
+                str(position[key]).strip()
+                for key in ("strategy", "strategy_tag", "strategy_name")
+                if position.get(key) not in (None, "")
+            ),
+            "",
+        )
+        if position_strategy and not engine._is_strategy_order(position):
+            logger.info(
+                "ignoring broker position owned by another strategy (%s): %s",
+                position_strategy,
+                position.get("symbol"),
+            )
+            continue
         symbol = str(position.get("symbol") or "")
         quantity = int(float(position.get("quantity") or 0))
         if not symbol or quantity <= 0:
@@ -625,9 +713,25 @@ def _restore_open_positions(engine: BaseStrategyEngine, broker: OpenAlgoBroker, 
                 live_side = candidate_side
                 break
 
+        if (
+            engine._is_hd_strategy()
+            and live_pending is None
+            and not _has_active_strategy_entry_alert(alerts, symbol)
+        ):
+            logger.warning(
+                "ignoring broker position %s without an active HD entry alert",
+                symbol,
+            )
+            continue
+
         if live_pending is not None:
             side = live_side
+            if engine._is_hd_strategy():
+                quantity = min(quantity, live_pending.quantity)
             avg_price_raw = position.get("average_price")
+            if engine._is_hd_strategy() and live_pending.order_id:
+                order_status = broker.get_order_status(live_pending.order_id)
+                avg_price_raw = order_status.get("average_price") or avg_price_raw
             try:
                 avg_price = float(avg_price_raw) if avg_price_raw else None
             except (ValueError, TypeError):
@@ -659,6 +763,14 @@ def _restore_open_positions(engine: BaseStrategyEngine, broker: OpenAlgoBroker, 
             side, _, parsed_entry, _, trigger, stop, risk = match.groups()
             entry_alert = matching[-1]
             avg_price_raw = position.get("average_price")
+            if engine._is_hd_strategy():
+                try:
+                    quantity = min(quantity, int(match.group(4)))
+                except (TypeError, ValueError):
+                    logger.warning("could not parse HD entry quantity for %s", symbol)
+                    continue
+                if parsed_entry:
+                    avg_price_raw = parsed_entry
             try:
                 avg_price = float(avg_price_raw) if avg_price_raw else None
             except (ValueError, TypeError):
@@ -682,6 +794,12 @@ def _restore_open_positions(engine: BaseStrategyEngine, broker: OpenAlgoBroker, 
             risk = risk or str(abs(float(trigger) - float(stop)))
             entry_time = datetime.fromisoformat(str(entry_alert["timestamp"]))
         else:
+            if engine._is_hd_strategy():
+                logger.warning(
+                    "ignoring broker position %s without an HD-owned entry record",
+                    symbol,
+                )
+                continue
             try:
                 _, _, _, side = _parse_option_symbol(symbol)
             except ValueError:
@@ -741,6 +859,7 @@ def _restore_open_positions(engine: BaseStrategyEngine, broker: OpenAlgoBroker, 
                 order for order in open_orders
                 if str(order.get("symbol") or "") == symbol
                 and str(order.get("action") or order.get("side") or "").upper() == "SELL"
+                and engine._is_strategy_order(order, _alert_order_ids(alerts))
             ]
             expected_stop = float(stop)
             matching_protective_order = any(
@@ -769,6 +888,8 @@ def _restore_open_positions(engine: BaseStrategyEngine, broker: OpenAlgoBroker, 
         symbol = str(order.get("symbol") or "")
         action = str(order.get("action") or order.get("side") or "").upper()
         if not symbol or action != "BUY":
+            continue
+        if not engine._is_strategy_order(order, _alert_order_ids(alerts)):
             continue
         try:
             _, _, _, side = _parse_option_symbol(symbol)
@@ -1235,6 +1356,7 @@ class LiveFeedRunner:
 
     def _poll_once(self) -> None:
         now = datetime.now()
+        spot_data: Optional[pd.DataFrame] = None
         try:
             start_date = (now.date() - timedelta(days=1)).strftime("%Y-%m-%d")
             end_date = now.date().strftime("%Y-%m-%d")
@@ -1275,6 +1397,7 @@ class LiveFeedRunner:
                 continue
             try:
                 data = self._fetch_option_history(symbol)
+                data = _attach_spot_ema_context(data, spot_data)
             except Exception as exc:
                 logger.warning("history fetch failed for %s %s: %s", side, symbol, exc)
                 continue
@@ -1746,6 +1869,20 @@ class MultiEngineLiveFeedRunner:
 
     def _poll_once(self) -> None:
         now = datetime.now()
+        start_date = (now.date() - timedelta(days=1)).strftime("%Y-%m-%d")
+        end_date = now.date().strftime("%Y-%m-%d")
+        spot_data: Optional[pd.DataFrame] = None
+        try:
+            raw_spot = self.broker.fetch_history(
+                symbol=self.cfg.spot_symbol,
+                exchange=self.cfg.exchange_spot,
+                interval=f"{self.cfg.timeframe_minutes}m",
+                start_date=start_date,
+                end_date=end_date,
+            )
+            spot_data = add_indicators(_normalize_history_df(raw_spot), self.cfg)
+        except Exception as exc:
+            logger.warning("spot indicator history failed: %s", exc)
         self._try_lock_atm(now)
         first_engine = self.engines[0][1]
         if not first_engine.state.atm_locked:
@@ -1763,6 +1900,7 @@ class MultiEngineLiveFeedRunner:
                 continue
             try:
                 data = self._fetch_option_history(symbol)
+                data = _attach_spot_ema_context(data, spot_data)
             except Exception as exc:
                 logger.warning("history fetch failed for %s %s: %s", side, symbol, exc)
                 continue
@@ -1970,10 +2108,32 @@ def _iter_trading_days(spot_df: pd.DataFrame) -> list[date]:
 
 
 def _slice_session(df: pd.DataFrame, day: date, cfg: StrategyConfig) -> pd.DataFrame:
+    if df.empty:
+        return df.reset_index(drop=True)
     session_start = datetime.combine(day, cfg.market_open)
     session_end = datetime.combine(day, cfg.market_close)
     sub = df[(df["datetime"] >= session_start) & (df["datetime"] < session_end)]
     return sub.reset_index(drop=True)
+
+
+def _attach_spot_ema_context(
+    option_df: pd.DataFrame,
+    spot_df: Optional[pd.DataFrame],
+) -> pd.DataFrame:
+    if option_df.empty or spot_df is None or spot_df.empty:
+        return option_df
+    spot_columns = {"ema13": "spot_ema13", "ema20": "spot_ema20", "ema50": "spot_ema50"}
+    available = [column for column in spot_columns if column in spot_df.columns]
+    if not available:
+        return option_df
+
+    option = option_df.drop(columns=list(spot_columns.values()), errors="ignore").copy()
+    option["_row_order"] = range(len(option))
+    context = spot_df[["datetime", *available]].rename(columns=spot_columns).copy()
+    option = option.sort_values("datetime")
+    context = context.sort_values("datetime")
+    merged = pd.merge_asof(option, context, on="datetime", direction="backward")
+    return merged.sort_values("_row_order").drop(columns="_row_order").reset_index(drop=True)
 
 
 def _warmup_and_slice(df: pd.DataFrame, day: date, cfg: StrategyConfig) -> pd.DataFrame:
@@ -2050,7 +2210,7 @@ def run_historical_replay(
     total_bars = 0
     skipped_days = 0
     for day in _iter_trading_days(spot_df):
-        spot_day = _slice_session(spot_df, day, cfg)
+        spot_day = _warmup_and_slice(spot_df, day, cfg)
         if spot_day.empty:
             continue
 
@@ -2075,21 +2235,34 @@ def run_historical_replay(
             engine.lock_atm_for_day(lock_ts, atm_price, expiry_day_override=expiry_day)
         ce_sym = engine.state.ce_symbol
         pe_sym = engine.state.pe_symbol
-        assert ce_sym and pe_sym
+        if not ce_sym and not pe_sym:
+            skipped_days += 1
+            continue
 
         warmup_start = (day - timedelta(days=5)).strftime("%Y-%m-%d")
         day_str = day.strftime("%Y-%m-%d")
         try:
-            ce_raw, pe_raw, resolved_ce, resolved_pe, off = _resolve_option_pair_history(
-                history_broker,
-                ce_sym,
-                pe_sym,
-                cfg.exchange_options,
-                interval,
-                warmup_start,
-                day_str,
-                cfg.strike_step,
-            )
+            if ce_sym and pe_sym and not engine._is_hd_strategy():
+                ce_raw, pe_raw, resolved_ce, resolved_pe, off = _resolve_option_pair_history(
+                    history_broker,
+                    ce_sym,
+                    pe_sym,
+                    cfg.exchange_options,
+                    interval,
+                    warmup_start,
+                    day_str,
+                    cfg.strike_step,
+                )
+            else:
+                ce_raw = (
+                    _fetch_history_df(history_broker, ce_sym, cfg.exchange_options, interval, warmup_start, day_str)
+                    if ce_sym else pd.DataFrame()
+                )
+                pe_raw = (
+                    _fetch_history_df(history_broker, pe_sym, cfg.exchange_options, interval, warmup_start, day_str)
+                    if pe_sym else pd.DataFrame()
+                )
+                resolved_ce, resolved_pe, off = ce_sym, pe_sym, 0
             if off != 0:
                 logger.warning(
                     "replay %s: ATM strike history missing; fallback offset=%+d used (CE=%s PE=%s)",
@@ -2109,7 +2282,7 @@ def run_historical_replay(
             skipped_days += 1
             continue
 
-        if ce_raw.empty or pe_raw.empty:
+        if ce_raw.empty and pe_raw.empty:
             logger.warning(
                 "replay %s: empty option history (CE=%d PE=%d) — skipping day",
                 day, len(ce_raw), len(pe_raw),
@@ -2119,23 +2292,17 @@ def run_historical_replay(
 
         ce_day = _warmup_and_slice(ce_raw, day, cfg)
         pe_day = _warmup_and_slice(pe_raw, day, cfg)
+        ce_day = _attach_spot_ema_context(ce_day, spot_day)
+        pe_day = _attach_spot_ema_context(pe_day, spot_day)
 
         try:
-            ce_fill_raw = _fetch_history_df(
-                history_broker,
-                ce_sym,
-                cfg.exchange_options,
-                "1m",
-                day_str,
-                day_str,
+            ce_fill_raw = (
+                _fetch_history_df(history_broker, ce_sym, cfg.exchange_options, "1m", day_str, day_str)
+                if ce_sym else pd.DataFrame()
             )
-            pe_fill_raw = _fetch_history_df(
-                history_broker,
-                pe_sym,
-                cfg.exchange_options,
-                "1m",
-                day_str,
-                day_str,
+            pe_fill_raw = (
+                _fetch_history_df(history_broker, pe_sym, cfg.exchange_options, "1m", day_str, day_str)
+                if pe_sym else pd.DataFrame()
             )
         except Exception as exc:
             logger.warning(
@@ -2308,7 +2475,7 @@ def run_multi_historical_replay(
     skipped_days = 0
     total_bars = 0
     for day in _iter_trading_days(spot_df):
-        spot_day = _slice_session(spot_df, day, cfg)
+        spot_day = _warmup_and_slice(spot_df, day, cfg)
         if spot_day.empty:
             continue
 
@@ -2336,26 +2503,39 @@ def run_multi_historical_replay(
             engine.state.pe_symbol = engines[0][1].state.pe_symbol
             engine.state.ce.option_symbol = engine.state.ce_symbol
             engine.state.pe.option_symbol = engine.state.pe_symbol
-            engine.state.atm_locked = True
+            engine.state.atm_locked = bool(engine.state.ce_symbol or engine.state.pe_symbol)
 
         # All engines share the same ATM symbols
         ce_sym = engines[0][1].state.ce_symbol
         pe_sym = engines[0][1].state.pe_symbol
-        assert ce_sym and pe_sym
+        if not ce_sym and not pe_sym:
+            skipped_days += 1
+            continue
 
         warmup_start = (day - timedelta(days=5)).strftime("%Y-%m-%d")
         day_str = day.strftime("%Y-%m-%d")
         try:
-            ce_raw, pe_raw, resolved_ce, resolved_pe, off = _resolve_option_pair_history(
-                history_broker,
-                ce_sym,
-                pe_sym,
-                cfg.exchange_options,
-                interval,
-                warmup_start,
-                day_str,
-                cfg.strike_step,
-            )
+            if ce_sym and pe_sym and not engines[0][1]._is_hd_strategy():
+                ce_raw, pe_raw, resolved_ce, resolved_pe, off = _resolve_option_pair_history(
+                    history_broker,
+                    ce_sym,
+                    pe_sym,
+                    cfg.exchange_options,
+                    interval,
+                    warmup_start,
+                    day_str,
+                    cfg.strike_step,
+                )
+            else:
+                ce_raw = (
+                    _fetch_history_df(history_broker, ce_sym, cfg.exchange_options, interval, warmup_start, day_str)
+                    if ce_sym else pd.DataFrame()
+                )
+                pe_raw = (
+                    _fetch_history_df(history_broker, pe_sym, cfg.exchange_options, interval, warmup_start, day_str)
+                    if pe_sym else pd.DataFrame()
+                )
+                resolved_ce, resolved_pe, off = ce_sym, pe_sym, 0
             if off != 0:
                 logger.warning(
                     "replay %s: ATM strike history missing; fallback offset=%+d used (CE=%s PE=%s)",
@@ -2376,12 +2556,14 @@ def run_multi_historical_replay(
             skipped_days += 1
             continue
 
-        if ce_raw.empty or pe_raw.empty:
+        if ce_raw.empty and pe_raw.empty:
             skipped_days += 1
             continue
 
         ce_day = _warmup_and_slice(ce_raw, day, cfg)
         pe_day = _warmup_and_slice(pe_raw, day, cfg)
+        ce_day = _attach_spot_ema_context(ce_day, spot_day)
+        pe_day = _attach_spot_ema_context(pe_day, spot_day)
 
         ce_events = [("CE", row) for _, row in ce_day.iterrows()]
         pe_events = [("PE", row) for _, row in pe_day.iterrows()]

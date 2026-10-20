@@ -28,6 +28,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application files
 COPY run_strategy.py .
+COPY strategy_daemon.py .
 COPY export_dashboard_data.py .
 COPY api_server.py .
 COPY core ./core

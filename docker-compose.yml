@@ -54,7 +54,7 @@ services:
       strategy_worker:
         condition: service_started
     healthcheck:
-      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:3000"]
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1:3000"]
       interval: 10s
       timeout: 5s
       retries: 3
@@ -98,6 +98,23 @@ services:
       - ./logs:/app/logs
       - ./data:/app/data
 
+  # One manager owns all supported active dashboard strategies.
+  strategy_daemon:
+    <<: *live-defaults
+    container_name: strategy_daemon
+    labels:
+      com.openalgo.display-name: "Strategy manager"
+    command: ["python3", "strategy_daemon.py"]
+    environment:
+      <<: *common-environment
+      MODE: live
+      STRATEGY_FILTER: "21EMA,EMA21,HD,CD,TC,2BC,BO"
+      STRATEGY_DASHBOARD_API_URL: http://strategy_worker:5003/api/instruments
+      LOGS_DIR: /app/logs
+    depends_on:
+      strategy_worker:
+        condition: service_started
+
   # Dashboard Data Exporter (Syncs OpenAlgo & Fyers data to React)
   dashboard_exporter:
     build:
@@ -125,4 +142,3 @@ services:
 networks:
   default:
     name: trading-network
-

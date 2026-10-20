@@ -117,6 +117,7 @@ def migrate():
             create_schema()
         else:
             logger.info("✅ All tables already exist")
+            create_schema()
         
         # Print schema info
         print_schema_info()

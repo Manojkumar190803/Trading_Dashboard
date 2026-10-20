@@ -654,6 +654,7 @@ def get_logs():
 @app.route("/api/instruments", methods=["GET"])
 def get_instruments():
     """Fetch all configured instruments from database."""
+    session = None
     try:
         from core.db_models import Instrument
         from core.db_connection import DatabaseConnection
@@ -672,12 +673,14 @@ def get_instruments():
                     "brokerSymbol": i.broker_symbol,
                     "monitoringStartTime": i.monitoring_start_time,
                     "monitoringEndTime": i.monitoring_end_time,
+                    "entryCutoffTime": i.entry_cutoff_time or "14:40",
                     "lotSizeAdjustment": i.lot_size_adjustment,
                     "calculatedLotSize": i.calculated_lot_size,
                     "strategy": i.strategy,
                     "productType": i.product_type,
                     "premiumMinPrice": i.premium_min_price,
                     "premiumMaxPrice": i.premium_max_price,
+                    "maxInitialRiskPoints": i.max_initial_risk_points or 20.0,
                     "premiumOptionStrike": i.premium_option_strike,
                     "status": i.status,
                     "createdAt": i.created_at.isoformat(),
@@ -691,6 +694,9 @@ def get_instruments():
     except Exception as e:
         logger.error(f"Error fetching instruments: {e}")
         return jsonify({"error": str(e)}), 500
+    finally:
+        if session is not None:
+            session.close()
 
 
 @app.route("/api/instruments", methods=["POST"])
@@ -715,10 +721,12 @@ def create_instrument():
         instrument.strategy = data.get("strategy")
         instrument.monitoring_start_time = data.get("monitoringStartTime")
         instrument.monitoring_end_time = data.get("monitoringEndTime")
+        instrument.entry_cutoff_time = data.get("entryCutoffTime", "14:40")
         instrument.lot_size_adjustment = float(data.get("lotSizeAdjustment", 1.0))
         instrument.calculated_lot_size = int(data.get("calculatedLotSize"))
         instrument.premium_min_price = float(data.get("premiumMinPrice")) if data.get("premiumMinPrice") else None
         instrument.premium_max_price = float(data.get("premiumMaxPrice")) if data.get("premiumMaxPrice") else None
+        instrument.max_initial_risk_points = float(data.get("maxInitialRiskPoints", 20.0))
         instrument.product_type = data.get("productType", "SPOT")
         instrument.status = "ACTIVE"
 
@@ -745,11 +753,15 @@ def create_instrument():
             return jsonify({"error": "An instrument with this name already exists"}), 409
         logger.error(f"Error creating instrument: {e}")
         return jsonify({"error": error_message}), 500
+    finally:
+        if session is not None:
+            session.close()
 
 
 @app.route("/api/instruments/<int:instrument_id>", methods=["PUT"])
 def update_instrument(instrument_id):
     """Update an existing instrument."""
+    session = None
     try:
         from core.db_models import Instrument
         from core.db_connection import DatabaseConnection
@@ -772,6 +784,8 @@ def update_instrument(instrument_id):
             instrument.monitoring_start_time = data["monitoringStartTime"]
         if "monitoringEndTime" in data:
             instrument.monitoring_end_time = data["monitoringEndTime"]
+        if "entryCutoffTime" in data:
+            instrument.entry_cutoff_time = data["entryCutoffTime"]
         if "lotSizeAdjustment" in data:
             instrument.lot_size_adjustment = float(data["lotSizeAdjustment"])
         if "calculatedLotSize" in data:
@@ -780,6 +794,8 @@ def update_instrument(instrument_id):
             instrument.premium_min_price = float(data["premiumMinPrice"]) if data["premiumMinPrice"] else None
         if "premiumMaxPrice" in data:
             instrument.premium_max_price = float(data["premiumMaxPrice"]) if data["premiumMaxPrice"] else None
+        if "maxInitialRiskPoints" in data:
+            instrument.max_initial_risk_points = float(data["maxInitialRiskPoints"])
         if "premiumOptionStrike" in data:
             instrument.premium_option_strike = int(data["premiumOptionStrike"]) if data["premiumOptionStrike"] else None
         if "status" in data:
@@ -796,13 +812,19 @@ def update_instrument(instrument_id):
         }), 200
         
     except Exception as e:
+        if session is not None:
+            session.rollback()
         logger.error(f"Error updating instrument: {e}")
         return jsonify({"error": str(e)}), 500
+    finally:
+        if session is not None:
+            session.close()
 
 
 @app.route("/api/instruments/<int:instrument_id>", methods=["DELETE"])
 def delete_instrument(instrument_id):
     """Delete (archive) an instrument."""
+    session = None
     try:
         from core.db_models import Instrument
         from core.db_connection import DatabaseConnection
@@ -824,13 +846,19 @@ def delete_instrument(instrument_id):
         }), 200
         
     except Exception as e:
+        if session is not None:
+            session.rollback()
         logger.error(f"Error deleting instrument: {e}")
         return jsonify({"error": str(e)}), 500
+    finally:
+        if session is not None:
+            session.close()
 
 
 @app.route("/api/instruments/debug/all", methods=["GET"])
 def get_all_instruments_debug():
     """Get all instruments including archived (debug endpoint)."""
+    session = None
     try:
         from core.db_models import Instrument
         from core.db_connection import DatabaseConnection
@@ -855,11 +883,15 @@ def get_all_instruments_debug():
     except Exception as e:
         logger.error(f"Error fetching all instruments: {e}")
         return jsonify({"error": str(e)}), 500
+    finally:
+        if session is not None:
+            session.close()
 
 
 @app.route("/api/instruments/debug/clear", methods=["POST"])
 def clear_all_instruments():
     """Clear all instruments (debug endpoint)."""
+    session = None
     try:
         from core.db_models import Instrument
         from core.db_connection import DatabaseConnection
@@ -875,8 +907,13 @@ def clear_all_instruments():
         }), 200
         
     except Exception as e:
+        if session is not None:
+            session.rollback()
         logger.error(f"Error clearing instruments: {e}")
         return jsonify({"error": str(e)}), 500
+    finally:
+        if session is not None:
+            session.close()
 
 
 # ==================== Health Check ====================

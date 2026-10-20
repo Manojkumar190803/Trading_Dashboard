@@ -53,7 +53,7 @@ interface AppStore {
   updateInstrument: (id: string, instrument: Partial<Instrument>) => void
   deleteInstrument: (id: string) => void
   toggleInstrument: (id: string) => void
-  exportInstruments: () => Promise<void>
+  exportInstruments: (instruments?: Instrument[]) => Promise<void>
   getStrategyStatus: () => Promise<any>
 
   // Global Trailing Stops Configuration
@@ -150,13 +150,16 @@ export const useAppStore = create<AppStore>(
       })),
     
     // Export instruments to backend for Python to consume
-    exportInstruments: async () => {
+    exportInstruments: async (instruments) => {
       try {
         const state = useAppStore.getState()
         const response = await fetch('/api/instruments/export', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ instruments: state.instruments }),
+          body: JSON.stringify({
+            instruments: instruments ?? state.instruments,
+            trailingStopsConfig: state.trailingStopsConfig,
+          }),
         })
         if (!response.ok) {
           throw new Error(`Export failed: ${response.statusText}`)

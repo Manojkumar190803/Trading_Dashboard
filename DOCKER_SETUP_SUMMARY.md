@@ -1,5 +1,14 @@
 # 🐳 Docker Containerization Complete! 
 
+> **Historical snapshot:** This file documents the original Docker setup. Its
+> service count, Nginx references, and description of `strategy_worker` as the
+> live strategy runner are no longer authoritative. The current Compose worker
+> serves the API, while `hd_strategy_daemon` runs strategies only for active
+> dashboard instruments. See [DOCKER_GUIDE.md](DOCKER_GUIDE.md),
+> [DOCKER_ARCHITECTURE.md](DOCKER_ARCHITECTURE.md), and
+> [DOCKER_FIX_SUMMARY.md](DOCKER_FIX_SUMMARY.md) for current behavior, including
+> the database/session fixes and React health-check correction.
+
 ## Summary
 
 Your trading strategy application is now fully containerized and ready to run in Docker. Here's what has been set up:

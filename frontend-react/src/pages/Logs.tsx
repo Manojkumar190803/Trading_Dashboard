@@ -40,17 +40,37 @@ interface AlertEntry {
 }
 
 interface ActiveSymbol {
+  id: string
   name: string
   baseSymbol: string
   strike: string
+  strikeLabel: string
   strategy: string
+  ceStrike?: string
+  peStrike?: string
   hasCE: boolean
   hasPE: boolean
+  isLocked: boolean
+}
+
+interface AtmLockSnapshot {
+  ceSymbol: string | null
+  peSymbol: string | null
+}
+
+const parseAtmLockSnapshot = (payload: unknown): AtmLockSnapshot | null => {
+  if (typeof payload !== 'object' || payload === null) return null
+  const record = payload as Record<string, unknown>
+  const ceSymbol = typeof record.ce_symbol === 'string' ? record.ce_symbol : null
+  const peSymbol = typeof record.pe_symbol === 'string' ? record.pe_symbol : null
+  return ceSymbol || peSymbol ? { ceSymbol, peSymbol } : null
 }
 
 const Logs: React.FC = () => {
   const { logs: storeLogs, setLogs: setStoreLogs, setInstruments: setStoreInstruments } = useAppStore()
   const { instruments: apiInstruments } = useInstruments()
+  const [atmLocks, setAtmLocks] = useState<Record<string, AtmLockSnapshot>>({})
+  const [atmLocksLoaded, setAtmLocksLoaded] = useState(false)
   const [logs, setLogs] = useState<LogEntry[]>([])
   const [alerts, setAlerts] = useState<AlertEntry[]>([])
   const [dismissedAlertIds, setDismissedAlertIds] = useState<Set<string>>(new Set())
@@ -66,6 +86,69 @@ const Logs: React.FC = () => {
       setStoreInstruments(apiInstruments)
     }
   }, [apiInstruments, setStoreInstruments])
+
+  useEffect(() => {
+    let cancelled = false
+
+    const loadAtmLocks = async () => {
+      const now = new Date()
+      const dateKey = [
+        now.getFullYear(),
+        String(now.getMonth() + 1).padStart(2, '0'),
+        String(now.getDate()).padStart(2, '0'),
+      ].join('')
+      const activeInstruments = apiInstruments.filter((instrument) => instrument.status)
+      const entries = await Promise.all(activeInstruments.map(async (instrument) => {
+        const brokerSymbol = instrument.brokerSymbol.toUpperCase()
+        const strategySuffix = instrument.strategy.toUpperCase() === 'HD' ? '_HD' : ''
+        const filename = `atm_lock_${brokerSymbol}${strategySuffix}_${dateKey}.json`
+        try {
+          const response = await fetch(`http://localhost:4000/logs/${filename}?t=${Date.now()}`, {
+            cache: 'no-store',
+          })
+          if (response.status === 404) return [instrument.id, null] as const
+          if (!response.ok) {
+            throw new Error(`HTTP ${response.status} loading ${filename}`)
+          }
+          const payload: unknown = await response.json()
+          return [instrument.id, parseAtmLockSnapshot(payload)] as const
+        } catch (error) {
+          console.error(`Unable to load ATM lock for ${instrument.name} (${instrument.strategy}):`, error)
+          return [instrument.id, null] as const
+        }
+      }))
+
+      if (cancelled) return
+      const nextLocks: Record<string, AtmLockSnapshot> = {}
+      for (const [instrumentId, lock] of entries) {
+        if (lock) nextLocks[instrumentId] = lock
+      }
+      setAtmLocks((currentLocks) => {
+        const currentIds = Object.keys(currentLocks)
+        const nextIds = Object.keys(nextLocks)
+        const unchanged = currentIds.length === nextIds.length
+          && nextIds.every((id) => currentLocks[id]?.ceSymbol === nextLocks[id].ceSymbol
+            && currentLocks[id]?.peSymbol === nextLocks[id].peSymbol)
+        return unchanged ? currentLocks : nextLocks
+      })
+      setAtmLocksLoaded(true)
+    }
+
+    if (apiInstruments.length === 0) {
+      setAtmLocks({})
+      setAtmLocksLoaded(true)
+      return () => {
+        cancelled = true
+      }
+    }
+
+    loadAtmLocks()
+    const interval = setInterval(loadAtmLocks, 2000)
+    return () => {
+      cancelled = true
+      clearInterval(interval)
+    }
+  }, [apiInstruments])
 
   // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   // TOAST NOTIFICATION SYSTEM FOR TRADING EVENTS
@@ -262,7 +345,7 @@ const Logs: React.FC = () => {
     })
   }, [alerts, previousAlertCount, isInitialLoad, toast])
 
-  // Load logs from real signal log file - reads actual EMA21 strategy signals
+  // Load per-strategy setup status from the shared monitoring file.
   // Only load when instruments are configured
   useEffect(() => {
     // If no instruments configured, clear logs in local state
@@ -313,14 +396,27 @@ const Logs: React.FC = () => {
           })
         })
 
+        const hdLockedSymbols = new Set(
+          apiInstruments
+            .filter((instrument) => instrument.strategy.toUpperCase() === 'HD')
+            .flatMap((instrument) => {
+              const lock = atmLocks[instrument.id]
+              return [lock?.ceSymbol, lock?.peSymbol].filter(
+                (symbol): symbol is string => Boolean(symbol)
+              )
+            })
+        )
         const logs: LogEntry[] = parsed.data.flatMap((row, index) => {
           if (row.category?.trim() !== 'SETUP_STATUS' || !row.timestamp || !row.message) return []
 
           const parts = row.message.split('|').map((part) => part.trim())
-          const setupName = parts[0] || 'EMA21 setup'
+          const recordedSetupName = parts[0] || 'EMA21 setup'
           const instrument = row.symbol?.trim() || parts[1] || ''
-          const side = setupName.match(/^(CE|PE)\b/i)?.[1]?.toUpperCase()
-          const strategy = setupName.match(/^(?:CE|PE)\s+(.+?)\s+setup$/i)?.[1] || 'EMA21'
+          const side = recordedSetupName.match(/^(CE|PE)\b/i)?.[1]?.toUpperCase()
+          const setupStrategy = recordedSetupName.match(/^(?:CE|PE)\s+(.+?)\s+setup$/i)?.[1] || 'EMA21'
+          const isHdLockedSymbol = hdLockedSymbols.has(instrument)
+          const strategy = isHdLockedSymbol ? 'HD' : setupStrategy
+          const setupName = isHdLockedSymbol && side ? `${side} HD setup` : recordedSetupName
           const parsedTimestamp = new Date(row.timestamp)
           if (Number.isNaN(parsedTimestamp.getTime())) return []
           const candleTime = row.message.match(/candle\s*=\s*(\d{2}:\d{2}:\d{2})/i)?.[1] || ''
@@ -363,7 +459,7 @@ const Logs: React.FC = () => {
     const interval = setInterval(loadLogsFromData, 2000)
     
     return () => clearInterval(interval)
-  }, [setStoreLogs, apiInstruments])
+  }, [setStoreLogs, apiInstruments, atmLocks])
 
   // Sync logs from store
   useEffect(() => {
@@ -396,32 +492,37 @@ const Logs: React.FC = () => {
           console.warn('Unable to read triggered-alert reset marker:', error)
         }
 
-        // Fetch alerts for all configured instruments (NIFTY, BANKNIFTY, etc.)
+        // Each symbol's CSV contains all configured strategies for that underlying.
         const allAlerts: AlertEntry[] = []
-        
-        for (const instrument of apiInstruments) {
+        const seenAlertSignatures = new Set<string>()
+        const seenAlertIds = new Set<string>()
+
+        const brokerSymbols = Array.from(new Set(apiInstruments.map((instrument) => instrument.brokerSymbol)))
+        for (const brokerSymbol of brokerSymbols) {
+          const instrument = apiInstruments.find((item) => item.brokerSymbol === brokerSymbol)
+          if (!instrument) continue
           // Backend is on host machine localhost:4000, accessible from host browser
-          const alertsFile = `http://localhost:4000/logs/trade_alerts_${instrument.brokerSymbol}_${dateStr}.csv?t=${Date.now()}`
+          const alertsFile = `http://localhost:4000/logs/trade_alerts_${brokerSymbol}_${dateStr}.csv?t=${Date.now()}`
           
           console.log('🔍 Fetching alerts file:', alertsFile)
           
           try {
             // Fetch triggered alerts from EMA21 strategy CSV
             const response = await fetch(alertsFile)
-            console.log('📡 Alerts response status:', response.status, response.ok, `for ${instrument.brokerSymbol}`)
+            console.log('📡 Alerts response status:', response.status, response.ok, `for ${brokerSymbol}`)
             
             if (!response.ok) {
-              console.log(`❌ Alerts file not found for ${instrument.brokerSymbol}:`, response.status)
+              console.log(`❌ Alerts file not found for ${brokerSymbol}:`, response.status)
               continue
             }
 
             const text = await response.text()
-            console.log('📄 Alerts file size:', text.length, 'bytes', `for ${instrument.brokerSymbol}`)
+            console.log('📄 Alerts file size:', text.length, 'bytes', `for ${brokerSymbol}`)
             
             const rows = Papa.parse<Record<string, string>>(text, { header: true, skipEmptyLines: true }).data
-            console.log('📋 Parsed alert rows:', rows.length, `for ${instrument.brokerSymbol}`)
+            console.log('📋 Parsed alert rows:', rows.length, `for ${brokerSymbol}`)
 
-            rows.forEach((row) => {
+            rows.forEach((row, rowIndex) => {
               const timestamp = row.timestamp?.trim()
               const message = row.message?.trim()
               if (!timestamp || !message) return
@@ -433,7 +534,7 @@ const Logs: React.FC = () => {
               if (Number.isNaN(parsedDate.getTime())) return
 
               const symbolMatch = message.match(/([A-Z]+\d+[A-Z]+\d+\d+(?:CE|PE))/)
-              const symbol = row.symbol?.trim() || symbolMatch?.[1] || instrument.brokerSymbol
+              const symbol = row.symbol?.trim() || symbolMatch?.[1] || brokerSymbol
               const strategy = row.strategy?.replace('SignalProvider', '').trim() || instrument.strategy || 'EMA21'
               const alertType = row.category?.trim() || row.alert_type?.trim() ||
                 (/entry|signal/i.test(message) ? 'ENTRY' : /exit|closed/i.test(message) ? 'EXIT' : 'ALERT')
@@ -441,7 +542,14 @@ const Logs: React.FC = () => {
               const status = sourceStatus === 'ACTIVE' || sourceStatus === 'CLOSED'
                 ? sourceStatus
                 : /ENTRY|SIGNAL/i.test(alertType) ? 'ACTIVE' : 'CLOSED'
-              const id = `alert_${timestamp}_${symbol}_${strategy}_${alertType}`
+              const signature = JSON.stringify([timestamp, symbol, strategy, alertType, message])
+              if (seenAlertSignatures.has(signature)) return
+              seenAlertSignatures.add(signature)
+
+              const baseId = `alert_${timestamp}_${symbol}_${strategy}_${alertType}`
+              const id = seenAlertIds.has(baseId) ? `${baseId}_${rowIndex}` : baseId
+              seenAlertIds.add(baseId)
+              seenAlertIds.add(id)
 
               allAlerts.push({
                 id,
@@ -454,7 +562,7 @@ const Logs: React.FC = () => {
               })
             })
           } catch (err) {
-            console.error(`❌ Error loading alerts for ${instrument.brokerSymbol}:`, err)
+            console.error(`❌ Error loading alerts for ${brokerSymbol}:`, err)
             // Continue to next instrument if one fails
             continue
           }
@@ -555,6 +663,10 @@ const Logs: React.FC = () => {
     return apiInstruments
       .filter((instrument) => instrument.status)
       .map((instrument) => {
+        const lock = atmLocks[instrument.id]
+        const hasLock = Boolean(lock?.ceSymbol || lock?.peSymbol)
+        const ceContract = parseOptionSymbol(lock?.ceSymbol || '')
+        const peContract = parseOptionSymbol(lock?.peSymbol || '')
         const configuredContract = parseOptionSymbol(instrument.brokerSymbol)
         const baseMatch = instrument.brokerSymbol.match(/^([A-Z]+)\d+/)
         const baseSymbol = configuredContract?.baseSymbol
@@ -566,17 +678,29 @@ const Logs: React.FC = () => {
             && hasFreshLog(log)
         })
         const latestContract = latestSetup ? parseOptionSymbol(latestSetup.instrument || '') : null
-        const strike = configuredContract?.strike
+        const lockedContracts = [
+          ceContract ? `CE ${ceContract.strike}` : lock?.ceSymbol ? `CE ${lock.ceSymbol}` : null,
+          peContract ? `PE ${peContract.strike}` : lock?.peSymbol ? `PE ${lock.peSymbol}` : null,
+        ].filter((contract): contract is string => Boolean(contract))
+        const sameLockedStrike = ceContract && peContract && ceContract.strike === peContract.strike
+        const strike = hasLock
+          ? (sameLockedStrike ? ceContract.strike : lockedContracts.join(' · '))
+          : configuredContract?.strike
           || (instrument.premiumOptionStrike ? String(instrument.premiumOptionStrike) : undefined)
           || latestContract?.strike
           || '—'
         return {
+          id: instrument.id,
           name: instrument.name,
           baseSymbol,
           strike,
+          strikeLabel: hasLock && !sameLockedStrike ? 'LOCKED' : 'ATM',
           strategy: instrument.strategy,
-          hasCE: true,
-          hasPE: true,
+          ceStrike: ceContract?.strike,
+          peStrike: peContract?.strike,
+          hasCE: hasLock ? Boolean(lock?.ceSymbol) : false,
+          hasPE: hasLock ? Boolean(lock?.peSymbol) : false,
+          isLocked: hasLock,
         }
       })
   }
@@ -653,19 +777,22 @@ const Logs: React.FC = () => {
 
   const getInstrumentSetups = (strategy: string, side: 'CE' | 'PE') => {
     return getActiveSymbols()
-      .filter((instrument) => normalizeStrategy(instrument.strategy) === normalizeStrategy(strategy))
+      .filter((instrument) => normalizeStrategy(instrument.strategy) === normalizeStrategy(strategy)
+        && (side === 'CE' ? instrument.hasCE : instrument.hasPE))
       .map((instrument) => {
+        const sideStrike = side === 'CE' ? instrument.ceStrike : instrument.peStrike
         const matchingLogs = getThreeMinuteLogs(strategy, side).filter((log) => {
           const contract = parseOptionSymbol(log.instrument || '')
           return contract?.baseSymbol === instrument.baseSymbol
-            && (instrument.strike === '—' || contract.strike === instrument.strike)
+            && (sideStrike
+              ? contract.strike === sideStrike
+              : instrument.strike === '—' || contract.strike === instrument.strike)
             && Boolean(log.candleOhlc)
             && hasFreshLog(log)
         })
         return {
           instrument,
           current: matchingLogs[matchingLogs.length - 1] || null,
-          previous: matchingLogs.length > 1 ? matchingLogs[matchingLogs.length - 2] : null,
         }
       })
   }
@@ -770,7 +897,7 @@ const Logs: React.FC = () => {
     const visual = getInstrumentVisual(instrument.baseSymbol)
     return (
       <div
-        key={instrument.baseSymbol}
+        key={`${instrument.id}-${instrument.baseSymbol}-${normalizeStrategy(instrument.strategy)}`}
         className={`rounded border border-l-4 px-3 py-2 ${visual.frame}`}
       >
         <div className="flex items-center justify-between gap-2">
@@ -785,9 +912,15 @@ const Logs: React.FC = () => {
           </span>
         </div>
         <div className="mt-2 flex items-center gap-2">
-          <span className="text-[10px] font-semibold uppercase text-text-tertiary">ATM</span>
+          <span className="text-[10px] font-semibold uppercase text-text-tertiary">
+            {instrument.isLocked ? instrument.strikeLabel : 'STATUS'}
+          </span>
           <span className={`font-mono text-sm font-bold ${visual.name}`}>
-            {instrument.strike === '—' ? 'Pending' : instrument.strike}
+            {instrument.isLocked
+              ? instrument.strike
+              : atmLocksLoaded
+                ? 'Waiting for contract lock'
+                : 'Checking lock'}
           </span>
           {instrument.hasCE && (
             <span className="rounded bg-accent-cyan/20 px-1.5 py-0.5 text-[10px] font-bold text-accent-cyan">CE</span>
@@ -1187,6 +1320,7 @@ const Logs: React.FC = () => {
           const strategies = getActiveStrategies().length > 0 ? getActiveStrategies() : ['ema21']
           
           return strategies.map((strategy) => {
+            const strategyLabel = normalizeStrategy(strategy) === 'EMA21' ? '21EMA' : strategy.toUpperCase()
             const ceLogs = getThreeMinuteLogs(strategy, 'CE')
             const peLogs = getThreeMinuteLogs(strategy, 'PE')
             const ceInstrumentSetups = getInstrumentSetups(strategy, 'CE')
@@ -1196,9 +1330,13 @@ const Logs: React.FC = () => {
 
             return (
               <div key={strategy} className="space-y-3">
-                {/* Meta info: Row count and order */}
-                <div className="text-xs text-text-secondary font-semibold">
-                  {ceLogs.length} CE rows | {peLogs.length} PE rows | newest events first
+                <div className="flex flex-wrap items-center justify-between gap-2 border-b border-bg-tertiary/50 pb-2">
+                  <h3 className="text-sm font-bold text-text-primary">
+                    Strategy <span className="ml-1 rounded border border-accent-cyan bg-accent-cyan px-2 py-1 font-semibold text-bg-primary">{strategyLabel}</span>
+                  </h3>
+                  <div className="text-xs font-semibold text-text-secondary">
+                    {ceLogs.length} CE rows | {peLogs.length} PE rows | newest events first
+                  </div>
                 </div>
 
                 {/* CE/PE Columns Layout - Side by Side */}
@@ -1238,22 +1376,6 @@ const Logs: React.FC = () => {
                           ))}
                         </div>
 
-                        {/* Previous setup event */}
-                        <div className="space-y-2">
-                          <p className="text-xs font-bold text-text-secondary uppercase tracking-wider">Previous setup event</p>
-                          {ceInstrumentSetups.map(({ instrument, previous }) => (
-                            <div key={instrument.baseSymbol}>
-                              {renderSetupFields(
-                                previous,
-                                'border-accent-cyan/30',
-                                instrument,
-                                'No previous candle',
-                                'CE'
-                              )}
-                            </div>
-                          ))}
-                        </div>
-
                         {/* Completed 3-minute candles */}
                         <div className="space-y-2">
                           <p className="text-xs font-bold text-text-secondary uppercase tracking-wider">Completed 3-minute candles</p>
@@ -1272,11 +1394,21 @@ const Logs: React.FC = () => {
                                   const fields = getSetupFields(log)
                                   if (!fields) return null
                                   return (
-                                    <div key={idx} className="grid grid-cols-4 gap-2 px-3 py-2 border-b border-accent-cyan/10 text-xs text-text-secondary hover:bg-bg-secondary/20 transition-colors">
-                                      <div className="break-words text-text-primary">{fields.setupName}</div>
-                                      <div className="break-words text-text-primary">{fields.instrument}</div>
-                                      <div className="break-words">{fields.status}</div>
-                                      <div className="font-mono">{fields.candleTime}</div>
+                                    <div key={idx} className="border-b border-accent-cyan/10 px-3 py-2 text-xs text-text-secondary hover:bg-bg-secondary/20 transition-colors">
+                                      <div className="grid grid-cols-4 gap-2">
+                                        <div className="break-words text-text-primary">{fields.setupName}</div>
+                                        <div className="break-words text-text-primary">{fields.instrument}</div>
+                                        <div className="break-words">{fields.status}</div>
+                                        <div className="font-mono">{fields.candleTime}</div>
+                                      </div>
+                                      <div className="mt-2 grid grid-cols-4 gap-2 border-t border-accent-cyan/10 pt-2">
+                                        {(['open', 'high', 'low', 'close'] as const).map((value) => (
+                                          <div key={value}>
+                                            <div className="text-[10px] uppercase text-text-tertiary">{value}</div>
+                                            <div className="font-mono text-text-primary">{fields.candleOhlc?.[value] || '—'}</div>
+                                          </div>
+                                        ))}
+                                      </div>
                                     </div>
                                   )
                                 })}
@@ -1329,22 +1461,6 @@ const Logs: React.FC = () => {
                           ))}
                         </div>
 
-                        {/* Previous setup event */}
-                        <div className="space-y-2">
-                          <p className="text-xs font-bold text-text-secondary uppercase tracking-wider">Previous setup event</p>
-                          {peInstrumentSetups.map(({ instrument, previous }) => (
-                            <div key={instrument.baseSymbol}>
-                              {renderSetupFields(
-                                previous,
-                                'border-accent-red/30',
-                                instrument,
-                                'No previous candle',
-                                'PE'
-                              )}
-                            </div>
-                          ))}
-                        </div>
-
                         {/* Completed 3-minute candles */}
                         <div className="space-y-2">
                           <p className="text-xs font-bold text-text-secondary uppercase tracking-wider">Completed 3-minute candles</p>
@@ -1363,11 +1479,21 @@ const Logs: React.FC = () => {
                                   const fields = getSetupFields(log)
                                   if (!fields) return null
                                   return (
-                                    <div key={idx} className="grid grid-cols-4 gap-2 px-3 py-2 border-b border-accent-red/10 text-xs text-text-secondary hover:bg-bg-secondary/20 transition-colors">
-                                      <div className="break-words text-text-primary">{fields.setupName}</div>
-                                      <div className="break-words text-text-primary">{fields.instrument}</div>
-                                      <div className="break-words">{fields.status}</div>
-                                      <div className="font-mono">{fields.candleTime}</div>
+                                    <div key={idx} className="border-b border-accent-red/10 px-3 py-2 text-xs text-text-secondary hover:bg-bg-secondary/20 transition-colors">
+                                      <div className="grid grid-cols-4 gap-2">
+                                        <div className="break-words text-text-primary">{fields.setupName}</div>
+                                        <div className="break-words text-text-primary">{fields.instrument}</div>
+                                        <div className="break-words">{fields.status}</div>
+                                        <div className="font-mono">{fields.candleTime}</div>
+                                      </div>
+                                      <div className="mt-2 grid grid-cols-4 gap-2 border-t border-accent-red/10 pt-2">
+                                        {(['open', 'high', 'low', 'close'] as const).map((value) => (
+                                          <div key={value}>
+                                            <div className="text-[10px] uppercase text-text-tertiary">{value}</div>
+                                            <div className="font-mono text-text-primary">{fields.candleOhlc?.[value] || '—'}</div>
+                                          </div>
+                                        ))}
+                                      </div>
                                     </div>
                                   )
                                 })}
@@ -1439,8 +1565,7 @@ const Logs: React.FC = () => {
                   <col className="w-[15%]" />
                   <col className="w-[16%]" />
                   <col className="w-[12%]" />
-                  <col className="w-[35%]" />
-                  <col className="w-[10%]" />
+                  <col className="w-[45%]" />
                 </colgroup>
                 <thead>
                   <tr className="border-b border-bg-tertiary/50 bg-bg-tertiary/30">
@@ -1449,7 +1574,6 @@ const Logs: React.FC = () => {
                     <th className="px-4 py-2 text-left font-semibold text-text-secondary">Symbol</th>
                     <th className="px-4 py-2 text-left font-semibold text-text-secondary">Type</th>
                     <th className="px-4 py-2 text-left font-semibold text-text-secondary">Message</th>
-                    <th className="px-4 py-2 text-center font-semibold text-text-secondary">Status</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -1469,18 +1593,6 @@ const Logs: React.FC = () => {
                       </td>
                       <td className="px-4 py-2 text-text-primary max-w-xl whitespace-normal break-words [overflow-wrap:anywhere]">
                         {alert.message}
-                      </td>
-                      <td className="px-4 py-2 text-center">
-                        <span 
-                          className={clsx(
-                            'inline-block px-3 py-1 rounded-full text-xs font-bold border',
-                            alert.status === 'ACTIVE' 
-                              ? 'bg-green-500/20 text-green-400 border-green-500/50' 
-                              : 'bg-red-500/20 text-red-400 border-red-500/50'
-                          )}
-                        >
-                          {alert.status}
-                        </span>
                       </td>
                     </tr>
                   ))}

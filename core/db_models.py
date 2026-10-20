@@ -8,7 +8,7 @@ from decimal import Decimal
 from typing import Optional
 from sqlalchemy import (
     Column, Integer, String, Float, DateTime, Text, Boolean, 
-    DECIMAL, ForeignKey, Index, Enum, UniqueConstraint
+    DECIMAL, ForeignKey, Index, Enum, UniqueConstraint, inspect, text
 )
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import relationship
@@ -316,6 +316,7 @@ class Instrument(Base):
     # Monitoring times (stored as string HH:MM format)
     monitoring_start_time = Column(String(5), nullable=False)  # e.g., "09:15"
     monitoring_end_time = Column(String(5), nullable=False)    # e.g., "15:30"
+    entry_cutoff_time = Column(String(5), nullable=True, default="14:40")
     
     # Lot configuration
     lot_size_adjustment = Column(Float, nullable=False, default=1.0)
@@ -325,6 +326,7 @@ class Instrument(Base):
     premium_min_price = Column(Float, nullable=True)
     premium_max_price = Column(Float, nullable=True)
     premium_option_strike = Column(Integer, nullable=True)  # ATM strike price for options
+    max_initial_risk_points = Column(Float, nullable=True, default=20.0)
     
     # Product type (SPOT, OPTION, etc.)
     product_type = Column(String(20), nullable=False, default="SPOT")
@@ -342,6 +344,21 @@ class Instrument(Base):
 
 # Utility function to create all tables
 def create_all_tables(engine):
-    """Create all tables in the database"""
+    """Create tables and add supported columns to existing instrument tables."""
     Base.metadata.create_all(engine)
+
+    inspector = inspect(engine)
+    if "instruments" in inspector.get_table_names():
+        existing_columns = {column["name"] for column in inspector.get_columns("instruments")}
+        column_definitions = {
+            "entry_cutoff_time": "VARCHAR(5) DEFAULT '14:40'",
+            "max_initial_risk_points": "FLOAT DEFAULT 20.0",
+        }
+        with engine.begin() as connection:
+            for column_name, definition in column_definitions.items():
+                if column_name not in existing_columns:
+                    connection.execute(
+                        text(f"ALTER TABLE instruments ADD COLUMN {column_name} {definition}")
+                    )
+
     print("✅ Database schema created successfully!")

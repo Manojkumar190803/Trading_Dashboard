@@ -86,6 +86,7 @@ export interface Instrument {
   brokerSymbol: string
   monitoringStartTime: string
   monitoringEndTime: string
+  entryCutoffTime?: string
   lotSizeAdjustment: number
   strategy: '21EMA' | 'HD' | 'CD' | 'TC' | '2BC' | 'BO'
   productType: 'INTRADAY' // Fixed, not editable

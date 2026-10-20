@@ -2,34 +2,26 @@
 
 ## Container Architecture
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                     Docker Compose Network                       │
-│                    (trading-network)                             │
-└─────────────────────────────────────────────────────────────────┘
-           │                │                │                │
-           │                │                │                │
-    ┌──────▼──────┐  ┌──────▼──────┐  ┌─────▼──────┐  ┌─────▼──────┐
-    │   Strategy  │  │  Dashboard  │  │    React   │  │ Streamlit  │
-    │   Worker    │  │  Exporter   │  │ Dashboard  │  │ Interface  │
-    │             │  │             │  │            │  │            │
-    │ Port: -     │  │ Port: -     │  │ Port: 3000 │  │ Port: 8502 │
-    │ Python      │  │ Python      │  │ Node.js    │  │ Python     │
-    │ run_        │  │ export_     │  │ Vite Dev   │  │ Streamlit  │
-    │ strategy.py │  │ dashboard_  │  │ Server     │  │ app        │
-    │             │  │ data.py     │  │            │  │            │
-    └──────┬──────┘  └──────┬──────┘  └──────┬─────┘  └────────────┘
-           │                │                │
-           └────────────────┼────────────────┘
-                            │
-                  ┌─────────▼──────────┐
-                  │ Shared Volumes:    │
-                  │ ./logs:/app/logs   │
-                  │ ./data:/app/data   │
-                  └───────────────────┘
-```
+The current Compose deployment has five services:
+
+| Service | Responsibility | Host access |
+|---------|----------------|-------------|
+| `strategy_worker` | Flask API on port 5003; does not launch a hard-coded live strategy in Compose | `localhost:5003` |
+| `hd_strategy_daemon` | Legacy service name; manages all strategies from active dashboard instruments | Internal only |
+| `dashboard_exporter` | Reads broker account data and writes dashboard JSON snapshots | Internal only |
+| `react_dashboard` | React/Vite dashboard; proxies API requests to `strategy_worker` | `localhost:3000` |
+| `streamlit_interface` | Legacy Streamlit dashboard | `localhost:8502` |
+
+Services communicate over the Compose network. The worker and strategy daemon
+share `logs` and `data` volumes with the exporter. React's health check probes
+`127.0.0.1:3000` from inside its container.
 
 ## Data Flow Diagram
+
+> The illustration below is a historical layout. For current service
+> responsibilities, use the container table above and the component flow
+> below: `strategy_worker` serves the API; `hd_strategy_daemon` runs active
+> dashboard-configured strategies.
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
@@ -94,12 +86,16 @@
 ## Component Communication
 
 ```
-Strategy Worker (EMA21SignalProvider)
-├─ Monitors live feed (NIFTY options)
-├─ Calculates EMA21 indicators
-├─ Generates buy/sell signals
+Strategy daemon (`hd_strategy_daemon`; legacy service name)
+├─ Polls the instrument API every five seconds
+├─ Starts only ACTIVE instruments; excludes INACTIVE and ARCHIVED rows
+└─ Stops a runner when its instrument is deactivated or removed
+
+Strategy runner (one process per active instrument)
+├─ Monitors the configured index/options feed
+├─ Calculates indicators and generates strategy signals
 ├─ Sends orders to OpenAlgo via API
-└─ Logs trade history → ./logs/*.csv
+└─ Writes strategy logs to ./logs/
 
 Dashboard Exporter
 ├─ Polls OpenAlgo every 5 seconds
@@ -136,7 +132,7 @@ Streamlit Interface
 
 ```
 openalgo_buying_setups/
-├── docker-compose.yml           ← Defines all 4 services
+├── docker-compose.yml           ← Defines five Compose services
 ├── docker-compose.override.yml  ← Dev overrides (volume mounts, hot reload)
 ├── Dockerfile                   ← Strategy & Dashboard Exporter image
 ├── Dockerfile.react             ← React Dashboard image  
@@ -243,7 +239,7 @@ streamlit_interface:
 ```
 
 ---
-**This diagram explains why containers weren't visible before:**
+**Historical Docker build issue (2026-10-07):**
 - Build failed on `COPY logs ./logs` → No containers could start
-- After fix: All 4 containers build and run successfully
-- Data flows from brokers → exporter → JSON files → dashboards
+- Logs are mounted as runtime volumes instead of copied into the image
+- Current service responsibilities are described at the top of this document

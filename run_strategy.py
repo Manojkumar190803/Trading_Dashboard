@@ -247,6 +247,44 @@ def _apply_ema21_policy(cfg: StrategyConfig, script: str) -> None:
     cfg.option_tick_size = _env_float("EMA21_OPTION_TICK_SIZE", 0.05)
 
 
+def _apply_hd_policy(cfg: StrategyConfig) -> None:
+    from datetime import time
+
+    cfg.premium_min_price = _env_float("HD_PREMIUM_MIN_PRICE", 120.0)
+    cfg.premium_max_price = _env_float("HD_PREMIUM_MAX_PRICE", 180.0)
+    cfg.max_option_risk_points = _env_float(
+        "HD_MAX_OPTION_RISK_POINTS", 20.0
+    )
+    cfg.full_size_lots = _env_int("HD_FULL_SIZE_LOTS", 1)
+    cfg.t1_rr = _env_float("HD_BREAKEVEN_RR", 1.25)
+    cfg.trailing_step_rr = _env_float("HD_TRAIL_STEP_RR", 0.5)
+    monitoring_start = _env_time("HD_MONITORING_START_TIME", "09:15")
+    monitoring_end = _env_time("HD_MONITORING_END_TIME", "15:30")
+    entry_cutoff = _env_time("HD_ENTRY_CUTOFF", "14:40")
+    if monitoring_start >= monitoring_end:
+        raise ValueError("HD monitoring start time must be earlier than monitoring end time")
+    if not monitoring_start <= entry_cutoff <= monitoring_end:
+        raise ValueError(
+            "HD entry cutoff must be between the monitoring start and end times"
+        )
+    if cfg.premium_min_price >= cfg.premium_max_price:
+        raise ValueError("HD premium minimum must be less than premium maximum")
+    if cfg.max_option_risk_points <= 0:
+        raise ValueError("HD maximum initial risk must be greater than zero")
+    if cfg.full_size_lots <= 0:
+        raise ValueError("HD lot size adjustment must be a positive integer")
+    if cfg.t1_rr <= 0 or cfg.trailing_step_rr <= 0:
+        raise ValueError("HD breakeven and trailing RR settings must be greater than zero")
+
+    cfg.market_open = monitoring_start
+    cfg.market_close = monitoring_end
+    cfg.entry_start = monitoring_start
+    cfg.atm_lock_time = max(time(9, 20), monitoring_start)
+    cfg.force_square_off = monitoring_end
+    cfg.entry_cutoff = entry_cutoff
+    cfg.signal_cutoff = cfg.entry_cutoff
+
+
 def _apply_ema21_expiry_policy(cfg: StrategyConfig, script: str) -> None:
     default_policy = "monthly" if script == "BANKNIFTY" else "weekly"
     cfg.expiry_policy = os.getenv(f"{script}_EXPIRY_POLICY", default_policy).strip().lower()
@@ -381,6 +419,8 @@ def _run_multi_script_live(
         if strategy_name == "ema21":
             _apply_ema21_policy(cfg, script)
             _apply_ema21_expiry_policy(cfg, script)
+        elif strategy_name.lower() == "hd":
+            _apply_hd_policy(cfg)
         
         # Apply manual overrides
         if args.symbol:
@@ -507,6 +547,8 @@ def _run_single_script(args: argparse.Namespace) -> None:
 
     # Support comma-separated strategies: --strategy hd,cd
     strategy_names = [s.strip() for s in args.strategy.split(",")]
+    if "hd" in [name.lower() for name in strategy_names]:
+        _apply_hd_policy(cfg)
 
     if "ema21" in strategy_names:
         # EMA21 timing and risk policy is configured through EMA21_* in .env.

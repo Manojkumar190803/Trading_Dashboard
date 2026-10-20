@@ -317,7 +317,28 @@ The background launcher writes its PID to `logs/dashboard.pid` and Streamlit out
 
 The dashboard runs in a separate image built from `Dockerfile.streamlit`. It is independent of the strategy containers, so strategy start/stop controls can be added to the interface later. The Docker service is named `streamlit_interface` because Docker names cannot contain spaces; its display label is `Streamlit interface`.
 
-Each service runs the EMA21 strategy in IST timezone, auto-restarts on crash, and injects a script-specific `SCRIPT` value into `run_strategy.py --mode live --strategy ema21`. The Docker image includes only the shared runtime files and EMA21 strategy implementation.
+### Dashboard-Managed Docker Trading
+
+In the Compose deployment, `strategy_worker` runs the Flask API only. The
+`hd_strategy_daemon` service (a legacy service name) polls the API and starts
+individual strategy runners for instruments whose dashboard status is
+`ACTIVE`; inactive and archived rows are excluded. Compose clears
+`STRATEGY_FILTER`, so all strategy types are eligible. The worker's image-level
+`SCRIPT` default is not used by this workflow.
+
+Deactivating an instrument stops its runner on the next five-second daemon poll
+and prevents future strategy signals. It does not cancel an order already at
+OpenAlgo or close a broker position. Manage existing orders/positions at the
+broker separately.
+
+The API initializes the schema at startup and adds the supported missing
+instrument columns (`entry_cutoff_time`, `max_initial_risk_points`) to existing
+tables without replacing their rows. Instrument API handlers close sessions and
+roll back failed writes to avoid SQLAlchemy pool exhaustion. The React container
+health check probes `127.0.0.1:3000`.
+
+See [DOCKER_GUIDE.md](DOCKER_GUIDE.md) for operating steps and
+[DOCKER_ARCHITECTURE.md](DOCKER_ARCHITECTURE.md) for service/data flow.
 
 ---
 

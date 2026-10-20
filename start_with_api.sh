@@ -17,6 +17,11 @@ echo "Strategy: $STRATEGY"
 echo "Mode: $MODE"
 echo "=========================================="
 
+if [[ "${BACKGROUND_WORKER_ENABLED:-false}" == "true" ]]; then
+    echo "[API] Strategy execution is managed from the active dashboard instruments..."
+    exec python3 api_server.py
+fi
+
 # Start API server in the background
 echo "[API] Starting Flask API server on port 5003..."
 python3 api_server.py &

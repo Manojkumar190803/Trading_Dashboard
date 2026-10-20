@@ -1,7 +1,7 @@
 """Focused tests for BaseStrategyEngine tick and square-off behavior."""
 
 import os
-from datetime import date, datetime
+from datetime import date, datetime, time
 from pathlib import Path
 
 import pandas as pd
@@ -9,7 +9,10 @@ import pandas as pd
 from core.broker import ConsoleBroker, HistoricalReplayBroker
 from core.engine import BaseStrategyEngine
 from core.models import BaseSideState, PendingEntry, Position, RiskConfig, Signal, StrategyConfig
+import run_strategy
+import strategy_daemon
 from strategies.base import SignalProvider
+from strategies.hd import HDSignalProvider
 
 
 class StubSignalProvider(SignalProvider):
@@ -621,3 +624,467 @@ def test_lock_atm_uses_expiry_override_date():
     assert engine.state.pe_symbol is not None
     assert "25AUG26" in engine.state.ce_symbol
     assert "25AUG26" in engine.state.pe_symbol
+
+
+def test_hd_contract_lock_selects_exactly_one_strike_itm_per_side():
+    class ChainBroker(ConsoleBroker):
+        def fetch_option_chain(self, underlying, exchange, expiry_date):
+            assert (underlying, exchange, expiry_date) == ("NIFTY", "NSE_INDEX", "25AUG26")
+            return {
+                "status": "success",
+                "chain": [
+                    {"strike": 24900, "ce": {"symbol": "CE-24900", "ltp": 150}},
+                    {"strike": 24950, "ce": {"symbol": "CE-24950", "ltp": 145}},
+                    {"strike": 25000, "ce": {"symbol": "CE-25000", "ltp": 150}, "pe": {"symbol": "PE-25000", "ltp": 150}},
+                    {"strike": 25050, "ce": {"symbol": "CE-25050", "ltp": 150}, "pe": {"symbol": "PE-25050", "ltp": 155}},
+                    {"strike": 25100, "pe": {"symbol": "PE-25100", "ltp": 150}},
+                ],
+            }
+
+    engine = BaseStrategyEngine(
+        cfg=StrategyConfig(premium_min_price=120, premium_max_price=180),
+        risk=RiskConfig(),
+        broker=ChainBroker(),
+        signal_provider=HDSignalProvider(),
+    )
+
+    engine.lock_atm_for_day(
+        datetime(2026, 8, 8, 9, 20),
+        spot_price=25020,
+        expiry_day_override=date(2026, 8, 25),
+    )
+
+    assert engine.state.ce_symbol == "CE-24950"
+    assert engine.state.pe_symbol == "PE-25050"
+    assert engine.state.atm_locked is True
+
+
+def test_hd_contract_lock_rejects_chain_without_in_range_contracts():
+    class ChainBroker(ConsoleBroker):
+        def fetch_option_chain(self, underlying, exchange, expiry_date):
+            return {
+                "status": "success",
+                "data": {"chain": [{"strike": 25000, "ce": {"symbol": "CE", "ltp": 200}}]},
+            }
+
+    engine = BaseStrategyEngine(
+        cfg=StrategyConfig(premium_min_price=120, premium_max_price=180),
+        risk=RiskConfig(),
+        broker=ChainBroker(),
+        signal_provider=HDSignalProvider(),
+    )
+
+    engine.lock_atm_for_day(
+        datetime(2026, 8, 8, 9, 20),
+        spot_price=25020,
+        expiry_day_override=date(2026, 8, 25),
+    )
+
+    assert engine.state.atm_locked is False
+    assert engine.state.ce_symbol is None
+    assert engine.state.pe_symbol is None
+
+
+def test_hd_contract_lock_keeps_eligible_side_when_other_side_has_no_match():
+    class ChainBroker(ConsoleBroker):
+        def fetch_option_chain(self, underlying, exchange, expiry_date):
+            return {
+                "status": "success",
+                "data": {
+                    "chain": [
+                        {"strike": 24950, "ce": {"symbol": "CE-24950", "ltp": 150}},
+                        {"strike": 25050, "pe": {"symbol": "PE-25050", "ltp": 200}},
+                    ]
+                },
+            }
+
+    engine = BaseStrategyEngine(
+        cfg=StrategyConfig(premium_min_price=120, premium_max_price=180),
+        risk=RiskConfig(),
+        broker=ChainBroker(),
+        signal_provider=HDSignalProvider(),
+    )
+
+    engine.lock_atm_for_day(
+        datetime(2026, 8, 8, 9, 20),
+        spot_price=25020,
+        expiry_day_override=date(2026, 8, 25),
+    )
+
+    assert engine.state.atm_locked is True
+    assert engine.state.ce_symbol == "CE-24950"
+    assert engine.state.pe_symbol is None
+
+
+def test_hd_contract_lock_does_not_fall_back_from_missing_one_step_itm_strike():
+    class ChainBroker(ConsoleBroker):
+        def fetch_option_chain(self, underlying, exchange, expiry_date):
+            return {
+                "status": "success",
+                "data": {
+                    "chain": [
+                        {"strike": 25000, "ce": {"symbol": "ATM-CE", "ltp": 150}},
+                        {"strike": 25100, "ce": {"symbol": "OTM-CE", "ltp": 150}},
+                        {"strike": 25050, "pe": {"symbol": "ITM-PE", "ltp": 150}},
+                    ]
+                },
+            }
+
+    engine = BaseStrategyEngine(
+        cfg=StrategyConfig(premium_min_price=120, premium_max_price=180),
+        risk=RiskConfig(),
+        broker=ChainBroker(),
+        signal_provider=HDSignalProvider(),
+    )
+
+    engine.lock_atm_for_day(
+        datetime(2026, 8, 8, 9, 20),
+        spot_price=25020,
+        expiry_day_override=date(2026, 8, 25),
+    )
+
+    assert engine.state.atm_locked is True
+    assert engine.state.ce_symbol is None
+    assert engine.state.pe_symbol == "ITM-PE"
+
+
+def test_hd_trailing_uses_global_rr_steps_without_partial_exit():
+    engine = BaseStrategyEngine(
+        cfg=StrategyConfig(option_lot_size=65, t1_rr=1.25, trailing_step_rr=0.5),
+        risk=RiskConfig(),
+        broker=RecordingBroker(),
+        signal_provider=HDSignalProvider(),
+    )
+    side_state = engine.state.ce
+    side_state.position = Position(
+        option_symbol="NIFTY-CE",
+        option_type="CE",
+        quantity=130,
+        initial_quantity=130,
+        entry_price=100.0,
+        entry_time=datetime(2026, 8, 8, 10, 0),
+        option_stop_level=90.0,
+        option_entry_trigger=99.0,
+        option_risk_points=10.0,
+    )
+
+    engine.process_tick("CE", 112.5, datetime(2026, 8, 8, 10, 1))
+    assert side_state.position.option_stop_level == 100.0
+    assert side_state.position.highest_rr_step == 1.25
+
+    engine.process_tick("CE", 117.5, datetime(2026, 8, 8, 10, 2))
+    assert side_state.position.option_stop_level == 105.0
+    assert side_state.position.highest_rr_step == 1.75
+
+    engine.process_tick("CE", 120.0, datetime(2026, 8, 8, 10, 3))
+    assert side_state.position.quantity == 130
+    assert side_state.position.option_stop_level == 105.0
+
+
+def test_hd_trailing_stop_hit_does_not_count_as_hard_sl():
+    engine = BaseStrategyEngine(
+        cfg=StrategyConfig(option_lot_size=65, t1_rr=1.25, trailing_step_rr=0.5),
+        risk=RiskConfig(),
+        broker=RecordingBroker(),
+        signal_provider=HDSignalProvider(),
+    )
+    side_state = engine.state.ce
+    side_state.position = Position(
+        option_symbol="NIFTY-CE",
+        option_type="CE",
+        quantity=65,
+        initial_quantity=65,
+        entry_price=100.0,
+        entry_time=datetime(2026, 8, 8, 10, 0),
+        option_stop_level=100.0,
+        option_entry_trigger=99.0,
+        option_risk_points=10.0,
+        breakeven_armed=True,
+        t1_done=True,
+        trailing_sl_level=100.0,
+        highest_rr_step=1.25,
+    )
+
+    engine.process_tick("CE", 99.0, datetime(2026, 8, 8, 10, 1))
+
+    assert side_state.position is None
+    assert engine.state.sl_hits_today == 0
+    assert engine.total_hard_sl_hits == 0
+
+
+def test_hd_pending_order_survives_cutoff_and_generic_expiry():
+    broker = RecordingBroker()
+    broker.is_replay = True
+    engine = BaseStrategyEngine(
+        cfg=StrategyConfig(entry_cutoff=time(14, 40), pending_entry_expiry_candles=3),
+        risk=RiskConfig(),
+        broker=broker,
+        signal_provider=HDSignalProvider(),
+    )
+    side_state = engine.state.ce
+    side_state.option_symbol = "NIFTY-CE"
+    side_state.pending_entry = PendingEntry(
+        signal=Signal.BUY_CE,
+        created_at=datetime(2026, 8, 8, 14, 0),
+        option_symbol="NIFTY-CE",
+        quantity=65,
+        option_trigger_level=120.0,
+        option_stop_level=90.0,
+        trigger_candle_high=119.0,
+        trigger_candle_low=95.0,
+    )
+
+    engine.try_fill_pending_entry(
+        "CE",
+        side_state,
+        datetime(2026, 8, 8, 14, 45),
+        _row(datetime(2026, 8, 8, 14, 45), high=110.0, low=95.0),
+    )
+
+    assert side_state.pending_entry is not None
+
+
+def test_hd_pending_order_cancels_when_stop_is_breached():
+    broker = RecordingBroker()
+    broker.is_replay = True
+    engine = BaseStrategyEngine(
+        cfg=StrategyConfig(),
+        risk=RiskConfig(),
+        broker=broker,
+        signal_provider=HDSignalProvider(),
+    )
+    engine.reset_for_new_day(date(2026, 8, 8))
+    side_state = engine.state.ce
+    side_state.pending_entry = PendingEntry(
+        signal=Signal.BUY_CE,
+        created_at=datetime(2026, 8, 8, 10, 0),
+        option_symbol="NIFTY-CE",
+        quantity=65,
+        option_trigger_level=120.0,
+        option_stop_level=90.0,
+        trigger_candle_high=119.0,
+        trigger_candle_low=95.0,
+    )
+
+    engine.try_fill_pending_entry(
+        "CE",
+        side_state,
+        datetime(2026, 8, 8, 10, 3),
+        _row(datetime(2026, 8, 8, 10, 3), high=110.0, low=89.0),
+    )
+
+    assert side_state.pending_entry is None
+
+
+def test_hd_dashboard_settings_reach_strategy_config(monkeypatch):
+    environment = strategy_daemon._strategy_environment(
+        {
+            "strategy": "HD",
+            "premiumMinPrice": 125,
+            "premiumMaxPrice": 175,
+            "maxInitialRiskPoints": 18,
+            "lotSizeAdjustment": 3.0,
+            "monitoringStartTime": "09:30",
+            "monitoringEndTime": "15:00",
+            "entryCutoffTime": "14:45",
+        },
+        {"breakEvenRR": 1.25, "trailStepRR": 0.5},
+    )
+    for name, value in environment.items():
+        if name.startswith("HD_"):
+            monkeypatch.setenv(name, value)
+
+    cfg = StrategyConfig()
+    run_strategy._apply_hd_policy(cfg)
+
+    assert cfg.premium_min_price == 125
+    assert cfg.premium_max_price == 175
+    assert cfg.max_option_risk_points == 18
+    assert cfg.full_size_lots == 3
+    assert cfg.market_open.strftime("%H:%M") == "09:30"
+    assert cfg.market_close.strftime("%H:%M") == "15:00"
+    assert cfg.force_square_off.strftime("%H:%M") == "15:00"
+    assert cfg.atm_lock_time.strftime("%H:%M") == "09:30"
+    assert cfg.entry_cutoff.strftime("%H:%M") == "14:45"
+    assert cfg.t1_rr == 1.25
+    assert cfg.trailing_step_rr == 0.5
+
+
+def test_hd_dashboard_values_override_inherited_runtime_defaults(monkeypatch):
+    monkeypatch.setenv("HD_MONITORING_START_TIME", "10:00")
+    monkeypatch.setenv("HD_MAX_OPTION_RISK_POINTS", "7")
+
+    environment = strategy_daemon._strategy_environment(
+        {"strategy": "HD"},
+        {"maxInitialRiskPoints": 15},
+    )
+
+    assert environment["HD_MONITORING_START_TIME"] == "09:15"
+    assert environment["HD_MONITORING_END_TIME"] == "15:30"
+    assert environment["HD_ENTRY_CUTOFF"] == "14:40"
+    assert environment["HD_MAX_OPTION_RISK_POINTS"] == "20"
+    assert environment["HD_FULL_SIZE_LOTS"] == "1"
+    assert environment["HD_PREMIUM_MIN_PRICE"] == "120"
+    assert environment["HD_PREMIUM_MAX_PRICE"] == "180"
+
+
+def test_hd_entry_order_uses_dashboard_risk_and_lot_settings():
+    broker = RecordingBroker()
+    engine = BaseStrategyEngine(
+        cfg=StrategyConfig(
+            option_lot_size=65,
+            full_size_lots=2,
+            max_option_risk_points=12.0,
+        ),
+        risk=RiskConfig(),
+        broker=broker,
+        signal_provider=HDSignalProvider(),
+    )
+    engine.reset_for_new_day(date(2026, 8, 8))
+    side_state = engine.state.ce
+    side_state.option_symbol = "NIFTY-CE"
+    side_state.alert_ready = True
+    side_state.alert_candle_low = 100.0
+    row = pd.Series({
+        "datetime": datetime(2026, 8, 8, 10, 0),
+        "open": 105.0,
+        "high": 110.0,
+        "low": 100.0,
+        "close": 109.5,
+    })
+
+    engine.place_pending_entry("CE", side_state, row["datetime"], row)
+
+    assert broker.stop_orders == [("NIFTY-CE", "BUY", 130, 110.05, 110.05)]
+    assert side_state.pending_entry is not None
+
+    rejected_broker = RecordingBroker()
+    rejected_engine = BaseStrategyEngine(
+        cfg=StrategyConfig(
+            option_lot_size=65,
+            full_size_lots=2,
+            max_option_risk_points=10.0,
+        ),
+        risk=RiskConfig(),
+        broker=rejected_broker,
+        signal_provider=HDSignalProvider(),
+    )
+    rejected_engine.reset_for_new_day(date(2026, 8, 8))
+    rejected_state = rejected_engine.state.ce
+    rejected_state.option_symbol = "NIFTY-CE"
+    rejected_state.alert_ready = True
+    rejected_state.alert_candle_low = 100.0
+
+    rejected_engine.place_pending_entry("CE", rejected_state, row["datetime"], row)
+
+    assert rejected_broker.stop_orders == []
+    assert rejected_state.pending_entry is None
+
+
+def test_hd_dashboard_monitoring_start_change_restarts_instrument():
+    instrument = {
+        "strategy": "HD",
+        "brokerSymbol": "NIFTY",
+        "monitoringStartTime": "09:15",
+        "monitoringEndTime": "15:00",
+    }
+    changed = {**instrument, "monitoringStartTime": "09:30"}
+
+    assert strategy_daemon._runtime_signature(instrument, {}) != (
+        strategy_daemon._runtime_signature(changed, {})
+    )
+
+
+def test_hd_broker_fill_sets_actual_entry_and_initial_risk():
+    class FilledBroker(RecordingBroker):
+        requires_position_reconciliation = True
+
+        def get_order_status(self, order_id):
+            return {"order_status": "complete", "average_price": 102.0}
+
+        def get_position_book(self):
+            return [{"symbol": "NIFTY-CE", "quantity": 65}]
+
+    engine = BaseStrategyEngine(
+        cfg=StrategyConfig(),
+        risk=RiskConfig(),
+        broker=FilledBroker(),
+        signal_provider=HDSignalProvider(),
+    )
+    engine.reset_for_new_day(date(2026, 8, 8))
+    side_state = engine.state.ce
+    side_state.option_symbol = "NIFTY-CE"
+    side_state.pending_entry = PendingEntry(
+        signal=Signal.BUY_CE,
+        created_at=datetime(2026, 8, 8, 10, 0),
+        option_symbol="NIFTY-CE",
+        quantity=65,
+        option_trigger_level=101.0,
+        option_stop_level=90.0,
+        trigger_candle_high=100.95,
+        trigger_candle_low=90.0,
+        order_id="ENTRY-1",
+    )
+
+    engine.try_fill_pending_entry(
+        "CE",
+        side_state,
+        datetime(2026, 8, 8, 10, 3),
+        _row(datetime(2026, 8, 8, 10, 3), high=101.0, low=100.0),
+    )
+
+    assert side_state.position.entry_price == 102.0
+    assert side_state.position.option_risk_points == 12.0
+    assert side_state.pending_entry is None
+
+
+def test_hd_broker_fill_over_risk_limit_is_exited():
+    class FilledBroker(RecordingBroker):
+        requires_position_reconciliation = True
+
+        def __init__(self):
+            super().__init__()
+            self.market_orders = []
+
+        def get_order_status(self, order_id):
+            return {"order_status": "complete", "average_price": 111.0}
+
+        def get_position_book(self):
+            return [{"symbol": "NIFTY-CE", "quantity": 65}]
+
+        def place_market_order(self, symbol, side, quantity):
+            self.market_orders.append((symbol, side, quantity))
+            return "EXIT-1"
+
+    broker = FilledBroker()
+    engine = BaseStrategyEngine(
+        cfg=StrategyConfig(max_option_risk_points=20.0),
+        risk=RiskConfig(),
+        broker=broker,
+        signal_provider=HDSignalProvider(),
+    )
+    engine.reset_for_new_day(date(2026, 8, 8))
+    side_state = engine.state.ce
+    side_state.option_symbol = "NIFTY-CE"
+    side_state.pending_entry = PendingEntry(
+        signal=Signal.BUY_CE,
+        created_at=datetime(2026, 8, 8, 10, 0),
+        option_symbol="NIFTY-CE",
+        quantity=65,
+        option_trigger_level=101.0,
+        option_stop_level=90.0,
+        trigger_candle_high=100.95,
+        trigger_candle_low=90.0,
+        order_id="ENTRY-1",
+    )
+
+    engine.try_fill_pending_entry(
+        "CE",
+        side_state,
+        datetime(2026, 8, 8, 10, 3),
+        _row(datetime(2026, 8, 8, 10, 3), high=101.0, low=100.0),
+    )
+
+    assert side_state.position is None
+    assert side_state.pending_entry is None
+    assert broker.market_orders == [("NIFTY-CE", "SELL", 65)]

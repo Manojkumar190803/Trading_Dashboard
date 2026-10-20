@@ -36,6 +36,21 @@ services:
     # Restart on failure for development
     restart: on-failure:3
 
+  strategy_daemon:
+    volumes:
+      - ./strategy_daemon.py:/app/strategy_daemon.py
+      - ./core:/app/core
+      - ./strategies:/app/strategies
+      - ./run_strategy.py:/app/run_strategy.py
+      - ./logs:/app/logs
+      - ./data:/app/data
+
+    environment:
+      LOG_LEVEL: DEBUG
+      PYTHONUNBUFFERED: 1
+
+    restart: on-failure:3
+
   streamlit_interface:
     # Mount local frontend code
     volumes:

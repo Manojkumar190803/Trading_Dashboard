@@ -32,6 +32,19 @@ def _shared_sl_count_path(trading_day: date) -> Path:
     configured = os.getenv("SHARED_SL_COUNT_FILE", "").strip()
     if configured:
         return Path(configured)
+    namespace = os.getenv("SHARED_SL_COUNT_NAMESPACE", "").strip()
+    if namespace:
+        safe_namespace = "".join(
+            char for char in namespace if char.isalnum() or char in "-_"
+        )
+        if safe_namespace:
+            namespaced_path = Path("logs") / (
+                f"sl_hits_{trading_day:%Y%m%d}_{safe_namespace}.json"
+            )
+            legacy_path = Path("logs") / f"sl_hits_{trading_day:%Y%m%d}.json"
+            if namespace.upper() == "EMA21" and not namespaced_path.exists() and legacy_path.exists():
+                return legacy_path
+            return namespaced_path
     return Path("logs") / f"sl_hits_{trading_day:%Y%m%d}.json"
 
 
@@ -145,6 +158,39 @@ class BaseStrategyEngine:
 
     def _is_ema21_strategy(self) -> bool:
         return getattr(self.signal_provider, "strategy_key", None) == "ema21"
+
+    def _is_hd_strategy(self) -> bool:
+        return getattr(self.signal_provider, "strategy_key", None) == "hd"
+
+    def _is_strategy_order(
+        self,
+        order: dict[str, object],
+        known_order_ids: Optional[set[str]] = None,
+    ) -> bool:
+        order_id = str(order.get("orderid") or order.get("order_id") or "")
+        if order_id and order_id in (known_order_ids or set()):
+            return True
+        strategy = next(
+            (
+                str(order[key]).strip()
+                for key in ("strategy", "strategy_tag", "strategy_name")
+                if order.get(key) not in (None, "")
+            ),
+            "",
+        )
+        if not strategy:
+            return not self._is_hd_strategy()
+        expected = str(
+            getattr(
+                self.broker,
+                "strategy_tag",
+                "HD" if self._is_hd_strategy() else "Strategy",
+            )
+        ).strip()
+        return bool(strategy and strategy.casefold() == expected.casefold())
+
+    def _uses_broker_confirmed_fill(self) -> bool:
+        return self._is_ema21_strategy() or self._is_hd_strategy()
 
     def _round_option_price(self, price: float) -> float:
         tick_size = max(float(getattr(self.cfg, "option_tick_size", 0.05)), 0.0001)
@@ -397,6 +443,12 @@ class BaseStrategyEngine:
             order for order in open_orders
             if str(order.get("symbol") or "") == position.option_symbol
             and str(order.get("action") or order.get("side") or "").upper() == "SELL"
+            and self._is_strategy_order(
+                order,
+                {position.protective_stop_order_id}
+                if position.protective_stop_order_id
+                else set(),
+            )
         ]
         matching_order = next(
             (
@@ -730,14 +782,40 @@ class BaseStrategyEngine:
                 expiry_day = choose_weekly_expiry_for_entry(ts.date(), self.cfg.weekly_expiry_weekday)
         expiry_code = format_expiry_code(expiry_day)
 
-        ce_symbol = build_option_symbol(self.cfg.option_index_symbol, expiry_code, strike, "CE")
-        pe_symbol = build_option_symbol(self.cfg.option_index_symbol, expiry_code, strike, "PE")
+        if getattr(self.signal_provider, "strategy_key", None) == "hd":
+            try:
+                chain = self.broker.fetch_option_chain(
+                    self.cfg.option_index_symbol,
+                    self.cfg.exchange_spot,
+                    expiry_code,
+                )
+            except Exception as exc:
+                self._record_alert(ts, "RISK", f"HD option-chain fetch failed: {exc}")
+                return
+            selected = self._select_hd_contracts(chain, strike)
+            if selected is None:
+                self._record_alert(
+                    ts,
+                    "RISK",
+                    "HD contracts not locked: no one-step ITM contracts in "
+                    f"premium range {self.cfg.premium_min_price:.2f}-"
+                    f"{self.cfg.premium_max_price:.2f}",
+                )
+                return
+            ce_symbol, pe_symbol = selected
+            if ce_symbol is None:
+                self._record_alert(ts, "RISK", "HD CE unavailable: one-step ITM contract missing or outside premium range")
+            if pe_symbol is None:
+                self._record_alert(ts, "RISK", "HD PE unavailable: one-step ITM contract missing or outside premium range")
+        else:
+            ce_symbol = build_option_symbol(self.cfg.option_index_symbol, expiry_code, strike, "CE")
+            pe_symbol = build_option_symbol(self.cfg.option_index_symbol, expiry_code, strike, "PE")
         self.state.ce_symbol = ce_symbol
         self.state.pe_symbol = pe_symbol
         self.state.atm_strike = strike
         self.state.ce.option_symbol = ce_symbol
         self.state.pe.option_symbol = pe_symbol
-        self.state.atm_locked = True
+        self.state.atm_locked = bool(ce_symbol or pe_symbol)
         print()
         print("┌" + "─" * 60 + "┐")
         print(f"│ {'STRATEGY — STRIKES LOCKED':^58s} │")
@@ -746,13 +824,59 @@ class BaseStrategyEngine:
         print(f"│  Spot   : {spot_price:<47.2f} │")
         print(f"│  Strike : {strike:<47d} │")
         print(f"│  Expiry : {expiry_code:<47s} │")
-        print(f"│  CE     : {ce_symbol:<47s} │")
-        print(f"│  PE     : {pe_symbol:<47s} │")
+        print(f"│  CE     : {str(ce_symbol or '-'):<47s} │")
+        print(f"│  PE     : {str(pe_symbol or '-'):<47s} │")
         print("└" + "─" * 60 + "┘")
         print()
         self._record_alert(
             ts, "ATM_LOCK", f"Strike {strike} | CE={ce_symbol} | PE={pe_symbol}",
         )
+
+    def _select_hd_contracts(
+        self,
+        response: Optional[dict[str, object]],
+        atm_strike: int,
+    ) -> Optional[tuple[Optional[str], Optional[str]]]:
+        if self.cfg.premium_min_price >= self.cfg.premium_max_price or response is None:
+            return None
+        payload = response.get("data") if isinstance(response.get("data"), dict) else response
+        chain_rows = payload.get("chain") if isinstance(payload, dict) else None
+        if not isinstance(chain_rows, list):
+            return None
+
+        midpoint = (self.cfg.premium_min_price + self.cfg.premium_max_price) / 2
+        selected: dict[str, tuple[float, str]] = {}
+        for row in chain_rows:
+            if not isinstance(row, dict):
+                continue
+            try:
+                strike = float(row.get("strike"))
+            except (TypeError, ValueError):
+                continue
+            for side in ("CE", "PE"):
+                target_strike = atm_strike + (-self.cfg.strike_step if side == "CE" else self.cfg.strike_step)
+                if strike != target_strike:
+                    continue
+                option = row.get(side.lower()) or row.get(side)
+                if not isinstance(option, dict):
+                    continue
+                symbol = option.get("symbol")
+                try:
+                    premium = float(option.get("ltp"))
+                except (TypeError, ValueError):
+                    continue
+                if not symbol or not self.cfg.premium_min_price <= premium <= self.cfg.premium_max_price:
+                    continue
+                rank = abs(premium - midpoint)
+                current = selected.get(side)
+                if current is None or rank < current[0]:
+                    selected[side] = (rank, str(symbol))
+
+        ce_symbol = selected.get("CE", ((), None))[1]
+        pe_symbol = selected.get("PE", ((), None))[1]
+        if ce_symbol is None and pe_symbol is None:
+            return None
+        return ce_symbol, pe_symbol
 
     # ── entry placement ────────────────────────────────────────────
 
@@ -911,6 +1035,15 @@ class BaseStrategyEngine:
                     )
                     return
 
+        if self._is_hd_strategy() and ts.time() >= self.cfg.entry_cutoff:
+            self._record_alert(
+                ts,
+                "RISK",
+                f"{side} entry blocked: HD entry cutoff reached at "
+                f"{self.cfg.entry_cutoff.strftime('%H:%M')}",
+            )
+            return
+
         if self._is_ema21_strategy():
             if ts.time() < self.cfg.entry_start or ts.time() >= self.cfg.entry_cutoff:
                 self._record_alert(
@@ -1045,7 +1178,12 @@ class BaseStrategyEngine:
             ts, "PENDING_ENTRY",
             f"Pending {side} {side_state.option_symbol} qty={quantity} "
             f"trigger={trigger_level:.2f} SL={stop_level:.2f} lots={lots} "
-            f"option_risk={risk_points:.2f}",
+            f"option_risk={risk_points:.2f}"
+            + (
+                f" order_id={order_id}"
+                if self._is_hd_strategy() and order_id
+                else ""
+            ),
         )
         print(self._fmt_candle_context(row, side_state.option_symbol, self._is_ema21_strategy()))
 
@@ -1077,7 +1215,7 @@ class BaseStrategyEngine:
         created_at_normalized = pending.created_at.replace(tzinfo=None) if pending.created_at.tzinfo else pending.created_at
         elapsed_seconds = max(0.0, (ts_normalized - created_at_normalized).total_seconds())
         candles_elapsed = int(elapsed_seconds // candle_seconds)
-        if candles_elapsed > self.cfg.pending_entry_expiry_candles:
+        if not self._is_hd_strategy() and candles_elapsed > self.cfg.pending_entry_expiry_candles:
             self._cancel_pending_entry_with_reason(
                 side,
                 side_state,
@@ -1110,7 +1248,7 @@ class BaseStrategyEngine:
                 )
                 return
 
-        if self._is_ema21_strategy() and not self.broker.is_replay:
+        if self._uses_broker_confirmed_fill() and not self.broker.is_replay:
             status = self.broker.get_order_status(pending.order_id or "")
             order_status = str(status.get("order_status") or status.get("status") or "").lower()
             if order_status in {"cancelled", "rejected", "failed"}:
@@ -1179,7 +1317,10 @@ class BaseStrategyEngine:
                     entry_time=ts,
                     option_stop_level=pending.option_stop_level,
                     option_entry_trigger=pending.option_trigger_level,
-                    option_risk_points=abs(pending.option_trigger_level - pending.option_stop_level),
+                    option_risk_points=(
+                        actual_risk if self._is_hd_strategy()
+                        else abs(pending.option_trigger_level - pending.option_stop_level)
+                    ),
                 )
                 self._place_protective_stop(side, side_state.position, ts)
                 side_state.pending_entry = None
@@ -1190,7 +1331,12 @@ class BaseStrategyEngine:
                     f"Entered {side} {pending.option_symbol} @ {option_ltp:.2f}, "
                     f"qty={pending.quantity}, trigger={pending.option_trigger_level:.2f}, "
                     f"SL={pending.option_stop_level:.2f}, "
-                    f"option_risk={abs(pending.option_trigger_level - pending.option_stop_level):.2f}",
+                    f"option_risk={abs(pending.option_trigger_level - pending.option_stop_level):.2f}"
+                    + (
+                        f", order_id={pending.order_id}"
+                        if self._is_hd_strategy() and pending.order_id
+                        else ""
+                    ),
                 )
             return
 
@@ -1266,7 +1412,12 @@ class BaseStrategyEngine:
             ts, "ENTRY",
             f"Entered {side} {option_symbol} @ {option_ltp:.2f}, "
             f"trigger={pending.option_trigger_level:.2f}, "
-            f"SL={pending.option_stop_level:.2f}, option_risk={risk_points:.2f}",
+            f"SL={pending.option_stop_level:.2f}, option_risk={risk_points:.2f}"
+            + (
+                f", order_id={pending.order_id}"
+                if self._is_hd_strategy() and pending.order_id
+                else ""
+            ),
         )
         print(self._fmt_candle_context(row, option_symbol, self._is_ema21_strategy()))
 
@@ -1275,7 +1426,7 @@ class BaseStrategyEngine:
     def compute_rr_progress(self, pos: Position, row: pd.Series) -> float:
         if pos.option_risk_points <= 0:
             return 0.0
-        rr_entry = pos.entry_price if self._is_ema21_strategy() else pos.option_entry_trigger
+        rr_entry = pos.entry_price if self._uses_broker_confirmed_fill() else pos.option_entry_trigger
         favorable_move = float(row["high"]) - rr_entry
         return favorable_move / pos.option_risk_points
 
@@ -1334,6 +1485,14 @@ class BaseStrategyEngine:
                 f"{pos.option_type} {self.cfg.t1_rr:.1f} RR hit — SL moved to entry (breakeven)",
             )
 
+        if self._is_hd_strategy():
+            self._advance_hd_trailing(
+                side_state,
+                rr,
+                self.last_processed_candle_time or pos.entry_time,
+            )
+            return
+
         # Phase 3: At 2.0 RR — partial exit 1 lot.
         if (
             not self._is_ema21_strategy()
@@ -1377,6 +1536,38 @@ class BaseStrategyEngine:
                         f"{pos.option_type} {current_step:.1f} RR — TSL raised to {new_sl:.2f}",
                     )
 
+    def _advance_hd_trailing(
+        self,
+        side_state: BaseSideState,
+        rr: float,
+        ts: datetime,
+    ) -> None:
+        pos = side_state.position
+        if pos is None or not pos.breakeven_armed or pos.option_risk_points <= 0:
+            return
+        step = float(self.cfg.trailing_step_rr)
+        if step <= 0:
+            return
+        milestone = max(float(self.cfg.t1_rr), pos.highest_rr_step) + step
+        while rr + 1e-9 >= milestone:
+            new_stop = pos.entry_price + (milestone - self.cfg.t1_rr) * pos.option_risk_points
+            if pos.trailing_sl_level is None or new_stop > pos.trailing_sl_level:
+                pos.trailing_sl_level = new_stop
+                pos.option_stop_level = new_stop
+                self._refresh_protective_stop(pos.option_type, pos, ts)
+                self._record_alert(
+                    ts,
+                    "TSL",
+                    f"{pos.option_type} {milestone:.2f} RR milestone hit — TSL raised to {new_stop:.2f}",
+                )
+            pos.highest_rr_step = milestone
+            pos.next_target_rr = milestone + step
+            pos.progress_status = (
+                f"{milestone:.2f}R reached - SL shifted to {pos.option_stop_level:.2f}; "
+                f"looking for {pos.next_target_rr:.2f}R"
+            )
+            milestone += step
+
     def check_trailing_stop(self, side_state: BaseSideState, row: Optional[pd.Series] = None) -> None:
         """Exit if the candle low or live LTP drops to the trailing SL level."""
         pos = side_state.position
@@ -1411,12 +1602,17 @@ class BaseStrategyEngine:
         option_low = float(row["low"])
 
         if option_low <= pos.option_stop_level:
+            trailing_hit = self._is_hd_strategy() and pos.breakeven_armed
             self._exit_position(
                 side_state,
                 self.last_processed_candle_time or pos.entry_time,
                 pos.quantity,
-                f"Catastrophic stop hit: option low {option_low:.2f} <= SL {pos.option_stop_level:.2f}",
-                is_hard_sl=True,
+                (
+                    f"Trailing stop hit: option low {option_low:.2f} <= TSL {pos.option_stop_level:.2f}"
+                    if trailing_hit
+                    else f"Catastrophic stop hit: option low {option_low:.2f} <= SL {pos.option_stop_level:.2f}"
+                ),
+                is_hard_sl=not trailing_hit,
                 row=row,
             )
             return
@@ -1512,15 +1708,20 @@ class BaseStrategyEngine:
 
         # Hard SL check.
         if ltp <= pos.option_stop_level:
+            trailing_hit = self._is_hd_strategy() and pos.breakeven_armed
             self._exit_position(
                 side_state, ts, pos.quantity,
-                f"Hard SL hit (tick): LTP {ltp:.2f} <= SL {pos.option_stop_level:.2f}",
-                is_hard_sl=True,
+                (
+                    f"Trailing stop hit (tick): LTP {ltp:.2f} <= TSL {pos.option_stop_level:.2f}"
+                    if trailing_hit
+                    else f"Hard SL hit (tick): LTP {ltp:.2f} <= SL {pos.option_stop_level:.2f}"
+                ),
+                is_hard_sl=not trailing_hit,
             )
             return
 
         # Compute current RR from tick LTP.
-        rr_entry = pos.entry_price if self._is_ema21_strategy() else pos.option_entry_trigger
+        rr_entry = pos.entry_price if self._uses_broker_confirmed_fill() else pos.option_entry_trigger
         rr = (ltp - rr_entry) / ir
         lot_qty = self.cfg.option_lot_size
 
@@ -1540,6 +1741,10 @@ class BaseStrategyEngine:
                     "TSL",
                     f"{pos.option_type} {self.cfg.t1_rr:.1f} RR (tick) — SL to entry",
                 )
+
+        if self._is_hd_strategy():
+            self._advance_hd_trailing(side_state, rr, ts)
+            return
 
         # Phase 3: 2.0 RR — partial exit.
         if (

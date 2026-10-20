@@ -29,6 +29,9 @@ The PostgreSQL database integration for the trading platform is **complete and f
 - Pre-ping verification before using connections
 - SQLAlchemy 2.0 compatible with `text()` wrapper for raw SQL
 - Context manager `DatabaseSession` for automatic commit/rollback
+- Instrument API handlers close manually acquired sessions on every success and
+  error path, and roll back failed writes. This prevents repeated dashboard
+  requests from leaking connections and exhausting the SQLAlchemy pool.
 
 #### Key Features
 ```python
@@ -111,6 +114,20 @@ Features:
 - Idempotent (safe to run multiple times)
 - Detailed schema information display
 - Graceful handling of existing schemas
+- API startup runs schema initialization. Existing `instruments` tables receive
+  additive `entry_cutoff_time` and `max_initial_risk_points` columns when missing;
+  existing rows are preserved, with defaults `14:40` and `20.0`.
+
+This is a targeted additive migration, not a general migration of arbitrary ORM
+changes. Future schema changes still require an explicit migration.
+
+### Instrument Configuration API
+
+`GET /api/instruments` returns active instruments by default. Use
+`?includeArchived=true` to also inspect inactive and archived configurations.
+Updates through `PUT /api/instruments/<id>` persist the status read by the
+strategy daemon. Instrument CRUD and debug handlers close sessions on every
+response path and roll back failed writes.
 
 ### 5. REST API Endpoints
 **File**: [api_server.py](api_server.py) | **Port**: 5003

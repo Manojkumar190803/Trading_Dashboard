@@ -47,6 +47,74 @@ def test_normalize_history_drops_invalid_ohlc_rows_and_fills_volume():
     assert normalized["volume"].tolist() == [1000.0]
 
 
+def test_hd_replay_fetches_and_processes_only_the_available_option_side(monkeypatch):
+    history = _sample_df()
+
+    class ReplayHistoryBroker:
+        fetched_symbols = []
+
+        def __init__(self, **kwargs):
+            pass
+
+        def fetch_history(self, symbol, **kwargs):
+            self.fetched_symbols.append(symbol)
+            return history
+
+    class ReplayEngine:
+        processed_sides = []
+
+        def __init__(self, *args):
+            self.state = SimpleNamespace(
+                ce_symbol="NIFTY08AUG2625000CE",
+                pe_symbol=None,
+                ce=SimpleNamespace(option_symbol="NIFTY08AUG2625000CE", pending_entry=None, position=None),
+                pe=SimpleNamespace(option_symbol=None, pending_entry=None, position=None),
+                atm_locked=True,
+            )
+            self.alerts = []
+            self.trace_rows = []
+            self.processed_sides = []
+
+        def reset_for_new_day(self, day):
+            pass
+
+        def _is_hd_strategy(self):
+            return True
+
+        def process_option_candle(self, side, row, previous):
+            ReplayEngine.processed_sides.append(side)
+
+        def force_square_off_side(self, side_state, timestamp):
+            pass
+
+        def get_status_snapshot(self):
+            return {"total_entries": 0, "total_hard_sl_hits": 0, "realized_pnl": 0.0}
+
+        def _side_state(self, side):
+            return self.state.ce if side == "CE" else self.state.pe
+
+    monkeypatch.setenv("OPENALGO_API_KEY", "test-key")
+    monkeypatch.setattr(runner, "OpenAlgoBroker", ReplayHistoryBroker)
+    monkeypatch.setattr(runner, "HistoricalReplayBroker", lambda: SimpleNamespace(set_current_bar=lambda *args: None))
+    monkeypatch.setattr(runner, "BaseStrategyEngine", ReplayEngine)
+    monkeypatch.setattr(runner, "_restore_atm_lock_from_alerts", lambda *args: True)
+
+    runner.run_historical_replay(
+        StrategyConfig(option_index_symbol="NIFTY"),
+        RiskConfig(),
+        EMA21SignalProvider(),
+        "2026-08-08",
+        "2026-08-08",
+    )
+
+    assert ReplayHistoryBroker.fetched_symbols == [
+        "NIFTY",
+        "NIFTY08AUG2625000CE",
+        "NIFTY08AUG2625000CE",
+    ]
+    assert ReplayEngine.processed_sides == ["CE"]
+
+
 class PositionBookBroker(ConsoleBroker):
     requires_position_reconciliation = True
 
@@ -596,6 +664,65 @@ def test_live_setup_status_uses_candle_start_time(monkeypatch):
     )
 
     assert captured == [datetime(2026, 9, 23, 13, 30)]
+
+
+def test_setup_status_monitoring_uses_the_signal_provider_strategy(monkeypatch, tmp_path):
+    import csv
+    from datetime import datetime
+
+    monkeypatch.chdir(tmp_path)
+    engine = SimpleNamespace(
+        signal_provider=SimpleNamespace(
+            strategy_key="hd",
+            format_setup_status=lambda _state: "Waiting for RSI < 20",
+        )
+    )
+    side_state = SimpleNamespace(option_symbol="NIFTY19OCT2623200PE")
+    candle = pd.Series({"datetime": datetime(2026, 10, 16, 10, 15)})
+
+    runner._persist_setup_status_monitoring(engine, "PE", side_state, candle)
+
+    with open("logs/monitoring_20261016.csv", newline="", encoding="utf-8") as handle:
+        row = next(csv.DictReader(handle))
+    assert row["message"].startswith("PE HD setup | NIFTY19OCT2623200PE |")
+
+
+def test_restore_hd_atm_lock_accepts_a_single_selected_side(monkeypatch, tmp_path):
+    import json
+    from datetime import date, time
+
+    monkeypatch.chdir(tmp_path)
+    lock_path = runner._atm_lock_path(date(2026, 10, 16), "NIFTY", "hd")
+    lock_path.parent.mkdir(parents=True)
+    lock_path.write_text(
+        json.dumps({
+            "trading_day": "2026-10-16",
+            "spot_price": 23128.2,
+            "ce_symbol": None,
+            "pe_symbol": "NIFTY19OCT2623200PE",
+        }),
+        encoding="utf-8",
+    )
+    state = SimpleNamespace(
+        ce_symbol=None,
+        pe_symbol=None,
+        ce=SimpleNamespace(option_symbol=None),
+        pe=SimpleNamespace(option_symbol=None),
+        atm_locked=False,
+    )
+    engine = SimpleNamespace(
+        state=state,
+        cfg=SimpleNamespace(option_index_symbol="NIFTY", atm_lock_time=time(9, 20)),
+        _is_hd_strategy=lambda: True,
+        on_day_transition_if_needed=lambda _timestamp: None,
+    )
+
+    assert runner._restore_atm_lock(engine, date(2026, 10, 16)) is True
+    assert state.atm_locked is True
+    assert state.ce_symbol is None
+    assert state.pe_symbol == "NIFTY19OCT2623200PE"
+    assert state.ce.option_symbol is None
+    assert state.pe.option_symbol == "NIFTY19OCT2623200PE"
 
 
 def test_live_tick_poll_keeps_pending_entry_ticks_out_of_active_monitoring(monkeypatch):

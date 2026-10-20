@@ -13,21 +13,12 @@ from strategies.base import SignalProvider
 
 @dataclass
 class HDSideState(BaseSideState):
-    """HD strategy extends BaseSideState with RSI-divergence tracking."""
+    """Per-option RSI pullback and one-candle alert state."""
 
-    swing_low_active: bool = False
-    swing_low: Optional[float] = None
-    pullback_active: bool = False
-    pullback_low_price: Optional[float] = None
-    pullback_low_rsi: Optional[float] = None
-    pullback_low_time: Optional[datetime] = None
-    p1_price: Optional[float] = None
-    p1_rsi: Optional[float] = None
-    p1_candle_time: Optional[datetime] = None
-    p2_price: Optional[float] = None
-    p2_rsi: Optional[float] = None
-    p2_candle_time: Optional[datetime] = None
-    divergence_ready: bool = False
+    setup_pending: bool = False
+    alert_ready: bool = False
+    alert_candle_low: Optional[float] = None
+    setup_candle_time: Optional[datetime] = None
 
 
 @dataclass
@@ -35,10 +26,13 @@ class HDConfig:
     """HD-strategy-specific parameters (not shared with other strategies)."""
 
     strong_body_threshold: float = 0.85
+    option_tick_size: float = 0.05
 
 
 class HDSignalProvider(SignalProvider):
-    """RSI bullish-divergence + trend + trigger-candle signal logic."""
+    """NIFTY trend + option RSI pullback + alert-candle signal logic."""
+
+    strategy_key = "hd"
 
     def __init__(self, hd_cfg: Optional[HDConfig] = None) -> None:
         self.hd_cfg = hd_cfg or HDConfig()
@@ -53,7 +47,7 @@ class HDSignalProvider(SignalProvider):
         prev_row: Optional[pd.Series],
     ) -> None:
         assert isinstance(side_state, HDSideState)
-        self._update_bullish_setup(side_state, row, prev_row)
+        self._update_setup(side_state, row, prev_row)
 
     def generate_signal(
         self,
@@ -67,20 +61,14 @@ class HDSignalProvider(SignalProvider):
         if side_state.position is not None or side_state.pending_entry is not None:
             return Signal.NONE
 
-        bullish_trend = (row["ema13"] > row["ema20"]) or (row["ema20"] > row["ema50"])
-        trigger_ok = (
-            is_strong_green_candle(row, self.hd_cfg.strong_body_threshold)
-            or is_hammer_candle(row)
-        )
-        if (
-            side_state.p1_price is not None
-            and side_state.p2_price is not None
-            and bullish_trend
-            and side_state.divergence_ready
-            and trigger_ok
-        ):
-            return Signal.BUY_CE if side == "CE" else Signal.BUY_PE
+        if not side_state.alert_ready:
+            return Signal.NONE
 
+        trend = self._market_trend(row)
+        if trend == "BULLISH" and side == "CE":
+            return Signal.BUY_CE
+        if trend == "BEARISH" and side == "PE":
+            return Signal.BUY_PE
         return Signal.NONE
 
     def compute_risk_points(
@@ -89,16 +77,12 @@ class HDSignalProvider(SignalProvider):
         row: pd.Series,
     ) -> Optional[float]:
         assert isinstance(side_state, HDSideState)
-        if side_state.swing_low is None:
+        if side_state.alert_candle_low is None:
             return None
-        return float(row["high"] - side_state.swing_low)
+        return self.compute_entry_trigger_level(side_state, row) - side_state.alert_candle_low
 
     def compute_entry_lots(self, row: pd.Series, cfg: StrategyConfig) -> int:
-        premium = float(row["close"])
-        vwap = float(row["vwap"])
-        if pd.isna(vwap):
-            return cfg.half_size_lots
-        return cfg.full_size_lots if premium > vwap else cfg.half_size_lots
+        return cfg.full_size_lots
 
     def compute_stop_level(
         self,
@@ -106,50 +90,38 @@ class HDSignalProvider(SignalProvider):
         row: pd.Series,
     ) -> float:
         assert isinstance(side_state, HDSideState)
-        return float((side_state.swing_low or row["low"]) - 1.0)
+        return float(side_state.alert_candle_low if side_state.alert_candle_low is not None else row["low"])
+
+    def compute_entry_trigger_level(
+        self,
+        side_state: BaseSideState,
+        row: pd.Series,
+    ) -> float:
+        tick_size = float(row.get("option_tick_size", self.hd_cfg.option_tick_size))
+        return float(row["high"] + tick_size)
+
+    def entry_limit_buffer(self, cfg: StrategyConfig) -> float:
+        return 0.0
+
+    def applies_vwap_room_filter(self) -> bool:
+        return False
+
+    def submit_stop_limit_on_signal(self) -> bool:
+        return True
 
     def reset_after_entry(self, side_state: BaseSideState) -> None:
         assert isinstance(side_state, HDSideState)
-        side_state.swing_low_active = False
-        side_state.swing_low = None
-        side_state.pullback_active = False
-        side_state.pullback_low_price = None
-        side_state.pullback_low_rsi = None
-        side_state.pullback_low_time = None
-        side_state.p1_price = None
-        side_state.p1_rsi = None
-        side_state.p1_candle_time = None
-        side_state.p2_price = None
-        side_state.p2_rsi = None
-        side_state.p2_candle_time = None
-        side_state.divergence_ready = False
+        side_state.setup_pending = False
+        side_state.alert_ready = False
+        side_state.alert_candle_low = None
+        side_state.setup_candle_time = None
 
     def format_setup_status(self, side_state: BaseSideState) -> str:
         assert isinstance(side_state, HDSideState)
-        if side_state.divergence_ready:
-            return (
-                f"✅ DIVERGENCE ARMED  "
-                f"p1={side_state.p1_price:.1f}(rsi {side_state.p1_rsi:.0f})  "
-                f"p2={side_state.p2_price:.1f}(rsi {side_state.p2_rsi:.0f})"
-            )
-        if side_state.p2_price is not None:
-            return (
-                f"⏳ P2 found but NO divergence  "
-                f"p1={side_state.p1_price:.1f}/{side_state.p1_rsi:.0f}  "
-                f"p2={side_state.p2_price:.1f}/{side_state.p2_rsi:.0f}"
-            )
-        if side_state.p1_price is not None:
-            return (
-                f"⏳ Waiting for P2  "
-                f"(p1={side_state.p1_price:.1f}, rsi={side_state.p1_rsi:.0f})"
-            )
-        if side_state.pullback_active:
-            return (
-                f"⏳ Pullback active  "
-                f"low={side_state.pullback_low_price:.1f} rsi={side_state.pullback_low_rsi:.0f}"
-            )
-        if side_state.swing_low_active:
-            return f"⏳ Swing low = {side_state.swing_low:.1f}"
+        if side_state.alert_ready:
+            return "ALERT CANDLE READY"
+        if side_state.setup_pending:
+            return "WAITING FOR NEXT CANDLE AFTER RSI < 20"
         return "⏸  Waiting for RSI < 20"
 
     def diagnose_no_signal(
@@ -160,111 +132,56 @@ class HDSignalProvider(SignalProvider):
         prev_row: Optional[pd.Series],
     ) -> Optional[str]:
         assert isinstance(side_state, HDSideState)
-        rsi = row.get("rsi3")
-        ema13, ema20, ema50 = row.get("ema13"), row.get("ema20"), row.get("ema50")
+        if side_state.alert_ready:
+            return "ALERT_READY"
+        if side_state.setup_pending:
+            return "WAITING_FOR_ALERT_CANDLE"
+        if self._market_trend(row) == "AMBIGUOUS":
+            return "AMBIGUOUS_MARKET_TREND"
+        return "WAITING_FOR_RSI_CROSS_BELOW_20"
 
-        if side_state.p1_price is None:
-            state = "swing_low_active" if side_state.swing_low_active else "waiting_for_rsi<20"
-            pull = "pullback_active" if side_state.pullback_active else "no_pullback"
-            return f"NO_P1 ({state}, {pull})"
-        if side_state.p2_price is None:
-            return (
-                f"NO_P2 (have p1: price={side_state.p1_price:.2f} rsi={side_state.p1_rsi:.1f}; "
-                f"waiting for second pullback cross-above-20)"
-            )
-        if not side_state.divergence_ready:
-            return (
-                f"DIV_NOT_ARMED (p1={side_state.p1_price:.2f}/{side_state.p1_rsi:.1f}, "
-                f"p2={side_state.p2_price:.2f}/{side_state.p2_rsi:.1f}; "
-                f"need p2_price>p1_price AND p2_rsi<p1_rsi)"
-            )
+    def _market_trend(self, row: pd.Series) -> str:
+        ema13 = row.get("spot_ema13")
+        ema20 = row.get("spot_ema20")
+        ema50 = row.get("spot_ema50")
+        if any(value is None or pd.isna(value) for value in (ema13, ema20, ema50)):
+            return "AMBIGUOUS"
+        bullish = ema13 > ema20 or ema20 > ema50
+        bearish = ema13 < ema20 or ema20 < ema50
+        if bullish == bearish:
+            return "AMBIGUOUS"
+        return "BULLISH" if bullish else "BEARISH"
 
-        bullish_trend = (ema13 > ema20) or (ema20 > ema50)
-        if not bullish_trend:
-            return (
-                f"EMA_TREND_FAIL (need ema13>ema20 OR ema20>ema50; got "
-                f"{ema13:.2f} vs {ema20:.2f} vs {ema50:.2f})"
-            )
+    def _is_alert_candle(self, row: pd.Series) -> bool:
+        if float(row["close"]) <= float(row["open"]):
+            return False
+        if is_strong_green_candle(row, self.hd_cfg.strong_body_threshold):
+            return True
+        return is_hammer_candle(row)
 
-        strong_green = is_strong_green_candle(row, self.hd_cfg.strong_body_threshold)
-        hammer = is_hammer_candle(row)
-        if not (strong_green or hammer):
-            total = row["high"] - row["low"]
-            body = row["close"] - row["open"]
-            body_pct = (abs(body) / total * 100) if total > 0 else 0.0
-            return (
-                f"NO_TRIGGER_CANDLE (need body >= {self.hd_cfg.strong_body_threshold*100:.0f}% "
-                f"or hammer; body={body:+.2f}={body_pct:.0f}% of range={total:.2f})"
-            )
-
-        return "SIGNAL_OK (unexpected — signal should have fired)"
-
-    # ── RSI-divergence state machine ──────────────────────────────────
-
-    def _update_bullish_setup(
+    def _update_setup(
         self,
         ss: HDSideState,
         row: pd.Series,
         prev_row: Optional[pd.Series],
     ) -> None:
-        rsi = row["rsi3"]
-        if pd.isna(rsi):
-            return
-        prev_rsi = prev_row["rsi3"] if prev_row is not None else None
-        prev_rsi_valid = prev_rsi is not None and not pd.isna(prev_rsi)
+        ss.alert_ready = False
+        rsi = row.get("rsi3")
+        if ss.setup_pending:
+            ss.setup_pending = False
+            if self._is_alert_candle(row):
+                ss.alert_ready = True
+                ss.alert_candle_low = float(row["low"])
 
-        crossed_below_20 = prev_rsi_valid and prev_rsi >= 20 and rsi < 20
-        crossed_above_20 = prev_rsi_valid and prev_rsi <= 20 and rsi > 20
-
-        if crossed_below_20:
-            ss.swing_low_active = True
-            ss.swing_low = row["low"]
-            ss.pullback_active = True
-            ss.pullback_low_price = row["low"]
-            ss.pullback_low_rsi = rsi
-            ss.pullback_low_time = row.get("datetime")
-            ss.divergence_ready = False
-
-        if ss.swing_low_active:
-            if ss.swing_low is None:
-                ss.swing_low = row["low"]
-            else:
-                ss.swing_low = min(ss.swing_low, row["low"])
-
-        if ss.pullback_active and rsi < 20:
-            if ss.pullback_low_price is None:
-                ss.pullback_low_price = row["low"]
-                ss.pullback_low_time = row.get("datetime")
-            else:
-                if float(row["low"]) <= float(ss.pullback_low_price):
-                    ss.pullback_low_price = row["low"]
-                    ss.pullback_low_time = row.get("datetime")
-            if ss.pullback_low_rsi is None:
-                ss.pullback_low_rsi = rsi
-            else:
-                ss.pullback_low_rsi = min(ss.pullback_low_rsi, rsi)
-
-        if ss.pullback_active and crossed_above_20:
-            finished_price = ss.pullback_low_price
-            finished_rsi = ss.pullback_low_rsi
-            if finished_price is not None and finished_rsi is not None:
-                if ss.p1_price is None or ss.p1_rsi is None:
-                    ss.p1_price = finished_price
-                    ss.p1_rsi = finished_rsi
-                    ss.p1_candle_time = ss.pullback_low_time
-                    ss.p2_price = None
-                    ss.p2_rsi = None
-                    ss.p2_candle_time = None
-                    ss.divergence_ready = False
-                else:
-                    ss.p2_price = finished_price
-                    ss.p2_rsi = finished_rsi
-                    ss.p2_candle_time = ss.pullback_low_time
-                    ss.divergence_ready = (
-                        ss.p2_price > ss.p1_price and ss.p2_rsi < ss.p1_rsi
-                    )
-            ss.pullback_active = False
-            ss.pullback_active = False
-            ss.pullback_low_price = None
-            ss.pullback_low_rsi = None
-            ss.pullback_low_time = None
+        prev_rsi = None if prev_row is None else prev_row.get("rsi3")
+        if (
+            rsi is not None
+            and not pd.isna(rsi)
+            and prev_rsi is not None
+            and not pd.isna(prev_rsi)
+            and prev_rsi >= 20
+            and rsi < 20
+        ):
+            ss.setup_pending = True
+            ss.setup_candle_time = row.get("datetime")
+            ss.alert_candle_low = None

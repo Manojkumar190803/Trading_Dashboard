@@ -53,6 +53,8 @@ class StrategyConfig:
 
     # ── Risk (all on option premium points) ──────────────────────────
     max_option_risk_points: float = 20.0
+    premium_min_price: float = 120.0
+    premium_max_price: float = 180.0
     min_vwap_room_rr: float = 1.5
     pending_entry_expiry_candles: int = 3
     entry_buffer_points: float = 0.0

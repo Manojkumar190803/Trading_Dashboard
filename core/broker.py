@@ -8,6 +8,7 @@ from datetime import date, datetime, time, timedelta
 from typing import Optional
 
 import pandas as pd
+import requests
 
 from core.models import OrderSide
 
@@ -84,6 +85,15 @@ class BrokerInterface:
         expiry_policy: str = "weekly",
     ) -> Optional[date]:
         """Return nearest tradable expiry date for an option root, if available."""
+        return None
+
+    def fetch_option_chain(
+        self,
+        underlying: str,
+        exchange: str,
+        expiry_date: str,
+    ) -> Optional[dict[str, object]]:
+        """Return an option chain when the broker supports contract discovery."""
         return None
 
 
@@ -330,6 +340,53 @@ class OpenAlgoBroker(BrokerInterface):
 
         logger.warning("quotes(%s) unexpected response: %s", quote_symbol, resp)
         return 0.0
+
+    def fetch_option_chain(
+        self,
+        underlying: str,
+        exchange: str,
+        expiry_date: str,
+    ) -> Optional[dict[str, object]]:
+        optionchain = getattr(self.client, "optionchain", None)
+        if callable(optionchain):
+            response = optionchain(
+                underlying=underlying,
+                exchange=exchange,
+                expiry_date=expiry_date,
+            )
+        else:
+            base_url = getattr(self.client, "base_url", None)
+            api_key = getattr(self.client, "api_key", None)
+            if not isinstance(base_url, str) or not base_url.strip() or not api_key:
+                raise RuntimeError(
+                    "OpenAlgo client does not expose optionchain or the REST API credentials"
+                )
+            try:
+                http_response = requests.post(
+                    f"{base_url.rstrip('/')}/optionchain",
+                    json={
+                        "apikey": api_key,
+                        "underlying": underlying,
+                        "exchange": exchange,
+                        "expiry_date": expiry_date,
+                    },
+                    timeout=15,
+                )
+                http_response.raise_for_status()
+                response = http_response.json()
+            except requests.RequestException as exc:
+                raise RuntimeError(
+                    f"option chain HTTP request failed for {underlying}: {exc}"
+                ) from exc
+            except ValueError as exc:
+                raise RuntimeError(
+                    f"option chain response was not valid JSON for {underlying}"
+                ) from exc
+
+        if not isinstance(response, dict) or response.get("status") != "success":
+            message = response.get("message") if isinstance(response, dict) else response
+            raise RuntimeError(f"option chain request failed for {underlying}: {message}")
+        return response
 
     def get_position_book(self) -> list[dict[str, object]]:
         if self._positionbook_auth_failed:

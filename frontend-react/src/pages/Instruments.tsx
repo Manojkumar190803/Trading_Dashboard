@@ -40,14 +40,19 @@ interface FormData {
   brokerSymbol: string
   monitoringStartTime: string
   monitoringEndTime: string
+  entryCutoffTime: string
   lotSizeAdjustment: number
   strategy: string
-  premiumMinPrice?: number
-  premiumMaxPrice?: number
+  maxInitialRiskPoints: number
 }
 
 const Instruments: React.FC = () => {
-  const { trailingStopsConfig, setTrailingStopsConfig, resetTrailingStopsConfig } = useAppStore()
+  const {
+    trailingStopsConfig,
+    setTrailingStopsConfig,
+    resetTrailingStopsConfig,
+    exportInstruments,
+  } = useAppStore()
   const { instruments, isLoading, error, addInstrument: apiAddInstrument, updateInstrument: apiUpdateInstrument, deleteInstrument: apiDeleteInstrument, toggleInstrument: apiToggleInstrument } = useInstruments(true)
   const [showForm, setShowForm] = useState(false)
   const [editingId, setEditingId] = useState<string | null>(null)
@@ -66,10 +71,10 @@ const Instruments: React.FC = () => {
     brokerSymbol: '',
     monitoringStartTime: '09:15',
     monitoringEndTime: '15:30',
+    entryCutoffTime: '14:40',
     lotSizeAdjustment: 1,
     strategy: '21EMA',
-    premiumMinPrice: undefined,
-    premiumMaxPrice: undefined,
+    maxInitialRiskPoints: 20,
   })
 
   // Fetch symbol suggestions from API
@@ -160,6 +165,12 @@ const Instruments: React.FC = () => {
   const activeInstruments = filteredInstruments.filter((instrument) => instrument.status)
   const inactiveInstruments = filteredInstruments.filter((instrument) => !instrument.status)
 
+  useEffect(() => {
+    if (!isLoading) {
+      void exportInstruments(instruments)
+    }
+  }, [exportInstruments, instruments, isLoading, trailingStopsConfig])
+
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault()
     
@@ -168,16 +179,24 @@ const Instruments: React.FC = () => {
       return
     }
 
-    // Validate premium prices for non-21EMA strategies
-    if (formData.strategy !== '21EMA') {
-      if (formData.premiumMinPrice === undefined || formData.premiumMaxPrice === undefined) {
-        alert('Premium Min and Max prices are required for this strategy')
-        return
-      }
-      if (formData.premiumMinPrice >= formData.premiumMaxPrice) {
-        alert('Premium Min price must be less than Max price')
-        return
-      }
+    if (formData.monitoringStartTime >= formData.monitoringEndTime) {
+      alert('Monitoring start time must be earlier than monitoring end time')
+      return
+    }
+    if (
+      formData.entryCutoffTime < formData.monitoringStartTime
+      || formData.entryCutoffTime > formData.monitoringEndTime
+    ) {
+      alert('Entry cutoff must be between the monitoring start and end times')
+      return
+    }
+    if (!Number.isInteger(formData.lotSizeAdjustment) || formData.lotSizeAdjustment < 1) {
+      alert('Lot size adjustment must be a positive whole number')
+      return
+    }
+    if (formData.maxInitialRiskPoints <= 0) {
+      alert('Maximum initial risk must be greater than zero')
+      return
     }
 
     const baseLotSize = calculateLotSize(formData.name)
@@ -190,12 +209,12 @@ const Instruments: React.FC = () => {
       brokerSymbol: formData.brokerSymbol,
       monitoringStartTime: formData.monitoringStartTime,
       monitoringEndTime: formData.monitoringEndTime,
+      entryCutoffTime: formData.entryCutoffTime,
       lotSizeAdjustment: formData.lotSizeAdjustment,
       calculatedLotSize: lotSize,
       strategy: formData.strategy,
       productType: 'INTRADAY',
-      premiumMinPrice: formData.premiumMinPrice,
-      premiumMaxPrice: formData.premiumMaxPrice,
+      maxInitialRiskPoints: formData.maxInitialRiskPoints,
     }
 
     if (editingId) {
@@ -226,10 +245,10 @@ const Instruments: React.FC = () => {
       brokerSymbol: inst.brokerSymbol,
       monitoringStartTime: inst.monitoringStartTime,
       monitoringEndTime: inst.monitoringEndTime,
+      entryCutoffTime: inst.entryCutoffTime || '14:40',
       lotSizeAdjustment: inst.lotSizeAdjustment,
       strategy: inst.strategy,
-      premiumMinPrice: (inst as any).premiumMinPrice,
-      premiumMaxPrice: (inst as any).premiumMaxPrice,
+      maxInitialRiskPoints: inst.maxInitialRiskPoints ?? 20,
     })
     setEditingId(inst.id)
     setShowForm(true)
@@ -251,10 +270,10 @@ const Instruments: React.FC = () => {
       brokerSymbol: '',
       monitoringStartTime: '09:15',
       monitoringEndTime: '15:30',
+      entryCutoffTime: '14:40',
       lotSizeAdjustment: 1,
       strategy: '21EMA',
-      premiumMinPrice: undefined,
-      premiumMaxPrice: undefined,
+      maxInitialRiskPoints: 20,
     })
     setSymbolValidation(null)
   }
@@ -400,6 +419,34 @@ const Instruments: React.FC = () => {
                 className="w-full px-3 py-2 bg-bg-primary border border-bg-tertiary rounded-lg text-text-primary focus:outline-none focus:border-accent-cyan focus:ring-1 focus:ring-accent-cyan"
               />
             </div>
+            {formData.strategy === 'HD' && (
+              <>
+                <div>
+                  <label className="block text-sm font-medium text-text-secondary mb-2">
+                    Entry Cutoff *
+                  </label>
+                  <input
+                    type="time"
+                    value={formData.entryCutoffTime}
+                    onChange={(e) => setFormData({ ...formData, entryCutoffTime: e.target.value })}
+                    className="w-full px-3 py-2 bg-bg-primary border border-bg-tertiary rounded-lg text-text-primary focus:outline-none focus:border-accent-cyan focus:ring-1 focus:ring-accent-cyan"
+                  />
+                </div>
+                <div>
+                  <label className="block text-sm font-medium text-text-secondary mb-2">
+                    Maximum Initial Risk (points) *
+                  </label>
+                  <input
+                    type="number"
+                    min="0.05"
+                    step="0.05"
+                    value={formData.maxInitialRiskPoints}
+                    onChange={(e) => setFormData({ ...formData, maxInitialRiskPoints: Number(e.target.value) || 20 })}
+                    className="w-full px-3 py-2 bg-bg-primary border border-bg-tertiary rounded-lg text-text-primary focus:outline-none focus:border-accent-cyan focus:ring-1 focus:ring-accent-cyan"
+                  />
+                </div>
+              </>
+            )}
             <div>
               <label className="block text-sm font-medium text-text-secondary mb-2">Lot Size Adjustment</label>
               <input
@@ -434,40 +481,6 @@ const Instruments: React.FC = () => {
                 INTRADAY (Fixed)
               </div>
             </div>
-
-            {/* Trailing Mechanism - Risk Ratio Step */}
-            {/* Premium Price Min for Non-21EMA Strategies */}
-            {formData.strategy !== '21EMA' && (
-              <>
-                <div>
-                  <label className="block text-sm font-medium text-text-secondary mb-2">Premium Min Price</label>
-                  <input
-                    type="number"
-                    step="0.05"
-                    min="0"
-                    value={formData.premiumMinPrice || ''}
-                    onChange={(e) => setFormData({ ...formData, premiumMinPrice: parseFloat(e.target.value) || undefined })}
-                    className="w-full px-3 py-2 bg-bg-primary border border-bg-tertiary rounded-lg text-text-primary focus:outline-none focus:border-accent-cyan focus:ring-1 focus:ring-accent-cyan"
-                    placeholder="e.g., 25.50"
-                  />
-                  <p className="text-xs text-text-tertiary mt-1">Minimum option premium price</p>
-                </div>
-
-                <div>
-                  <label className="block text-sm font-medium text-text-secondary mb-2">Premium Max Price</label>
-                  <input
-                    type="number"
-                    step="0.05"
-                    min="0"
-                    value={formData.premiumMaxPrice || ''}
-                    onChange={(e) => setFormData({ ...formData, premiumMaxPrice: parseFloat(e.target.value) || undefined })}
-                    className="w-full px-3 py-2 bg-bg-primary border border-bg-tertiary rounded-lg text-text-primary focus:outline-none focus:border-accent-cyan focus:ring-1 focus:ring-accent-cyan"
-                    placeholder="e.g., 150.75"
-                  />
-                  <p className="text-xs text-text-tertiary mt-1">Maximum option premium price</p>
-                </div>
-              </>
-            )}
 
             <div className="col-span-1 md:col-span-3 flex gap-3">
               <button
@@ -525,11 +538,6 @@ const Instruments: React.FC = () => {
                     <td className="px-6 py-4 text-text-secondary font-mono">{inst.lotSize || calculateLotSize(inst.name)}</td>
                     <td className="px-6 py-4 text-text-secondary text-sm">
                       <div>{formatMonitoringWindow(inst.monitoringStartTime, inst.monitoringEndTime)}</div>
-                      {inst.strategy !== '21EMA' && (
-                        <div className="mt-1 text-xs text-text-tertiary">
-                          Premium: {(inst as any).premiumMinPrice?.toFixed(2) || '—'} - {(inst as any).premiumMaxPrice?.toFixed(2) || '—'}
-                        </div>
-                      )}
                     </td>
                     <td className="px-6 py-4">
                       <div className="flex items-center gap-2">
@@ -776,11 +784,6 @@ const Instruments: React.FC = () => {
                     </td>
                     <td className="px-6 py-4 text-sm text-text-secondary">
                       <div>{formatMonitoringWindow(instrument.monitoringStartTime, instrument.monitoringEndTime)}</div>
-                      {instrument.strategy !== '21EMA' && (
-                        <div className="mt-1 text-xs text-text-tertiary">
-                          Premium: {(instrument as any).premiumMinPrice?.toFixed(2) || '—'} - {(instrument as any).premiumMaxPrice?.toFixed(2) || '—'}
-                        </div>
-                      )}
                     </td>
                     <td className="px-6 py-4">
                       <div className="flex items-center gap-2 text-accent-red">

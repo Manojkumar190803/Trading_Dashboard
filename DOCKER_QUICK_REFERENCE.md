@@ -47,6 +47,11 @@ make backtest-ema21
 make backtest-2bc
 ```
 
+`make live` is an explicit CLI runner and does not consult dashboard instrument
+status. For dashboard-managed Docker trading, use `docker compose up -d` and
+manage active status in the dashboard; the Compose daemon starts runners only
+for `ACTIVE` rows.
+
 ### 🔍 View Logs
 
 ```bash
@@ -55,6 +60,10 @@ docker-compose logs -f
 
 # Strategy worker only
 docker-compose logs -f strategy_worker
+
+# Dashboard-managed strategy processes
+docker-compose logs -f hd_strategy_daemon
+cat logs/strategies_status.json
 
 # Streamlit only
 docker-compose logs -f streamlit_interface
@@ -133,6 +142,19 @@ make lint
 ```
 
 ## Troubleshooting
+
+### Inactive Instrument or Unexpected Broker Order
+
+Inactive and archived instruments are excluded from dashboard-managed strategy
+execution. The daemon checks configuration every five seconds. Deactivation
+does not cancel orders already submitted to OpenAlgo or close existing
+positions; verify broker state separately.
+
+```bash
+docker compose logs --tail 100 hd_strategy_daemon
+cat logs/strategies_status.json
+curl -fsS http://localhost:5003/api/instruments
+```
 
 ### Service Won't Start
 
