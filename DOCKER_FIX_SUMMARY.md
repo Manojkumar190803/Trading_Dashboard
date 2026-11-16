@@ -101,7 +101,8 @@ Logs: docker logs strategy_worker
 Command: python3 export_dashboard_data.py analyzer 5
 Status: ✅ Actively exporting data every 5 seconds
 Function: Fetches positions/orders/account from OpenAlgo → dashboard_data.json
-Fetches wallet/balance/margins from Fyers → wallet_data.json (if configured)
+Fetches the connected OpenAlgo broker account, including funds, positions, and
+orders → dashboard_data.json (using `OPENALGO_API_KEY` and `OPENALGO_HOST`)
 Logs: docker logs dashboard_exporter
 ```
 

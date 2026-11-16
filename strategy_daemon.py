@@ -221,6 +221,12 @@ def _strategy_environment(
     if strategy_key != 'EMA21':
         environment.pop('SHARED_SL_COUNT_FILE', None)
 
+    environment.update({
+        'PARTIAL_BOOKING_ENABLED': str(instrument.get('partialBookingEnabled', True)).lower(),
+        'PARTIAL_BOOKING_RR': str(instrument.get('partialBookingRR', 2.0)),
+        'PARTIAL_BOOKING_LOTS': str(instrument.get('partialBookingLots', 1)),
+        'PARTIAL_BOOKING_INTERVAL_RR': str(instrument.get('partialBookingIntervalRR', 0.5)),
+    })
     if strategy_key != 'HD':
         return environment
 
@@ -283,6 +289,10 @@ def _runtime_signature(instrument: dict[str, Any], trailing: dict[str, Any]) -> 
         instrument.get('lotSizeAdjustment'),
         instrument.get('entryCutoffTime'),
         instrument.get('monitoringEndTime'),
+        instrument.get('partialBookingEnabled', True),
+        instrument.get('partialBookingRR', 2.0),
+        instrument.get('partialBookingLots', 1),
+        instrument.get('partialBookingIntervalRR', 0.5),
         trailing.get('breakEvenRR'),
         trailing.get('trailStepRR'),
     )

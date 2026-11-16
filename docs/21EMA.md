@@ -42,10 +42,12 @@ exceeds 20 option-premium points.
 
 After entry, the position remains open through the first 1R milestone. At 1R,
 the stop moves to entry price. Thereafter, the stop advances by 0.5R for every
-additional 0.5R milestone. The position exits when its stop is hit, when a
-3-minute option candle closes below its EMA, or at the mandatory 15:10 IST
-square-off. Stop, milestone, and trailing triggers use live option-premium
-ticks.
+additional 0.5R milestone. When partial booking is enabled, the configured
+number of lots (one by default) is booked at the configured RR milestone (2R by
+default), and the remaining quantity continues trailing. The position exits
+when its stop is hit, when a 3-minute option candle closes below its EMA, or at
+the mandatory 15:10 IST square-off. Stop, milestone, and trailing triggers use
+live option-premium ticks.
 
 ## 3. Scope and Assumptions
 
@@ -92,6 +94,10 @@ ticks.
 | `max_initial_risk_points` | 20.0 | Discard setup when initial risk is greater than this value |
 | `breakeven_rr` | 1.0 | Move stop to cost at 1R |
 | `trail_step_rr` | 0.5 | Advance stop at each additional 0.5R |
+| `partial_booking_enabled` | true | Book a configured portion at the partial-booking milestone |
+| `partial_booking_rr` | 2.0 | Initial RR milestone for the first partial booking |
+| `partial_booking_interval_rr` | 0.5 | RR increment between later one-lot booking milestones |
+| `partial_booking_lots` | 1 | Lots to book at each milestone, retaining at least one lot to trail |
 | `max_trades_per_day` | 3 | Maximum filled entries per trading day |
 | `lots` | 2 | Initial lot count |
 | `option_lot_size` | 65 | Quantity per Nifty lot |
@@ -163,6 +169,7 @@ ticks.
 | FR-38 | If an entry or exit order fails, the system shall record the failure and reconcile broker state before retrying. | Must |
 | FR-39 | If actual fill risk, calculated as `actual_entry_price - initial_stop`, is greater than 20 option-premium points, the system shall exit the filled quantity immediately and record the risk breach. | Must |
 | FR-40 | The system shall lock new trading for the day after three filled trades exit at their initial or active stop-loss, regardless of the remaining filled-entry allowance. | Must |
+| FR-41 | When partial booking is enabled, the system shall book `partial_booking_lots` at `partial_booking_rr`, then repeat at each `partial_booking_interval_rr` while retaining at least one lot for trailing and normal strategy exits. | Must |
 
 ## 6. State Machine
 

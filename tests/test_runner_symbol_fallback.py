@@ -4,6 +4,7 @@ from datetime import datetime
 from types import SimpleNamespace
 
 import pandas as pd
+import pytest
 
 import core.runner as runner
 from core.broker import ConsoleBroker
@@ -184,6 +185,36 @@ def test_position_reconciliation_clears_local_position_when_broker_is_flat():
 def test_position_reconciliation_preserves_local_position_when_book_unavailable():
     engine = _engine_with_position()
     broker = PositionBookBroker([], available=False)
+
+    runner._clear_positions_missing_from_broker([engine], broker)
+
+    assert engine.state.ce.position is not None
+
+
+def test_position_reconciliation_waits_for_leftover_stop_cancellation(monkeypatch):
+    engine = _engine_with_position()
+    broker = PositionBookBroker([])
+    engine.broker = broker
+    position = engine.state.ce.position
+    position.protective_stop_order_id = "LEFTOVER-SL"
+    status = {"order_status": "open"}
+    monkeypatch.setattr(broker, "cancel_order", lambda order_id: False)
+    monkeypatch.setattr(broker, "get_order_status", lambda order_id: status)
+
+    runner._clear_positions_missing_from_broker([engine], broker)
+
+    assert engine.state.ce.position is position
+
+    status["order_status"] = "cancelled"
+    runner._clear_positions_missing_from_broker([engine], broker)
+
+    assert engine.state.ce.position is None
+    assert any(alert.category == "EXIT_RECONCILED" for alert in engine.alerts)
+
+
+def test_position_reconciliation_preserves_position_with_missing_quantity():
+    engine = _engine_with_position()
+    broker = PositionBookBroker([{"symbol": engine.state.ce.position.option_symbol}])
 
     runner._clear_positions_missing_from_broker([engine], broker)
 
@@ -587,6 +618,64 @@ def test_restore_uncertain_entry_preserves_original_ema21_stop(tmp_path, monkeyp
     assert broker.cancelled == ["BAD-SL"]
 
 
+@pytest.mark.parametrize("multi", [False, True])
+def test_live_tick_poll_checks_active_prices_before_entry_reconciliation(monkeypatch, multi):
+    events = []
+    position = SimpleNamespace(option_symbol="NIFTY01SEP2624250PE")
+    states = {
+        "CE": SimpleNamespace(position=None, pending_entry=None),
+        "PE": SimpleNamespace(position=position, pending_entry=None),
+    }
+    engine = SimpleNamespace(
+        _side_state=lambda side: states[side],
+        process_tick=lambda *args: events.append("risk_tick"),
+    )
+    runner_type = runner.MultiEngineLiveFeedRunner if multi else runner.LiveFeedRunner
+    live_runner = runner_type.__new__(runner_type)
+    if multi:
+        live_runner.engines = [("ema21", engine)]
+        live_runner.cfg = StrategyConfig()
+    else:
+        live_runner.engine = engine
+    live_runner.broker = ConsoleBroker(ltp_fallback=116.5)
+    monkeypatch.setattr(runner, "_persist_tick_monitoring", lambda *args: None)
+    monkeypatch.setattr(runner, "_now_ist_naive", lambda: datetime(2026, 9, 1, 13, 28))
+    monkeypatch.setattr(
+        runner, "_reconcile_pending_entry_fills",
+        lambda *args: events.append("entry_reconciliation"),
+    )
+    monkeypatch.setattr(
+        runner, "_clear_positions_missing_from_broker",
+        lambda *args: events.append("position_reconciliation"),
+    )
+
+    live_runner._poll_active_ticks()
+
+    assert events.index("risk_tick") < events.index("entry_reconciliation")
+    assert events.index("risk_tick") < events.index("position_reconciliation")
+
+
+@pytest.mark.parametrize("runner_type", [runner.LiveFeedRunner, runner.MultiEngineLiveFeedRunner])
+def test_tick_poll_wait_subtracts_broker_request_time(monkeypatch, runner_type):
+    clock = [0.0]
+    waits = []
+    live_runner = runner_type.__new__(runner_type)
+
+    def poll():
+        clock[0] += 0.4
+
+    def wait(seconds):
+        waits.append(seconds)
+        return True
+
+    live_runner._poll_active_ticks = poll
+    live_runner._stop = SimpleNamespace(is_set=lambda: False, wait=wait)
+    monkeypatch.setattr(runner, "monotonic", lambda: clock[0])
+
+    assert live_runner._wait_with_countdown(180) is True
+    assert waits == [pytest.approx(0.6)]
+
+
 def test_live_tick_poll_includes_pending_entry_symbol():
     class QuoteBroker(ConsoleBroker):
         def __init__(self):
@@ -612,6 +701,89 @@ def test_live_tick_poll_includes_pending_entry_symbol():
     live_runner._poll_active_ticks()
 
     assert live_runner.broker.quoted == ["NIFTY01SEP2624250PE"]
+
+
+@pytest.mark.parametrize("multi", [False, True])
+def test_active_ema21_position_exits_from_live_candle_before_history(monkeypatch, multi):
+    cfg = StrategyConfig()
+    engine = BaseStrategyEngine(
+        cfg, RiskConfig(), ConsoleBroker(ltp_fallback=90.0), EMA21SignalProvider()
+    )
+    symbol = "NIFTY01SEP2624250CE"
+    engine.state.trading_day = datetime(2026, 9, 1).date()
+    engine.state.atm_locked = True
+    side_state = engine.signal_provider.create_side_state()
+    engine.state.ce = side_state
+    side_state.option_symbol = symbol
+    side_state.last_ema21 = 100.0
+    side_state.position = Position(
+        option_symbol=symbol,
+        option_type="CE",
+        quantity=130,
+        initial_quantity=130,
+        entry_price=100.0,
+        entry_time=datetime(2026, 9, 1, 12, 0),
+        option_stop_level=70.0,
+        option_entry_trigger=100.0,
+        option_risk_points=30.0,
+    )
+
+    runner_type = runner.MultiEngineLiveFeedRunner if multi else runner.LiveFeedRunner
+    live_runner = runner_type.__new__(runner_type)
+    live_runner.cfg = cfg
+    live_runner._init_live_position_candles()
+    live_runner._last_bar_time = {
+        "CE": datetime(2026, 9, 1, 12, 27),
+        "PE": None,
+    }
+    live_runner._checkpoint_day = datetime(2026, 9, 1).date()
+    live_runner._startup_baselined = {"CE"}
+    if multi:
+        live_runner.engines = [("ema21", engine)]
+        live_runner._checkpoint_strategy = "ema21"
+    else:
+        live_runner.engine = engine
+
+    monkeypatch.setattr(runner, "_persist_candle_monitoring", lambda *args: None)
+    monkeypatch.setattr(runner, "_persist_setup_status_monitoring", lambda *args: None)
+    monkeypatch.setattr(runner, "_save_runner_checkpoint", lambda *args: None)
+    process_calls = 0
+    original_process = engine.process_option_candle
+
+    def counted_process(*args, **kwargs):
+        nonlocal process_calls
+        process_calls += 1
+        return original_process(*args, **kwargs)
+
+    engine.process_option_candle = counted_process
+    live_runner._observe_position_tick(
+        engine, "CE", symbol, 99.0, datetime(2026, 9, 1, 12, 30, 1)
+    )
+    live_runner._observe_position_tick(
+        engine, "CE", symbol, 90.0, datetime(2026, 9, 1, 12, 32, 59)
+    )
+    live_runner._finalize_live_position_candles(datetime(2026, 9, 1, 12, 33, 5))
+
+    assert side_state.position is None
+    assert process_calls == 1
+    assert any(
+        alert.category == "EXIT" and "EMA-21 close exit" in alert.message
+        for alert in engine.alerts
+    )
+
+    history_row = pd.DataFrame(
+        [{
+            "datetime": datetime(2026, 9, 1, 12, 30),
+            "open": 99.0,
+            "high": 99.0,
+            "low": 90.0,
+            "close": 90.0,
+            "volume": 0.0,
+            "ema21": 99.09,
+        }]
+    )
+    live_runner._process_new_bars_for_side("CE", history_row)
+    assert process_calls == 1
 
 
 def test_live_tick_poll_processes_setup_ticks_without_position_monitoring(monkeypatch):
@@ -747,7 +919,8 @@ def test_live_tick_poll_keeps_pending_entry_ticks_out_of_active_monitoring(monke
     assert persisted_ticks == []
 
 
-def test_live_tick_poll_activates_monitoring_after_entry_fill():
+@pytest.mark.parametrize("multi", [False, True])
+def test_live_tick_poll_activates_monitoring_after_entry_fill(monkeypatch, multi):
     class FilledEntryBroker(ConsoleBroker):
         requires_position_reconciliation = True
 
@@ -783,9 +956,15 @@ def test_live_tick_poll_activates_monitoring_after_entry_fill():
         trigger_candle_low=110.0,
         order_id="ENTRY-1",
     )
-    live_runner = runner.LiveFeedRunner.__new__(runner.LiveFeedRunner)
-    live_runner.engine = engine
+    runner_type = runner.MultiEngineLiveFeedRunner if multi else runner.LiveFeedRunner
+    live_runner = runner_type.__new__(runner_type)
+    if multi:
+        live_runner.engines = [("ema21", engine)]
+        live_runner.cfg = engine.cfg
+    else:
+        live_runner.engine = engine
     live_runner.broker = broker
+    monkeypatch.setattr(runner, "_now_ist_naive", lambda: datetime(2026, 9, 1, 13, 28))
 
     live_runner._poll_active_ticks()
 

@@ -14,6 +14,10 @@ interface InstrumentPayload {
   premiumMinPrice?: number
   premiumMaxPrice?: number
   maxInitialRiskPoints?: number
+  partialBookingEnabled: boolean
+  partialBookingRR: number
+  partialBookingLots: number
+  partialBookingIntervalRR: number
   status?: string
 }
 
@@ -48,6 +52,10 @@ export const useInstruments = (includeArchived = false) => {
         premiumMinPrice: inst.premiumMinPrice || inst.premium_min_price,
         premiumMaxPrice: inst.premiumMaxPrice || inst.premium_max_price,
         maxInitialRiskPoints: inst.maxInitialRiskPoints ?? inst.max_initial_risk_points ?? 20,
+        partialBookingEnabled: inst.partialBookingEnabled ?? inst.partial_booking_enabled ?? true,
+        partialBookingRR: inst.partialBookingRR ?? inst.partial_booking_rr ?? 2.0,
+        partialBookingLots: inst.partialBookingLots ?? inst.partial_booking_lots ?? 1,
+        partialBookingIntervalRR: inst.partialBookingIntervalRR ?? inst.partial_booking_interval_rr ?? 0.5,
         premiumOptionStrike: inst.premiumOptionStrike || inst.premium_option_strike,
         createdAt: inst.createdAt || inst.created_at,
         updatedAt: inst.updatedAt || inst.updated_at,
@@ -88,6 +96,10 @@ export const useInstruments = (includeArchived = false) => {
           premiumMinPrice: formData.premiumMinPrice,
           premiumMaxPrice: formData.premiumMaxPrice,
           maxInitialRiskPoints: formData.maxInitialRiskPoints,
+          partialBookingEnabled: formData.partialBookingEnabled,
+          partialBookingRR: formData.partialBookingRR,
+          partialBookingLots: formData.partialBookingLots,
+          partialBookingIntervalRR: formData.partialBookingIntervalRR,
         }),
       })
       
@@ -121,6 +133,10 @@ export const useInstruments = (includeArchived = false) => {
               premiumMinPrice: formData.premiumMinPrice,
               premiumMaxPrice: formData.premiumMaxPrice,
               maxInitialRiskPoints: formData.maxInitialRiskPoints,
+              partialBookingEnabled: formData.partialBookingEnabled,
+              partialBookingRR: formData.partialBookingRR,
+              partialBookingLots: formData.partialBookingLots,
+              partialBookingIntervalRR: formData.partialBookingIntervalRR,
               status: 'ACTIVE',
             }),
           })
@@ -159,6 +175,10 @@ export const useInstruments = (includeArchived = false) => {
           premiumMinPrice: formData.premiumMinPrice,
           premiumMaxPrice: formData.premiumMaxPrice,
           maxInitialRiskPoints: formData.maxInitialRiskPoints,
+          partialBookingEnabled: formData.partialBookingEnabled,
+          partialBookingRR: formData.partialBookingRR,
+          partialBookingLots: formData.partialBookingLots,
+          partialBookingIntervalRR: formData.partialBookingIntervalRR,
         }),
       })
       

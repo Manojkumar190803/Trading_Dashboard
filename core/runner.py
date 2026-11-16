@@ -7,8 +7,9 @@ import os
 import re
 import threading
 from datetime import date, datetime, time, timedelta
+from time import monotonic
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 from zoneinfo import ZoneInfo
 
 import numpy as np
@@ -963,34 +964,123 @@ def _clear_positions_missing_from_broker(
     broker: OpenAlgoBroker,
 ) -> None:
     """Drop local positions only after a successful broker position-book read."""
-    broker_positions = broker.get_position_book()
-    if not getattr(broker, "position_book_available", True):
-        return
-    quantities = {
-        str(position.get("symbol") or ""): int(float(position.get("quantity") or 0))
-        for position in broker_positions
-        if isinstance(position, dict)
-    }
+    now = _now_ist_naive()
+    pending_sides = set()
     for engine in engines:
         for side in ("CE", "PE"):
             side_state = engine._side_state(side)
-            position = side_state.position
-            if position is None or quantities.get(position.option_symbol, 0) > 0:
+            if (
+                side_state.position is not None
+                and side_state.position.pending_exit is not None
+                and engine._reconcile_exit_order(side_state, now)
+            ):
+                pending_sides.add((id(engine), side))
+    try:
+        broker_positions = broker.get_position_book()
+    except Exception as exc:
+        logger.warning("position cleanup unavailable: %s", exc)
+        return
+    if broker_positions is None or not getattr(broker, "position_book_available", True):
+        return
+    quantities = {}
+    for position in broker_positions:
+        if not isinstance(position, dict):
+            continue
+        symbol = str(position.get("symbol") or "")
+        try:
+            quantity = position.get("quantity")
+            quantities[symbol] = int(float(quantity)) if quantity is not None else None
+        except (TypeError, ValueError):
+            quantities[symbol] = None
+    for engine in engines:
+        for side in ("CE", "PE"):
+            if (id(engine), side) in pending_sides:
                 continue
-            logger.warning(
-                "clearing stale local %s position; broker quantity for %s is 0",
-                side, position.option_symbol,
-            )
+            side_state = engine._side_state(side)
+            position = side_state.position
+            if position is None:
+                continue
+            quantity = quantities.get(position.option_symbol, 0)
+            if quantity is None or quantity < 0:
+                continue
+            if quantity > 0:
+                if not getattr(engine.broker, "requires_position_reconciliation", False):
+                    continue
+                if position.protective_stop_order_id:
+                    try:
+                        status = broker.get_order_status(position.protective_stop_order_id)
+                    except Exception as exc:
+                        logger.warning("protective stop reconciliation unavailable: %s", exc)
+                        continue
+                    order_status = str(status.get("order_status") or status.get("status") or "").lower()
+                    if order_status not in {"cancelled", "canceled", "rejected", "failed"}:
+                        continue
+                    position.protective_stop_order_id = None
+                if quantity >= position.quantity:
+                    engine._place_protective_stop(side, position, now)
+                continue
             if position.protective_stop_order_id:
                 try:
-                    broker.cancel_order(position.protective_stop_order_id)
+                    order_id = position.protective_stop_order_id
+                    status = broker.get_order_status(order_id)
+                    closed = {"complete", "filled", "executed", "cancelled", "canceled", "rejected", "failed"}
+                    order_status = str(status.get("order_status") or status.get("status") or "").lower()
+                    if order_status not in closed:
+                        broker.cancel_order(order_id)
+                        status = broker.get_order_status(order_id)
+                        order_status = str(status.get("order_status") or status.get("status") or "").lower()
+                    if order_status not in closed:
+                        engine._record_alert(
+                            now, "RISK",
+                            f"{side} broker position is flat but protective SL {order_id} "
+                            "is not confirmed closed; setup monitoring remains blocked",
+                        )
+                        continue
                 except Exception as exc:
                     logger.warning(
                         "could not cancel stale protective stop %s: %s",
                         position.protective_stop_order_id, exc,
                     )
+                    continue
             side_state.position = None
             _reset_signal_state(engine, side_state)
+            engine._record_alert(
+                now, "EXIT_RECONCILED",
+                f"{side} broker confirmed flat for {position.option_symbol}; "
+                "protective stop closed, returned to setup monitoring",
+            )
+
+
+def _poll_position_ticks(
+    engines: list[BaseStrategyEngine],
+    broker: OpenAlgoBroker,
+    on_tick: Optional[Callable[[BaseStrategyEngine, str, str, float, datetime], None]] = None,
+) -> set[int]:
+    subscriptions: dict[str, list[tuple[BaseStrategyEngine, str, object]]] = {}
+    for engine in engines:
+        for side in ("CE", "PE"):
+            position = engine._side_state(side).position
+            if position is not None:
+                subscriptions.setdefault(position.option_symbol, []).append((engine, side, position))
+    processed = set()
+    for symbol, positions in subscriptions.items():
+        try:
+            ltp = broker.get_ltp(symbol)
+        except Exception as exc:
+            logger.warning("tick quote failed for %s: %s", symbol, exc)
+            continue
+        if ltp <= 0:
+            continue
+        tick_time = _now_ist_naive()
+        labels = ",".join(side for _, side, _ in positions)
+        print(f"[TICK] {tick_time} side={labels} symbol={symbol} ltp={float(ltp):.2f}")
+        _persist_tick_monitoring(symbol, float(ltp), tick_time, labels)
+        for engine, side, position in positions:
+            engine.process_tick(side, float(ltp), tick_time)
+            processed.add(id(position))
+            if on_tick is not None:
+                on_tick(engine, side, symbol, float(ltp), tick_time)
+    return processed
 
 
 def _reconcile_pending_entry_fills(
@@ -1180,7 +1270,183 @@ def _resolve_option_pair_history(
 # ===============================================================
 
 
-class LiveFeedRunner:
+class _LivePositionCandleSupport:
+    def _init_live_position_candles(self) -> None:
+        self._live_position_candles: dict[tuple[int, str], dict[str, object]] = {}
+        self._live_position_bars: set[tuple[int, str, datetime]] = set()
+
+    def _observe_position_tick(
+        self,
+        engine: BaseStrategyEngine,
+        side: str,
+        symbol: str,
+        ltp: float,
+        tick_time: datetime,
+    ) -> None:
+        is_ema21 = getattr(engine, "_is_ema21_strategy", None)
+        if not callable(is_ema21) or not is_ema21():
+            return
+        side_state = engine._side_state(side)
+        position = side_state.position
+        key = (id(engine), side)
+        if position is None or position.option_symbol != symbol:
+            getattr(self, "_live_position_candles", {}).pop(key, None)
+            return
+
+        timeframe = max(1, int(engine.cfg.timeframe_minutes))
+        candle_time = tick_time.replace(
+            minute=(tick_time.minute // timeframe) * timeframe,
+            second=0,
+            microsecond=0,
+        )
+        candles = getattr(self, "_live_position_candles", None)
+        if candles is None:
+            self._init_live_position_candles()
+            candles = self._live_position_candles
+        current = candles.get(key)
+        if current is not None and current["position_id"] != id(position):
+            candles.pop(key, None)
+            current = None
+        if current is not None and current["datetime"] < candle_time:
+            self._process_live_position_candle(engine, side, current)
+            candles.pop(key, None)
+            if side_state.position is None:
+                return
+            current = None
+
+        if current is None:
+            candles[key] = {
+                "position_id": id(position),
+                "symbol": symbol,
+                "datetime": candle_time,
+                "open": float(ltp),
+                "high": float(ltp),
+                "low": float(ltp),
+                "close": float(ltp),
+            }
+            return
+
+        current["high"] = max(float(current["high"]), float(ltp))
+        current["low"] = min(float(current["low"]), float(ltp))
+        current["close"] = float(ltp)
+
+    def _finalize_live_position_candles(self, now: datetime) -> None:
+        candles = getattr(self, "_live_position_candles", {})
+        engines = {id(engine): engine for engine in self._engines_for_live_candles()}
+        for key, candle in list(candles.items()):
+            engine = engines.get(key[0])
+            if engine is None:
+                candles.pop(key, None)
+                continue
+            timeframe = max(1, int(engine.cfg.timeframe_minutes))
+            candle_time = candle["datetime"]
+            if candle_time + timedelta(minutes=timeframe) > now:
+                continue
+            candles.pop(key, None)
+            self._process_live_position_candle(engine, key[1], candle)
+
+    def _engines_for_live_candles(self) -> list[BaseStrategyEngine]:
+        if hasattr(self, "engines"):
+            return [engine for _, engine in self.engines]
+        engine = getattr(self, "engine", None)
+        return [engine] if engine is not None else []
+
+    def _consume_live_position_bar(
+        self,
+        engine: BaseStrategyEngine,
+        side: str,
+        row: pd.Series,
+    ) -> bool:
+        candle_time = row["datetime"]
+        if hasattr(candle_time, "to_pydatetime"):
+            candle_time = candle_time.to_pydatetime()
+        live_bars = getattr(self, "_live_position_bars", set())
+        key = (id(engine), side, candle_time)
+        if key not in live_bars:
+            return False
+        live_bars.discard(key)
+        return True
+
+    def _process_live_position_candle(
+        self,
+        engine: BaseStrategyEngine,
+        side: str,
+        candle: dict[str, object],
+    ) -> None:
+        side_state = engine._side_state(side)
+        position = side_state.position
+        if (
+            position is None
+            or position.option_symbol != candle["symbol"]
+            or not engine._is_ema21_strategy()
+        ):
+            return
+
+        candle_time = candle["datetime"]
+        last_time = self._last_bar_time.get(side)
+        if last_time is not None and candle_time <= last_time:
+            return
+
+        close = float(candle["close"])
+        previous_ema = side_state.last_ema21
+        if previous_ema is None:
+            logger.warning(
+                "cannot evaluate live EMA21 candle for %s: no prior EMA value",
+                candle["symbol"],
+            )
+            return
+        alpha = 2.0 / (max(1, int(engine.cfg.ema_period)) + 1.0)
+        ema21 = float(previous_ema) + alpha * (close - float(previous_ema))
+
+        def next_ema(previous: Optional[float], period: int) -> Optional[float]:
+            if previous is None:
+                return None
+            factor = 2.0 / (max(1, int(period)) + 1.0)
+            return float(previous) + factor * (close - float(previous))
+
+        row = pd.Series(
+            {
+                "datetime": candle_time,
+                "open": float(candle["open"]),
+                "high": float(candle["high"]),
+                "low": float(candle["low"]),
+                "close": close,
+                "volume": 0.0,
+                "ema21": ema21,
+                "ema13": next_ema(side_state.last_ema13, engine.cfg.ema_fast),
+                "ema20": next_ema(side_state.last_ema20, engine.cfg.ema_mid),
+                "ema50": next_ema(side_state.last_ema50, engine.cfg.ema_slow),
+                "rsi3": side_state.last_rsi,
+            }
+        )
+        engine.process_option_candle(
+            side,
+            row,
+            None,
+            allow_entries=False,
+        )
+        _persist_candle_monitoring(
+            str(position.option_symbol), row, engine.cfg.timeframe_minutes, ema21
+        )
+        _persist_setup_status_monitoring(engine, side, side_state, row)
+
+        if hasattr(self, "engines"):
+            live_bars = getattr(self, "_live_position_bars", None)
+            if live_bars is None:
+                self._init_live_position_candles()
+                live_bars = self._live_position_bars
+            live_bars.add((id(engine), side, candle_time))
+        else:
+            self._last_bar_time[side] = candle_time
+            _save_runner_checkpoint(
+                self._checkpoint_day,
+                engine.cfg.option_index_symbol,
+                engine.strategy_name,
+                self._last_bar_time,
+            )
+
+
+class LiveFeedRunner(_LivePositionCandleSupport):
     """Polls OpenAlgo history at candle boundaries and drives the engine."""
 
     def __init__(
@@ -1198,6 +1464,7 @@ class LiveFeedRunner:
         self.poll_slack_seconds = poll_slack_seconds
         self._stop = threading.Event()
         self._last_bar_time: dict[str, Optional[datetime]] = {"CE": None, "PE": None}
+        self._init_live_position_candles()
         self._startup_baselined: set[str] = set()
         self._checkpoint_day = datetime.now().date()
         self._checkpoint = _load_runner_checkpoint(
@@ -1410,17 +1677,20 @@ class LiveFeedRunner:
         poll_active_ticks: bool = True,
     ) -> bool:
         import sys
-        deadline = datetime.now() + timedelta(seconds=seconds)
+        deadline = monotonic() + seconds
         while not self._stop.is_set():
-            remaining = (deadline - datetime.now()).total_seconds()
+            poll_started = monotonic()
+            remaining = deadline - poll_started
             if remaining <= 0:
                 break
             if poll_active_ticks:
                 self._poll_active_ticks()
+            remaining = max(0.0, deadline - monotonic())
             mins, secs = divmod(int(remaining), 60)
             sys.stdout.write(f"\r⏳ {label} in {mins:02d}:{secs:02d} ")
             sys.stdout.flush()
-            if self._stop.wait(min(1.0, remaining)):
+            pause = min(remaining, max(0.0, 1.0 - (monotonic() - poll_started)))
+            if self._stop.wait(pause):
                 sys.stdout.write("\r" + " " * 30 + "\r")
                 sys.stdout.flush()
                 return True
@@ -1437,6 +1707,9 @@ class LiveFeedRunner:
                 self.engine.force_square_off_side(
                     self.engine._side_state(side), now
                 )
+        processed_positions = _poll_position_ticks(
+            [self.engine], self.broker, self._observe_position_tick
+        )
         if any(
             getattr(self.engine._side_state(side), "order_submission_uncertain", False)
             for side in ("CE", "PE")
@@ -1448,6 +1721,8 @@ class LiveFeedRunner:
         for side in ("CE", "PE"):
             side_state = self.engine._side_state(side)
             if side_state.position is not None:
+                if id(side_state.position) in processed_positions:
+                    continue
                 symbol = side_state.position.option_symbol
             elif side_state.pending_entry is not None:
                 symbol = side_state.pending_entry.option_symbol
@@ -1466,7 +1741,7 @@ class LiveFeedRunner:
                 logger.warning("tick quote failed for %s: %s", symbol, exc)
                 continue
             if ltp > 0:
-                tick_time = now
+                tick_time = _now_ist_naive()
                 active_subscriptions = [
                     (side, side_state)
                     for side, side_state in subscriptions
@@ -1479,6 +1754,9 @@ class LiveFeedRunner:
                 for side, side_state in subscriptions:
                     if side_state.position is not None:
                         self.engine.process_tick(side, float(ltp), tick_time)
+                        self._observe_position_tick(
+                            self.engine, side, symbol, float(ltp), tick_time
+                        )
                     elif getattr(side_state, "setup_active", False):
                         self.engine.process_setup_tick(side, float(ltp), tick_time)
                         if hasattr(self.engine, "signal_provider"):
@@ -1536,6 +1814,7 @@ class LiveFeedRunner:
             if self._wait_with_countdown(sleep_for):
                 break
             try:
+                self._finalize_live_position_candles(_now_ist_naive())
                 self._poll_once()
                 self._print_cycle_summary()
             except KeyboardInterrupt:
@@ -1676,7 +1955,7 @@ class LiveFeedRunner:
 # ===============================================================
 
 
-class MultiEngineLiveFeedRunner:
+class MultiEngineLiveFeedRunner(_LivePositionCandleSupport):
     """Feeds same candle data to multiple independent engines."""
 
     def __init__(
@@ -1694,6 +1973,7 @@ class MultiEngineLiveFeedRunner:
         self.poll_slack_seconds = poll_slack_seconds
         self._stop = threading.Event()
         self._last_bar_time: dict[str, Optional[datetime]] = {"CE": None, "PE": None}
+        self._init_live_position_candles()
         self._startup_baselined: set[str] = set()
         self._checkpoint_day = datetime.now().date()
         self._checkpoint_strategy = "+".join(name for name, _ in self.engines)
@@ -1812,13 +2092,14 @@ class MultiEngineLiveFeedRunner:
                 pos_in_full = data.index.get_loc(row.name)
                 prev_row = data.iloc[pos_in_full - 1] if pos_in_full > 0 else None
                 for _, engine in self.engines:
-                    engine.process_option_candle(
-                        side,
-                        row,
-                        prev_row,
-                        allow_entries=False,
-                        preserve_setup_state=True,
-                    )
+                    if not self._consume_live_position_bar(engine, side, row):
+                        engine.process_option_candle(
+                            side,
+                            row,
+                            prev_row,
+                            allow_entries=False,
+                            preserve_setup_state=True,
+                        )
             self._startup_baselined.add(side)
             logger.info(
                 "warmed %s through %s without entries; processing new closed bars normally",
@@ -1843,7 +2124,8 @@ class MultiEngineLiveFeedRunner:
             if pos_in_full > 0:
                 prev_row = data.iloc[pos_in_full - 1]
             for _, engine in self.engines:
-                engine.process_option_candle(side, row, prev_row)
+                if not self._consume_live_position_bar(engine, side, row):
+                    engine.process_option_candle(side, row, prev_row)
                 _persist_candle_monitoring(
                     str(engine._side_state(side).option_symbol or side),
                     row,
@@ -1913,17 +2195,20 @@ class MultiEngineLiveFeedRunner:
         poll_active_ticks: bool = True,
     ) -> bool:
         import sys
-        deadline = datetime.now() + timedelta(seconds=seconds)
+        deadline = monotonic() + seconds
         while not self._stop.is_set():
-            remaining = (deadline - datetime.now()).total_seconds()
+            poll_started = monotonic()
+            remaining = deadline - poll_started
             if remaining <= 0:
                 break
             if poll_active_ticks:
                 self._poll_active_ticks()
+            remaining = max(0.0, deadline - monotonic())
             mins, secs = divmod(int(remaining), 60)
             sys.stdout.write(f"\r⏳ {label} in {mins:02d}:{secs:02d} ")
             sys.stdout.flush()
-            if self._stop.wait(min(1.0, remaining)):
+            pause = min(remaining, max(0.0, 1.0 - (monotonic() - poll_started)))
+            if self._stop.wait(pause):
                 sys.stdout.write("\r" + " " * 30 + "\r")
                 sys.stdout.flush()
                 return True
@@ -1932,12 +2217,6 @@ class MultiEngineLiveFeedRunner:
         return False
 
     def _poll_active_ticks(self) -> None:
-        _reconcile_pending_entry_fills(
-            [engine for _, engine in self.engines],
-            self.broker,
-            datetime.now().date(),
-        )
-        _clear_positions_missing_from_broker([engine for _, engine in self.engines], self.broker)
         now = _now_ist_naive()
         if now.time() >= self.cfg.force_square_off:
             for _, engine in self.engines:
@@ -1945,11 +2224,19 @@ class MultiEngineLiveFeedRunner:
                     engine.force_square_off_side(
                         engine._side_state(side), now
                     )
+        engines = [engine for _, engine in self.engines]
+        processed_positions = _poll_position_ticks(
+            engines, self.broker, self._observe_position_tick
+        )
+        _reconcile_pending_entry_fills(engines, self.broker, now.date())
+        _clear_positions_missing_from_broker(engines, self.broker)
         active_symbols: dict[str, list[tuple[BaseStrategyEngine, str, object]]] = {}
         for _, engine in self.engines:
             for side in ("CE", "PE"):
                 side_state = engine._side_state(side)
                 if side_state.position is not None:
+                    if id(side_state.position) in processed_positions:
+                        continue
                     symbol = side_state.position.option_symbol
                 elif side_state.pending_entry is not None:
                     symbol = side_state.pending_entry.option_symbol
@@ -1968,6 +2255,7 @@ class MultiEngineLiveFeedRunner:
                 logger.warning("tick quote failed for %s: %s", symbol, exc)
                 continue
             if ltp > 0:
+                now = _now_ist_naive()
                 active_subscriptions = [
                     (active_engine, active_side, side_state)
                     for active_engine, active_side, side_state in subscriptions
@@ -1979,6 +2267,9 @@ class MultiEngineLiveFeedRunner:
                 for active_engine, active_side, side_state in subscriptions:
                     if side_state.position is not None:
                         active_engine.process_tick(active_side, float(ltp), now)
+                        self._observe_position_tick(
+                            active_engine, active_side, symbol, float(ltp), now
+                        )
                     elif getattr(side_state, "setup_active", False):
                         active_engine.process_setup_tick(active_side, float(ltp), now)
                         if hasattr(active_engine, "signal_provider"):
@@ -2023,6 +2314,7 @@ class MultiEngineLiveFeedRunner:
             if self._wait_with_countdown(sleep_for):
                 break
             try:
+                self._finalize_live_position_candles(_now_ist_naive())
                 self._poll_once()
                 self._print_cycle_summary()
             except KeyboardInterrupt:

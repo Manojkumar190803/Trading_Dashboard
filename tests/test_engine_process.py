@@ -5,6 +5,7 @@ from datetime import date, datetime, time
 from pathlib import Path
 
 import pandas as pd
+import pytest
 
 from core.broker import ConsoleBroker, HistoricalReplayBroker
 from core.engine import BaseStrategyEngine
@@ -53,6 +54,9 @@ class RecordingBroker(ConsoleBroker):
     def cancel_order(self, order_id):
         self.cancelled_orders.append(order_id)
         return True
+
+    def get_order_status(self, order_id):
+        return {"order_status": "cancelled" if order_id in self.cancelled_orders else "open"}
 
     def place_stop_limit_order(self, symbol, side, quantity, trigger_price, limit_price):
         self.stop_orders.append((symbol, side, quantity, trigger_price, limit_price))
@@ -104,9 +108,25 @@ class ReconciledBroker(RecordingBroker):
     def get_position_book(self):
         return [{"symbol": "NIFTY08AUG2625000PE", "quantity": self.quantity}]
 
+    def get_order_status(self, order_id):
+        return {"order_status": "complete"}
+
     def place_market_order(self, symbol, side, quantity):
         self.market_orders.append((symbol, side, quantity))
         return "MKT-1"
+
+
+class ProtectiveStopFilledBroker(ReconciledBroker):
+    def __init__(self):
+        super().__init__(130)
+
+    def cancel_order(self, order_id):
+        self.cancelled_orders.append(order_id)
+        self.quantity = 0
+        return False
+
+    def get_order_status(self, order_id):
+        return {"order_status": "complete"}
 
 
 class EMA21StubSignalProvider(StubSignalProvider):
@@ -315,13 +335,16 @@ def test_trailing_status_reports_next_target_after_partial_booking():
 
     assert position.quantity == 65
     assert position.next_target_rr == 2.5
-    assert "looking for 2.5R" in position.progress_status
+    assert position.progress_status.endswith("trailing final lot")
+    assert broker.cancelled_orders == ["OPEN-SL-1"]
+    assert broker.stop_orders[-1][2] == 65
 
     engine.process_tick("PE", 125.0, datetime(2026, 8, 27, 12, 11))
 
     assert position.next_target_rr == 3.0
     assert "2.5R reached" in position.progress_status
     assert "SL shifted to 110.00" in position.progress_status
+    assert position.progress_status.endswith("trailing final lot")
 
 
 def test_protective_stop_waits_when_cancelled_order_is_still_open():
@@ -351,6 +374,128 @@ def test_protective_stop_waits_when_cancelled_order_is_still_open():
     assert position.protective_stop_order_id is None
 
 
+def test_live_exit_waits_for_fill_and_does_not_submit_duplicate_sell(monkeypatch):
+    broker = ReconciledBroker(130)
+    status = {"order_status": "open"}
+    monkeypatch.setattr(broker, "get_order_status", lambda order_id: status)
+    engine = _make_engine()
+    engine.broker = broker
+    _attach_position(engine, "PE")
+    position = engine.state.pe.position
+    ts = datetime(2026, 8, 8, 11, 0)
+
+    engine._exit_position(engine.state.pe, ts, 130, "test exit")
+
+    assert engine.state.pe.position is position
+    assert position.quantity == 130
+    assert engine.realized_pnl == 0
+    assert not any(alert.category == "EXIT" for alert in engine.alerts)
+
+    engine._exit_position(engine.state.pe, ts, 130, "test exit")
+    assert len(broker.market_orders) == 1
+
+    status.update(order_status="complete", average_price=95.0)
+    broker.quantity = 0
+    engine.process_tick("PE", 95.0, ts)
+
+    assert engine.state.pe.position is None
+    assert len(broker.market_orders) == 1
+    assert engine.realized_pnl == -650.0
+    assert sum(alert.category == "EXIT" for alert in engine.alerts) == 1
+
+
+def test_exit_fill_is_reconciled_by_poll_without_new_ticks(monkeypatch):
+    from core import runner
+
+    broker = ReconciledBroker(130)
+    status = {"order_status": "open"}
+    monkeypatch.setattr(broker, "get_order_status", lambda order_id: status)
+    engine = _make_engine()
+    engine.broker = broker
+    _attach_position(engine, "PE")
+    engine._exit_position(engine.state.pe, datetime(2026, 8, 8, 11, 0), 130, "test exit")
+
+    runner._clear_positions_missing_from_broker([engine], broker)
+    assert engine.state.pe.position is not None
+
+    status.update(order_status="complete", average_price=105.0)
+    runner._clear_positions_missing_from_broker([engine], broker)
+
+    assert engine.state.pe.position is None
+    assert engine.realized_pnl == 650.0
+    assert len(broker.market_orders) == 1
+
+
+@pytest.mark.parametrize("remaining", [130, 65])
+def test_rejected_exit_keeps_remaining_position_and_restores_stop(monkeypatch, remaining):
+    broker = ReconciledBroker(130)
+    status = {"order_status": "open"}
+    monkeypatch.setattr(broker, "get_order_status", lambda order_id: status)
+    engine = _make_engine()
+    engine.broker = broker
+    _attach_position(engine, "PE")
+    position = engine.state.pe.position
+    engine._exit_position(engine.state.pe, datetime(2026, 8, 8, 11, 0), 130, "test exit")
+
+    broker.quantity = remaining
+    status.update(order_status="rejected", average_price=95.0)
+    engine.process_tick("PE", 95.0, datetime(2026, 8, 8, 11, 1))
+
+    assert engine.state.pe.position is position
+    assert position.quantity == remaining
+    assert position.pending_exit is None
+    assert position.protective_stop_order_id == "OID-1"
+    assert broker.stop_orders[-1][2] == remaining
+    assert len(broker.market_orders) == 1
+    assert engine.realized_pnl == (130 - remaining) * -5.0
+
+
+def test_uncertain_exit_submission_blocks_duplicate_sells(monkeypatch):
+    broker = ReconciledBroker(130)
+
+    def uncertain_market_order(symbol, side, quantity):
+        broker.market_orders.append((symbol, side, quantity))
+        raise TimeoutError("submission timed out")
+
+    monkeypatch.setattr(broker, "place_market_order", uncertain_market_order)
+    engine = _make_engine()
+    engine.broker = broker
+    _attach_position(engine, "PE")
+    ts = datetime(2026, 8, 8, 11, 0)
+
+    engine._exit_position(engine.state.pe, ts, 130, "test exit")
+    engine._exit_position(engine.state.pe, ts, 130, "retry exit")
+    engine.process_tick("PE", 80.0, ts)
+
+    assert engine.state.pe.position is not None
+    assert engine.state.pe.position.quantity == 130
+    assert len(broker.market_orders) == 1
+    assert not any(alert.category == "EXIT" for alert in engine.alerts)
+
+
+def test_poll_restores_cancelled_stop_for_a_still_open_position(monkeypatch):
+    from core import runner
+
+    broker = ReconciledBroker(130)
+    monkeypatch.setattr(
+        broker, "get_order_status",
+        lambda order_id: {"order_status": "cancelled" if order_id == "OLD-SL" else "open"},
+    )
+    engine = _make_engine()
+    engine.broker = broker
+    _attach_position(engine, "PE")
+    position = engine.state.pe.position
+    position.protective_stop_order_id = "OLD-SL"
+
+    runner._clear_positions_missing_from_broker([engine], broker)
+    runner._clear_positions_missing_from_broker([engine], broker)
+
+    assert engine.state.pe.position is position
+    assert position.protective_stop_order_id == "OID-1"
+    assert len(broker.stop_orders) == 1
+    assert broker.market_orders == []
+
+
 def test_live_exit_is_blocked_when_broker_has_short_position():
     broker = ReconciledBroker(-130)
     engine = BaseStrategyEngine(
@@ -371,6 +516,91 @@ def test_live_exit_is_blocked_when_broker_has_short_position():
     assert broker.market_orders == []
     assert engine.state.pe.position is not None
     assert any("exit blocked" in alert.message for alert in engine.alerts)
+
+
+@pytest.mark.parametrize("failure_after_cancel", [False, True])
+def test_exit_preserves_position_when_position_book_is_unavailable(monkeypatch, failure_after_cancel):
+    broker = ReconciledBroker(130)
+    broker.position_book_available = True
+
+    def position_book():
+        if not failure_after_cancel or broker.cancelled_orders:
+            broker.position_book_available = False
+            return []
+        broker.position_book_available = True
+        return [{"symbol": "NIFTY08AUG2625000PE", "quantity": 130}]
+
+    monkeypatch.setattr(broker, "get_position_book", position_book)
+    monkeypatch.setattr(
+        broker, "get_order_status",
+        lambda order_id: {"order_status": "complete" if order_id == "MKT-1" else "cancelled"},
+    )
+    engine = BaseStrategyEngine(
+        cfg=StrategyConfig(),
+        risk=RiskConfig(),
+        broker=broker,
+        signal_provider=StubSignalProvider(),
+    )
+    _attach_position(engine, "PE")
+    position = engine.state.pe.position
+    position.protective_stop_order_id = "OPEN-SL"
+
+    engine._exit_position(
+        engine.state.pe, datetime(2026, 8, 8, 11, 0), 130, "test exit"
+    )
+
+    assert engine.state.pe.position is position
+    assert position.quantity == 130
+    assert broker.market_orders == []
+    assert broker.cancelled_orders == (["OPEN-SL"] if failure_after_cancel else [])
+    assert any("quantity unavailable" in alert.message for alert in engine.alerts)
+
+    def recovered_position_book():
+        broker.position_book_available = True
+        return [{"symbol": "NIFTY08AUG2625000PE", "quantity": 130}]
+
+    monkeypatch.setattr(broker, "get_position_book", recovered_position_book)
+    engine._exit_position(
+        engine.state.pe, datetime(2026, 8, 8, 11, 1), 130, "retry exit"
+    )
+
+    assert engine.state.pe.position is None
+    assert len(broker.market_orders) == 1
+    assert broker.market_orders[0][2] == 130
+
+
+@pytest.mark.parametrize("positions", [None, [{"symbol": "NIFTY08AUG2625000PE"}]])
+def test_broker_quantity_is_unknown_when_response_or_quantity_is_missing(monkeypatch, positions):
+    broker = ReconciledBroker(130)
+    monkeypatch.setattr(broker, "get_position_book", lambda: positions)
+    engine = _make_engine()
+    engine.broker = broker
+
+    assert engine._broker_quantity("NIFTY08AUG2625000PE") is None
+
+
+def test_exit_does_not_send_market_sell_if_protective_stop_filled_during_cancel():
+    broker = ProtectiveStopFilledBroker()
+    engine = BaseStrategyEngine(
+        cfg=StrategyConfig(),
+        risk=RiskConfig(),
+        broker=broker,
+        signal_provider=StubSignalProvider(),
+    )
+    _attach_position(engine, "PE")
+    engine.state.pe.position.protective_stop_order_id = "OPEN-SL"
+
+    engine._exit_position(
+        engine.state.pe,
+        datetime(2026, 8, 8, 11, 0),
+        130,
+        "test stop exit",
+    )
+
+    assert broker.cancelled_orders == ["OPEN-SL"]
+    assert broker.market_orders == []
+    assert engine.state.pe.position is None
+    assert any("skipped duplicate MARKET SELL" in alert.message for alert in engine.alerts)
 
 
 def test_live_entry_fill_is_blocked_when_broker_reports_short_position():
@@ -425,6 +655,7 @@ def test_hard_sl_count_is_shared_between_strategy_engines(tmp_path, monkeypatch)
 
 def test_candle_low_hits_trailing_stop_after_same_candle_trail_update():
     engine = _make_engine()
+    engine.broker = HistoricalReplayBroker()
     side_state = engine.state.ce
     side_state.position = Position(
         option_symbol="NIFTY01SEP2624250PE",
@@ -449,16 +680,50 @@ def test_candle_low_hits_trailing_stop_after_same_candle_trail_update():
     assert any("candle low" in alert.message for alert in engine.alerts)
 
 
+def test_live_position_does_not_exit_on_historical_candle_low():
+    engine = BaseStrategyEngine(
+        cfg=StrategyConfig(option_lot_size=65),
+        risk=RiskConfig(max_sl_per_day=3),
+        broker=ConsoleBroker(ltp_fallback=314.55),
+        signal_provider=EMA21StubSignalProvider(),
+    )
+    side_state = engine.state.ce
+    side_state.option_symbol = "NIFTY17NOV2624900CE"
+    side_state.position = Position(
+        option_symbol="NIFTY17NOV2624900CE",
+        option_type="CE",
+        quantity=130,
+        initial_quantity=130,
+        entry_price=258.0,
+        entry_time=datetime(2026, 11, 9, 11, 25),
+        option_stop_level=293.0,
+        option_entry_trigger=258.0,
+        option_risk_points=14.0,
+        breakeven_armed=True,
+        trailing_sl_level=293.0,
+    )
+    row = _row(datetime(2026, 11, 9, 14, 15), high=316.90, low=287.95)
+    row["open"] = 295.0
+    row["close"] = 316.35
+    row["ema21"] = 270.48
+
+    engine.process_option_candle("CE", row, None)
+
+    assert side_state.position is not None
+    assert not any(alert.category == "EXIT" for alert in engine.alerts)
+
+
 def test_process_tick_no_position_is_noop():
     engine = _make_engine()
     engine.process_tick("CE", 110.0, datetime(2026, 8, 8, 10, 1))
     assert engine.state.ce.position is None
 
 
-def test_process_tick_hard_stop_exits_position():
+@pytest.mark.parametrize("ltp", [89.0, 90.0])
+def test_process_tick_hard_stop_exits_position_at_or_below_stop(ltp):
     engine = _make_engine()
     _attach_position(engine, "CE")
-    engine.process_tick("CE", 89.0, datetime(2026, 8, 8, 10, 2))
+    engine.process_tick("CE", ltp, datetime(2026, 8, 8, 10, 2))
     assert engine.state.ce.position is None
     assert engine.total_hard_sl_hits == 1
 
@@ -476,6 +741,138 @@ def test_process_tick_arms_tsl_and_partial_exit_for_two_lot_position():
     engine.process_tick("CE", 120.0, datetime(2026, 8, 8, 10, 4))
     pos = engine.state.ce.position
     assert pos is not None and pos.quantity == 65
+
+
+def test_ema21_partial_booking_exits_configured_lot_at_two_rr():
+    engine = BaseStrategyEngine(
+        cfg=StrategyConfig(option_lot_size=65, partial_booking_enabled=True, partial_booking_lots=1),
+        risk=RiskConfig(max_sl_per_day=3),
+        broker=ConsoleBroker(ltp_fallback=100.0),
+        signal_provider=EMA21StubSignalProvider(),
+    )
+    _attach_position(engine, "CE")
+
+    engine.process_tick("CE", 110.0, datetime(2026, 8, 8, 10, 3))
+    engine.process_tick("CE", 120.0, datetime(2026, 8, 8, 10, 4))
+
+    position = engine.state.ce.position
+    assert position is not None and position.quantity == 65
+    assert position.t2_done is True
+    assert any("booked 1 lot(s)" in alert.message for alert in engine.alerts)
+
+
+@pytest.mark.parametrize(
+    ("initial_lots", "booking_prices", "expected_quantities"),
+    [
+        (3, [120.0, 125.0], [130, 65]),
+        (4, [120.0, 125.0, 130.0], [195, 130, 65]),
+    ],
+)
+def test_ema21_partial_booking_ladder_keeps_one_lot_trailing(
+    initial_lots, booking_prices, expected_quantities
+):
+    engine = BaseStrategyEngine(
+        cfg=StrategyConfig(
+            option_lot_size=65,
+            full_size_lots=initial_lots,
+            partial_booking_enabled=True,
+            partial_booking_lots=1,
+            partial_booking_interval_rr=0.5,
+        ),
+        risk=RiskConfig(max_sl_per_day=3),
+        broker=HistoricalReplayBroker(),
+        signal_provider=EMA21StubSignalProvider(),
+    )
+    _attach_position(engine, "CE")
+    position = engine.state.ce.position
+    position.quantity = initial_lots * 65
+    position.initial_quantity = initial_lots * 65
+
+    for index, (ltp, expected_quantity) in enumerate(
+        zip(booking_prices, expected_quantities), start=1
+    ):
+        engine.process_tick("CE", ltp, datetime(2026, 8, 8, 10, index))
+        assert engine.state.ce.position.quantity == expected_quantity
+
+    engine.process_tick("CE", booking_prices[-1] + 5.0, datetime(2026, 8, 8, 10, 10))
+
+    position = engine.state.ce.position
+    assert position is not None and position.quantity == 65
+    assert sum(alert.category == "EXIT" for alert in engine.alerts) == initial_lots - 1
+    assert position.progress_status.endswith("trailing final lot")
+
+
+def test_replay_partial_booking_uses_configured_rr_interval():
+    engine = BaseStrategyEngine(
+        cfg=StrategyConfig(
+            option_lot_size=65,
+            full_size_lots=3,
+            partial_booking_enabled=True,
+            partial_booking_lots=1,
+            partial_booking_interval_rr=0.5,
+        ),
+        risk=RiskConfig(max_sl_per_day=3),
+        broker=HistoricalReplayBroker(),
+        signal_provider=EMA21StubSignalProvider(),
+    )
+    _attach_position(engine, "CE")
+    position = engine.state.ce.position
+    position.quantity = 195
+    position.initial_quantity = 195
+
+    engine.manage_targets(engine.state.ce, _row(datetime(2026, 8, 8, 10, 1), high=120.0))
+    assert engine.state.ce.position.quantity == 130
+
+    engine.manage_targets(engine.state.ce, _row(datetime(2026, 8, 8, 10, 2), high=125.0))
+    assert engine.state.ce.position.quantity == 65
+    assert engine.state.ce.position.progress_status.endswith("trailing final lot")
+
+
+def test_ema21_partial_booking_can_be_disabled():
+    engine = BaseStrategyEngine(
+        cfg=StrategyConfig(option_lot_size=65, partial_booking_enabled=False),
+        risk=RiskConfig(max_sl_per_day=3),
+        broker=ConsoleBroker(ltp_fallback=100.0),
+        signal_provider=EMA21StubSignalProvider(),
+    )
+    _attach_position(engine, "CE")
+
+    engine.process_tick("CE", 110.0, datetime(2026, 8, 8, 10, 3))
+    engine.process_tick("CE", 120.0, datetime(2026, 8, 8, 10, 4))
+
+    position = engine.state.ce.position
+    assert position is not None and position.quantity == 130
+    assert position.t2_done is False
+
+
+def test_partial_booking_settings_reach_runner_environment(monkeypatch):
+    monkeypatch.setenv("PARTIAL_BOOKING_ENABLED", "false")
+    monkeypatch.setenv("PARTIAL_BOOKING_RR", "2.5")
+    monkeypatch.setenv("PARTIAL_BOOKING_LOTS", "2")
+    monkeypatch.setenv("PARTIAL_BOOKING_INTERVAL_RR", "0.75")
+    cfg = StrategyConfig()
+
+    run_strategy._apply_partial_booking_policy(cfg)
+
+    assert cfg.partial_booking_enabled is False
+    assert cfg.t2_rr == 2.5
+    assert cfg.partial_booking_lots == 2
+    assert cfg.partial_booking_interval_rr == 0.75
+
+
+def test_strategy_daemon_exports_partial_booking_settings():
+    environment = strategy_daemon._strategy_environment({
+        "strategy": "21EMA",
+        "partialBookingEnabled": False,
+        "partialBookingRR": 2.5,
+        "partialBookingLots": 2,
+        "partialBookingIntervalRR": 0.75,
+    })
+
+    assert environment["PARTIAL_BOOKING_ENABLED"] == "false"
+    assert environment["PARTIAL_BOOKING_RR"] == "2.5"
+    assert environment["PARTIAL_BOOKING_LOTS"] == "2"
+    assert environment["PARTIAL_BOOKING_INTERVAL_RR"] == "0.75"
 
 
 def test_process_tick_modifies_sl_once_for_high_rr_tick():
@@ -989,6 +1386,22 @@ def test_hd_dashboard_monitoring_start_change_restarts_instrument():
         "monitoringEndTime": "15:00",
     }
     changed = {**instrument, "monitoringStartTime": "09:30"}
+
+    assert strategy_daemon._runtime_signature(instrument, {}) != (
+        strategy_daemon._runtime_signature(changed, {})
+    )
+
+
+def test_partial_booking_change_restarts_instrument():
+    instrument = {
+        "strategy": "21EMA",
+        "brokerSymbol": "NIFTY",
+        "partialBookingEnabled": True,
+        "partialBookingRR": 2.0,
+        "partialBookingLots": 1,
+        "partialBookingIntervalRR": 0.5,
+    }
+    changed = {**instrument, "partialBookingIntervalRR": 0.75}
 
     assert strategy_daemon._runtime_signature(instrument, {}) != (
         strategy_daemon._runtime_signature(changed, {})

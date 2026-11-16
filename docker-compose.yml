@@ -7,7 +7,7 @@ x-common-variables: &common-variables
 
 x-common-environment: &common-environment
   <<: *common-variables
-  OPENALGO_HOST: http://host.docker.internal:5002
+  OPENALGO_HOST: ${OPENALGO_DOCKER_HOST:-http://host.docker.internal:5002}
   OPENALGO_WS_URL: ws://host.docker.internal:8766
   WEBSOCKET_HOST: host.docker.internal
   WEBSOCKET_PORT: "8766"
@@ -59,28 +59,6 @@ services:
       timeout: 5s
       retries: 3
 
-  # Streamlit Dashboard (Legacy Frontend)
-  streamlit_interface:
-    <<: *live-defaults
-    build:
-      context: .
-      dockerfile: Dockerfile.streamlit
-    container_name: streamlit_interface
-    labels:
-      com.openalgo.display-name: "Streamlit Dashboard (Legacy)"
-    ports:
-      - "8502:8501"
-    restart: unless-stopped
-    environment:
-      <<: *common-environment
-      STREAMLIT_SERVER_HEADLESS: "true"
-      STREAMLIT_SERVER_ADDRESS: 0.0.0.0
-      STREAMLIT_SERVER_PORT: "8501"
-      BACKGROUND_WORKER_ENABLED: "false"
-    volumes:
-      - ./logs:/app/logs
-      - ./data:/app/data
-
   # Strategy Worker (Core Engine)
   strategy_worker:
     <<: *live-defaults
@@ -115,7 +93,7 @@ services:
       strategy_worker:
         condition: service_started
 
-  # Dashboard Data Exporter (Syncs OpenAlgo & Fyers data to React)
+  # Dashboard Data Exporter (syncs the configured OpenAlgo broker account to React)
   dashboard_exporter:
     build:
       context: .

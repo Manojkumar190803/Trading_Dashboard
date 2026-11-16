@@ -194,6 +194,7 @@ def record_log(
     trade_id: Optional[int] = None,
     order_id: Optional[int] = None,
     metadata: Optional[Dict[str, Any]] = None,
+    timestamp: Optional[datetime] = None,
 ):
     """
     Record a log entry to the database.
@@ -223,7 +224,7 @@ def record_log(
                 trade_id=trade_id,
                 order_id=order_id,
                 metadata_json=json.dumps(metadata) if metadata else None,
-                timestamp=datetime.utcnow(),
+                timestamp=timestamp or datetime.utcnow(),
             )
             session.add(log)
             session.commit()

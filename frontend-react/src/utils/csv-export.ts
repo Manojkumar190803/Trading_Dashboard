@@ -55,13 +55,23 @@ export const exportPositionsCSV = (positions: any[]) => {
     return
   }
 
-  const headers = ['Symbol', 'Entry Price', 'Current Price', 'Quantity', 'P&L', 'P&L %', 'Status']
+  const headers = [
+    'Symbol',
+    'Entry Price',
+    'Current Price',
+    'Quantity',
+    'Protective SL',
+    'P&L',
+    'P&L %',
+    'Status',
+  ]
 
   const rows = positions.map((p) => [
     p.symbol,
     p.entryPrice,
     p.currentPrice,
     p.quantity,
+    p.protectiveSL ?? '',
     p.pnl,
     p.pnlPercent,
     p.pnl > 0 ? 'PROFIT' : 'LOSS',

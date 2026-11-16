@@ -10,6 +10,7 @@ from typing import Any, Optional
 
 import pandas as pd
 
+from core import db_sync
 from core.broker import BrokerInterface
 from core.models import (
     BaseSideState,
@@ -17,6 +18,7 @@ from core.models import (
     OrderSide,
     PendingEntry,
     Position,
+    PendingExit,
     RiskConfig,
     Signal,
     StrategyAlert,
@@ -148,6 +150,7 @@ class BaseStrategyEngine:
         self.capture_trace: bool = False
         self.trace_rows: list[dict[str, Any]] = []
         self.persist_alerts: bool = False
+        self._db_config_saved: bool = False
 
     @property
     def strategy_name(self) -> str:
@@ -295,6 +298,10 @@ class BaseStrategyEngine:
             "ORDER", "PROTECTIVE_SL", "TSL", "RISK", "REJECT", "FAILED", "ERROR", "UNCERTAIN_ENTRY",
         ):
             self._persist_trade_alert(ts, category, message)
+            if not self._db_config_saved:
+                self._db_config_saved = True
+                db_sync.save_strategy_config(self.strategy_name, self.cfg, self.risk)
+            db_sync.save_alert(self.strategy_name, ts, category, message)
         print(f"[ENGINE][{category}] {message}")
 
     def _sync_shared_sl_count(self, trading_day: date) -> None:
@@ -322,6 +329,13 @@ class BaseStrategyEngine:
         configured_initial_quantity = self.cfg.full_size_lots * self.cfg.option_lot_size
         initial_quantity = max(quantity, configured_initial_quantity)
         is_partial_position = quantity < initial_quantity
+        lot_size = max(self.cfg.option_lot_size, 1)
+        booked_lots = max(0, (initial_quantity - quantity) // lot_size)
+        completed_booking_rungs = booked_lots // max(self.cfg.partial_booking_lots, 1)
+        next_booking_rr = (
+            self.cfg.t2_rr
+            + completed_booking_rungs * self.cfg.partial_booking_interval_rr
+        )
         side_state.position = Position(
             option_symbol=side_state.option_symbol or "",
             option_type=side,
@@ -333,10 +347,15 @@ class BaseStrategyEngine:
             option_entry_trigger=entry_trigger,
             option_risk_points=risk_points,
             t2_done=is_partial_position,
-            next_target_rr=(self.cfg.t2_rr + self.cfg.trailing_step_rr if is_partial_position else None),
+            next_target_rr=(
+                next_booking_rr if is_partial_position and quantity > lot_size else None
+            ),
             progress_status=(
-                f"{self.cfg.t2_rr:.1f}R reached - half lot booked; "
-                f"looking for {self.cfg.t2_rr + self.cfg.trailing_step_rr:.1f}R"
+                (
+                    f"{booked_lots} lot(s) booked; looking for {next_booking_rr:.1f}R"
+                    if quantity > lot_size
+                    else "Trailing final lot"
+                )
                 if is_partial_position
                 else "Monitoring position"
             ),
@@ -407,11 +426,17 @@ class BaseStrategyEngine:
         if not getattr(self.broker, "requires_position_reconciliation", False):
             return None
         try:
-            for position in self.broker.get_position_book():
+            positions = self.broker.get_position_book()
+            if positions is None or not getattr(self.broker, "position_book_available", True):
+                logger.warning("position reconciliation unavailable for %s", symbol)
+                return None
+            for position in positions:
                 if str(position.get("symbol") or "") == symbol:
-                    return int(float(position.get("quantity") or 0))
+                    quantity = position.get("quantity")
+                    return int(float(quantity)) if quantity is not None else None
         except Exception as exc:
             logger.warning("position reconciliation failed for %s: %s", symbol, exc)
+            return None
         return 0
 
     def _place_protective_stop(self, side: str, position: Position, ts: datetime) -> None:
@@ -585,6 +610,46 @@ class BaseStrategyEngine:
             pnl += (option_ltp - self._pnl_entry_price(pos)) * pos.quantity
         return pnl
 
+    def _reconcile_exit_order(self, side_state: BaseSideState, ts: datetime) -> bool:
+        pos = side_state.position
+        if pos is None or pos.pending_exit is None:
+            return False
+        pending = pos.pending_exit
+        if not pending.order_id:
+            return True
+        try:
+            status = self.broker.get_order_status(pending.order_id)
+        except Exception as exc:
+            logger.warning("exit status unavailable for %s: %s", pending.order_id, exc)
+            return True
+        order_status = str(status.get("order_status") or status.get("status") or "").lower()
+        if order_status in {"complete", "filled", "executed"}:
+            price = float(status.get("average_price") or pending.price)
+            pos.pending_exit = None
+            self._complete_position_exit(
+                side_state, ts, pending.quantity, price, pending.reason, pending.is_hard_sl,
+            )
+        elif order_status in {"cancelled", "canceled", "rejected", "failed"}:
+            broker_quantity = self._broker_quantity(pos.option_symbol)
+            if broker_quantity is None:
+                return True
+            filled = min(pending.quantity, max(0, pos.quantity - broker_quantity))
+            pos.pending_exit = None
+            pos.progress_status = "Monitoring position"
+            if filled:
+                price = float(status.get("average_price") or pending.price)
+                self._complete_position_exit(
+                    side_state, ts, filled, price, pending.reason, pending.is_hard_sl,
+                )
+            elif broker_quantity > 0:
+                self._place_protective_stop(pos.option_type, pos, ts)
+            self._record_alert(
+                ts, "RISK",
+                f"{pos.option_type} exit order {pending.order_id} {order_status}; "
+                f"filled={filled}, remaining={pos.quantity}",
+            )
+        return True
+
     def _exit_position(
         self,
         side_state: BaseSideState,
@@ -593,10 +658,11 @@ class BaseStrategyEngine:
         reason: str,
         is_hard_sl: bool = False,
         row: Optional[pd.Series] = None,
-        refresh_protection: bool = True,
     ) -> None:
         pos = side_state.position
         if pos is None:
+            return
+        if self._reconcile_exit_order(side_state, ts):
             return
 
         qty = min(quantity, pos.quantity)
@@ -604,7 +670,21 @@ class BaseStrategyEngine:
             return
 
         broker_quantity = self._broker_quantity(pos.option_symbol)
-        if broker_quantity is not None and broker_quantity < qty:
+        if getattr(self.broker, "requires_position_reconciliation", False) and broker_quantity is None:
+            self._record_alert(
+                ts,
+                "RISK",
+                f"{pos.option_type} exit blocked: broker quantity unavailable for "
+                f"{pos.option_symbol}",
+            )
+            return
+        if (
+            broker_quantity is not None
+            and (
+                broker_quantity < 0
+                or (broker_quantity < qty and not pos.protective_stop_order_id)
+            )
+        ):
             side = pos.option_type
             self._record_alert(
                 ts,
@@ -613,6 +693,89 @@ class BaseStrategyEngine:
                 f"{broker_quantity}, local long quantity is {qty}",
             )
             return
+
+        had_protective_stop = bool(pos.protective_stop_order_id)
+        if had_protective_stop:
+            protective_order_id = pos.protective_stop_order_id or ""
+            try:
+                self.broker.cancel_order(protective_order_id)
+                protective_status = self.broker.get_order_status(protective_order_id)
+            except Exception as exc:
+                protective_status = {}
+                logger.warning(
+                    "%s protective SL cancellation check failed for %s: %s",
+                    pos.option_type, protective_order_id, exc,
+                )
+
+            protective_order_status = str(
+                protective_status.get("order_status")
+                or protective_status.get("status")
+                or ""
+            ).lower()
+            if protective_order_status in {"complete", "filled", "executed"}:
+                broker_quantity = self._broker_quantity(pos.option_symbol)
+                if broker_quantity is None:
+                    self._record_alert(
+                        ts,
+                        "RISK",
+                        f"{pos.option_type} exit blocked: protective SL {protective_order_id} "
+                        "filled but broker quantity is unavailable; manual reconciliation required",
+                    )
+                    return
+                if broker_quantity <= 0:
+                    side_state.position = None
+                    if hasattr(side_state, "setup_active"):
+                        self.signal_provider.reset_after_entry(side_state)
+                    self._record_alert(
+                        ts,
+                        "RISK",
+                        f"{pos.option_type} protective SL {protective_order_id} filled; "
+                        f"broker quantity={broker_quantity}, skipped duplicate MARKET SELL",
+                    )
+                    return
+                pos.quantity = min(pos.quantity, broker_quantity)
+                self._record_alert(
+                    ts,
+                    "RISK",
+                    f"{pos.option_type} protective SL {protective_order_id} filled but "
+                    f"broker still reports quantity={broker_quantity}; skipped MARKET SELL "
+                    "pending reconciliation",
+                )
+                return
+
+            if protective_order_status not in {"cancelled", "rejected", "failed"}:
+                self._record_alert(
+                    ts,
+                    "RISK",
+                    f"{pos.option_type} exit blocked: protective SL {protective_order_id} "
+                    f"is not confirmed closed (status={protective_order_status or 'unknown'})",
+                )
+                return
+
+            pos.protective_stop_order_id = None
+            if getattr(self.broker, "requires_position_reconciliation", False):
+                broker_quantity = self._broker_quantity(pos.option_symbol)
+                if broker_quantity is None:
+                    self._record_alert(
+                        ts,
+                        "RISK",
+                        f"{pos.option_type} exit blocked: broker quantity unavailable after "
+                        f"cancelling protective SL {protective_order_id}",
+                    )
+                    return
+                if broker_quantity <= 0:
+                    side_state.position = None
+                    if hasattr(side_state, "setup_active"):
+                        self.signal_provider.reset_after_entry(side_state)
+                    self._record_alert(
+                        ts,
+                        "RISK",
+                        f"{pos.option_type} exit blocked after protective SL cancellation: "
+                        f"broker quantity={broker_quantity}; no MARKET SELL submitted",
+                    )
+                    return
+                pos.quantity = min(pos.quantity, broker_quantity)
+                qty = min(qty, broker_quantity)
 
         exit_ltp = self.broker.get_ltp(pos.option_symbol)
         self._record_alert(
@@ -624,12 +787,23 @@ class BaseStrategyEngine:
         try:
             exit_order_id = self.broker.place_market_order(pos.option_symbol, OrderSide.SELL, qty)
         except Exception as exc:
+            if getattr(self.broker, "requires_position_reconciliation", False):
+                pos.pending_exit = PendingExit(None, qty, reason, is_hard_sl, exit_ltp)
+                pos.progress_status = "Exit submission uncertain - manual reconciliation required"
             self._record_alert(
                 ts,
                 "ERROR",
                 f"{pos.option_type} exit order failed for {pos.option_symbol} "
                 f"qty={qty}: {exc}",
             )
+            if had_protective_stop:
+                self._record_alert(
+                    ts,
+                    "RISK",
+                    f"{pos.option_type} exit submission uncertain after protective SL was "
+                    f"cancelled for {pos.option_symbol}; verify broker position and restore "
+                    "protection manually",
+                )
             return
         self._record_alert(
             ts,
@@ -638,11 +812,33 @@ class BaseStrategyEngine:
             f"qty={qty} order_id={exit_order_id}",
         )
 
+        if getattr(self.broker, "requires_position_reconciliation", False):
+            pos.pending_exit = PendingExit(exit_order_id, qty, reason, is_hard_sl, exit_ltp)
+            pos.progress_status = "Exit pending broker fill confirmation"
+            self._reconcile_exit_order(side_state, ts)
+            return
+        self._complete_position_exit(side_state, ts, qty, exit_ltp, reason, is_hard_sl, row)
+
+    def _complete_position_exit(
+        self,
+        side_state: BaseSideState,
+        ts: datetime,
+        quantity: int,
+        exit_ltp: float,
+        reason: str,
+        is_hard_sl: bool = False,
+        row: Optional[pd.Series] = None,
+    ) -> None:
+        pos = side_state.position
+        if pos is None:
+            return
+        qty = min(quantity, pos.quantity)
         pnl_entry_price = self._pnl_entry_price(pos)
         trade_pnl = (exit_ltp - pnl_entry_price) * qty
         self.realized_pnl += trade_pnl
 
         pos.quantity -= qty
+        pos.progress_status = "Monitoring position"
         self._record_alert(
             ts,
             "EXIT",
@@ -650,17 +846,21 @@ class BaseStrategyEngine:
             f"pnl_entry={pnl_entry_price:.2f}, trade_pnl={trade_pnl:.2f}, "
             f"remaining={pos.quantity}",
         )
+        if self.persist_alerts:
+            db_sync.save_exit_trade(
+                self.strategy_name, pos.option_symbol, pos.entry_time, pnl_entry_price,
+                ts, exit_ltp, qty, trade_pnl, pos.quantity, is_hard_sl, reason,
+                pos.option_risk_points, self.cfg.trailing_step_rr,
+            )
         if row is not None:
             print(self._fmt_candle_context(row, pos.option_symbol, self._is_ema21_strategy()))
 
         if pos.quantity <= 0:
-            if pos.protective_stop_order_id:
-                self.broker.cancel_order(pos.protective_stop_order_id)
             side_state.position = None
             if hasattr(side_state, "setup_active"):
                 self.signal_provider.reset_after_entry(side_state)
-        elif pos.protective_stop_order_id and refresh_protection:
-            self._refresh_protective_stop(pos.option_type, pos, ts)
+        elif not self.broker.is_replay:
+            self._place_protective_stop(pos.option_type, pos, ts)
 
         if is_hard_sl:
             self.state.sl_hits_today = _increment_shared_sl_count(ts.date())
@@ -1225,7 +1425,7 @@ class BaseStrategyEngine:
             )
             return
 
-        if float(row["low"]) <= pending.option_stop_level:
+        if not self._is_ema21_strategy() and float(row["low"]) <= pending.option_stop_level:
             self._cancel_pending_entry_with_reason(
                 side,
                 side_state,
@@ -1340,6 +1540,17 @@ class BaseStrategyEngine:
                 )
             return
 
+        if self._is_ema21_strategy():
+            ema21 = row.get("ema21")
+            if ema21 is not None and not pd.isna(ema21) and float(row["close"]) <= float(ema21):
+                self._cancel_pending_entry_with_reason(
+                    side,
+                    side_state,
+                    ts,
+                    f"EMA21 close failure (close={float(row['close']):.2f} <= EMA21={float(ema21):.2f})",
+                )
+                return
+
         # Cancel pending after configured number of candles from setup bar.
         if float(row["high"]) < pending.option_trigger_level:
             return
@@ -1358,8 +1569,8 @@ class BaseStrategyEngine:
         else:
             if self.broker.is_replay:
                 # A stop-limit order remains working when a candle gaps above
-                # its limit; expiry, EMA failure, cutoff, or stop breach owns
-                # cancellation. Do not invent a fill or cancel the order here.
+                # its limit; expiry, EMA failure, cutoff, or strategy-specific
+                # invalidation owns cancellation. Do not invent a fill here.
                 return
             option_ltp = self.broker.get_ltp(option_symbol)
 
@@ -1448,27 +1659,76 @@ class BaseStrategyEngine:
             qty,
             reason,
             is_hard_sl=False,
-            refresh_protection=False,
+        )
+
+    def _partial_booking_plan(self, pos: Position) -> tuple[float, int]:
+        lot_size = max(self.cfg.option_lot_size, 1)
+        initial_lots = max(pos.initial_quantity // lot_size, 0)
+        remaining_lots = max(pos.quantity // lot_size, 0)
+        booked_lots = max(initial_lots - remaining_lots, 0)
+        lots_per_booking = max(self.cfg.partial_booking_lots, 1)
+        completed_rungs = booked_lots // lots_per_booking
+        target_rr = self.cfg.t2_rr + completed_rungs * self.cfg.partial_booking_interval_rr
+        lots_available_to_book = max(remaining_lots - 1, 0)
+        lots_to_book = min(lots_per_booking, lots_available_to_book)
+        return target_rr, lots_to_book * lot_size
+
+    def _manage_partial_booking(
+        self,
+        side_state: BaseSideState,
+        rr: float,
+        ts: datetime,
+        source: str,
+    ) -> None:
+        pos = side_state.position
+        if (
+            pos is None
+            or not self.cfg.partial_booking_enabled
+            or self._is_hd_strategy()
+        ):
+            return
+
+        target_rr, partial_quantity = self._partial_booking_plan(pos)
+        if partial_quantity <= 0 or rr < target_rr:
+            return
+
+        lot_size = max(self.cfg.option_lot_size, 1)
+        booked_lots = partial_quantity // lot_size
+        self.execute_partial_exit(
+            side_state,
+            partial_quantity,
+            f"{target_rr:.1f} RR ({source}) — booked {booked_lots} lot(s)",
+        )
+        pos = side_state.position
+        if pos is None or pos.pending_exit is not None:
+            return
+
+        pos.t2_done = pos.quantity < pos.initial_quantity
+        next_target_rr, next_partial_quantity = self._partial_booking_plan(pos)
+        pos.next_target_rr = next_target_rr if next_partial_quantity > 0 else None
+        pos.progress_status = (
+            f"{target_rr:.1f}R reached - booked {booked_lots} lot(s); "
+            f"looking for {next_target_rr:.1f}R"
+            if next_partial_quantity > 0
+            else f"{target_rr:.1f}R reached - trailing final lot"
         )
 
     def manage_targets(self, side_state: BaseSideState, row: pd.Series) -> None:
         """FRD §6: Step-trailing SL logic.
 
                 - At 1.0 RR arm breakeven for every position size.
-                - 2-lot: at 2.0 RR book 1 lot, then trail the remaining lot every
-                    0.5 RR indefinitely.
-                - 1-lot: keep the lot open and trail it until the trailing SL hits.
+                - Book configured lots at the initial RR, then at each configured
+                    RR interval while retaining one lot for trailing.
+                - Trail the final lot until the strategy's exit rules trigger.
         """
         pos = side_state.position
         if pos is None:
             return
 
         rr = self.compute_rr_progress(pos, row)
-        lot_qty = self.cfg.option_lot_size
-        partial_qty = self.cfg.half_size_lots * lot_qty
         ir = pos.option_risk_points
 
-        # At 1.0 RR — arm breakeven for both 1-lot and 2-lot positions.
+        # At 1.0 RR — arm breakeven for every position size.
         if rr >= self.cfg.t1_rr and not pos.t1_done:
             pos.breakeven_armed = True
             pos.t1_done = True
@@ -1493,25 +1753,15 @@ class BaseStrategyEngine:
             )
             return
 
-        # Phase 3: At 2.0 RR — partial exit 1 lot.
-        if (
-            not self._is_ema21_strategy()
-            and pos.initial_quantity > partial_qty
-            and rr >= self.cfg.t2_rr
-            and not pos.t2_done
-        ):
-            self.execute_partial_exit(
-                side_state, partial_qty,
-                f"2.0 RR hit — booked 1 lot",
-            )
-            if side_state.position is None:
-                return
-            side_state.position.t2_done = True
-            side_state.position.next_target_rr = self.cfg.t2_rr + self.cfg.trailing_step_rr
-            side_state.position.progress_status = (
-                f"{self.cfg.t2_rr:.1f}R reached - half lot booked; "
-                f"looking for {side_state.position.next_target_rr:.1f}R"
-            )
+        self._manage_partial_booking(
+            side_state,
+            rr,
+            self.last_processed_candle_time or pos.entry_time,
+            "candle",
+        )
+        pos = side_state.position
+        if pos is None or pos.pending_exit is not None:
+            return
 
         # Step-trailing: at 1.5R protect 0.5R, then advance by 0.5R.
         if pos.breakeven_armed and ir > 0:
@@ -1526,9 +1776,16 @@ class BaseStrategyEngine:
                     pos.highest_rr_step = current_step
                     self._refresh_protective_stop(pos.option_type, pos, self.last_processed_candle_time or pos.entry_time)
                     pos.next_target_rr = current_step + step
+                    next_booking_rr, next_partial_quantity = self._partial_booking_plan(pos)
+                    if self.cfg.partial_booking_enabled and next_partial_quantity <= 0:
+                        trailing_status = "trailing final lot"
+                    elif self.cfg.partial_booking_enabled:
+                        trailing_status = f"next booking at {next_booking_rr:.1f}R"
+                    else:
+                        trailing_status = "trailing position"
                     pos.progress_status = (
                         f"{current_step:.1f}R reached - SL shifted to {new_sl:.2f}; "
-                        f"looking for {pos.next_target_rr:.1f}R"
+                        f"{trailing_status}"
                     )
                     self._record_alert(
                         self.last_processed_candle_time or pos.entry_time,
@@ -1595,8 +1852,9 @@ class BaseStrategyEngine:
             )
 
     def monitor_open_position(self, side_state: BaseSideState, row: pd.Series) -> None:
+        """Apply candle-based stop and target logic only during historical replay."""
         pos = side_state.position
-        if pos is None:
+        if pos is None or not self.broker.is_replay:
             return
 
         option_low = float(row["low"])
@@ -1696,6 +1954,8 @@ class BaseStrategyEngine:
         """
         self._sync_shared_sl_count(self.state.trading_day or ts.date())
         side_state = self._side_state(side)
+        if self._reconcile_exit_order(side_state, ts):
+            return
         pos = side_state.position
         if pos is None:
             return
@@ -1746,23 +2006,10 @@ class BaseStrategyEngine:
             self._advance_hd_trailing(side_state, rr, ts)
             return
 
-        # Phase 3: 2.0 RR — partial exit.
-        if (
-            not self._is_ema21_strategy()
-            and pos.initial_quantity > lot_qty
-            and rr >= self.cfg.t2_rr
-            and not pos.t2_done
-        ):
-            self.execute_partial_exit(side_state, lot_qty, f"2.0 RR (tick) — booked 1 lot")
-            if side_state.position is None:
-                return
-            side_state.position.t2_done = True
-            side_state.position.next_target_rr = self.cfg.t2_rr + self.cfg.trailing_step_rr
-            side_state.position.progress_status = (
-                f"{self.cfg.t2_rr:.1f}R reached - half lot booked; "
-                f"looking for {side_state.position.next_target_rr:.1f}R"
-            )
-            pos = side_state.position
+        self._manage_partial_booking(side_state, rr, ts, "tick")
+        pos = side_state.position
+        if pos is None or pos.pending_exit is not None:
+            return
 
         # Step-trailing: at 1.5R protect 0.5R, then advance by 0.5R.
         if pos.breakeven_armed and ir > 0:
@@ -1777,9 +2024,16 @@ class BaseStrategyEngine:
                     pos.highest_rr_step = current_step
                     self._refresh_protective_stop(pos.option_type, pos, ts)
                     pos.next_target_rr = current_step + step
+                    next_booking_rr, next_partial_quantity = self._partial_booking_plan(pos)
+                    if self.cfg.partial_booking_enabled and next_partial_quantity <= 0:
+                        trailing_status = "trailing final lot"
+                    elif self.cfg.partial_booking_enabled:
+                        trailing_status = f"next booking at {next_booking_rr:.1f}R"
+                    else:
+                        trailing_status = "trailing position"
                     pos.progress_status = (
                         f"{current_step:.1f}R reached - SL shifted to {new_sl:.2f}; "
-                        f"looking for {pos.next_target_rr:.1f}R"
+                        f"{trailing_status}"
                     )
                     self._record_alert(ts, "TSL", f"{pos.option_type} {current_step:.1f} RR (tick) — TSL={new_sl:.2f}")
 
@@ -1809,6 +2063,9 @@ class BaseStrategyEngine:
         self._sync_shared_sl_count(ts.date())
 
         side_state = self._side_state(side)
+        if self._reconcile_exit_order(side_state, ts):
+            self._record_trace_row(side, side_state, row, Signal.NONE, False, "EXIT_PENDING")
+            return
         signal: Signal = Signal.NONE
         remark = "NO_ENTRY"
         trade_initiated = False
@@ -1830,6 +2087,31 @@ class BaseStrategyEngine:
             self.force_square_off_side(side_state, ts)
             remark = "FORCE_SQUARE_OFF"
             self._record_trace_row(side, side_state, row, signal, False, remark)
+            return
+
+        if (
+            self._is_ema21_strategy()
+            and side_state.position is not None
+            and ema21_val is not None
+            and not pd.isna(ema21_val)
+            and float(row["close"]) < float(ema21_val)
+        ):
+            self.monitor_open_position(side_state, row)
+            exit_remark = "EMA_CLOSE_EXIT"
+            if side_state.position is not None:
+                self._exit_position(
+                    side_state,
+                    ts,
+                    side_state.position.quantity,
+                    "EMA-21 close exit",
+                    is_hard_sl=False,
+                    row=row,
+                )
+            else:
+                exit_remark = "POSITION_EXITED_BY_PROTECTION"
+            if side_state.position is None and had_position_before:
+                self.signal_provider.reset_after_entry(side_state)
+            self._record_trace_row(side, side_state, row, signal, False, exit_remark)
             return
 
         if not self.in_trade_window(ts):
@@ -1901,19 +2183,6 @@ class BaseStrategyEngine:
             self._record_trace_row(side, side_state, row, signal, False, "STATE_WARMUP")
             return
 
-        if (
-            self._is_ema21_strategy()
-            and side_state.pending_entry is not None
-            and row.get("ema21") is not None
-            and not pd.isna(row.get("ema21"))
-            and float(row["close"]) <= float(row["ema21"])
-        ):
-            self._cancel_pending_entry_with_reason(
-                side,
-                side_state,
-                ts,
-                f"EMA21 close failure (close={float(row['close']):.2f} <= EMA21={float(row['ema21']):.2f})",
-            )
         if (
             self._is_ema21_strategy()
             and side_state.order_submission_uncertain

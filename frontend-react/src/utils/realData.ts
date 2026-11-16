@@ -1,5 +1,5 @@
 /**
- * Real Account Data Provider - Reads actual OpenAlgo and Fyers data
+ * Real Account Data Provider - Reads account data from the configured OpenAlgo connection
  */
 
 import { DashboardMetrics, Position, Order } from '@/types'
@@ -45,32 +45,6 @@ export async function fetchOpenAlgoData(): Promise<{
 }
 
 /**
- * Fetch real Fyers wallet data (for live mode)
- */
-export async function fetchFyersWalletData(): Promise<{
-  available_balance: number;
-  used_margin: number;
-  available_margin: number;
-  pnl: number;
-} | null> {
-  try {
-    const response = await fetch('/api/logs/wallet_data.json');
-    if (!response.ok) return null;
-
-    const data = await response.json();
-    return {
-      available_balance: parseFloat(data.available_balance || data.cash || 0),
-      used_margin: parseFloat(data.utilisedMargin || data.used_margin || 0),
-      available_margin: parseFloat(data.availableMargin || data.available_margin || 0),
-      pnl: parseFloat(data.pnl || 0),
-    };
-  } catch (error) {
-    console.error('Error fetching Fyers wallet data:', error);
-    return null;
-  }
-}
-
-/**
  * Build real metrics from OpenAlgo account data
  */
 export function buildMetricsFromOpenAlgo(
@@ -81,7 +55,15 @@ export function buildMetricsFromOpenAlgo(
   const totalPnL = positions.reduce((sum, p) => sum + (p.pnl ?? 0), 0)
   
   // Get margin info from account
-  const availableMargin = parseFloat(account.margin || account.availableMargin || 500000)
+  const availableMargin = parseFloat(
+    account.availableMargin ??
+      account.available_margin ??
+      account.availablecash ??
+      account.availableCash ??
+      account.margin ??
+      account.cash ??
+      0
+  )
 
   return {
     net_mtm: parseFloat(account.mtm || account.pnl || totalPnL),
@@ -93,30 +75,14 @@ export function buildMetricsFromOpenAlgo(
 }
 
 /**
- * Build metrics from Fyers wallet (live mode)
- */
-export function buildMetricsFromFyersWallet(
-  wallet: Record<string, any>,
-  positions: Position[]
-): DashboardMetrics {
-  return {
-    net_mtm: wallet.pnl || 0,
-    available_margin: wallet.available_balance || 0,
-    active_trades: positions.filter(p => p.quantity !== 0).length,
-    engine_status: 'running' as const,
-    last_update: new Date().toISOString(),
-  }
-}
-
-/**
- * Detect current mode from environment or running process
+ * Detect the mode reported by the configured OpenAlgo account snapshot
  */
 export async function detectMode(): Promise<'analyzer' | 'live'> {
   try {
-    // Check if wallet data exists (live mode) or just dashboard data (analyzer)
-    const response = await fetch('/api/logs/wallet_data.json')
+    const response = await fetch('/api/logs/dashboard_data.json')
     if (response.ok) {
-      return 'live'
+      const data = await response.json()
+      return data.mode === 'live' ? 'live' : 'analyzer'
     }
     return 'analyzer'
   } catch {

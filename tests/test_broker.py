@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import pandas as pd
 import pytest
+import requests
 
 from core.broker import (
     BrokerInterface,
@@ -298,6 +299,28 @@ def test_openalgo_fetch_history_paths(fake_openalgo):
     client.history_response = pd.DataFrame()
     with pytest.raises(RuntimeError, match="No history data"):
         broker.fetch_history("NIFTY", "NFO", "3m", "2026-08-01", "2026-08-08")
+
+
+def test_openalgo_fetch_history_retries_transient_timeout(monkeypatch, fake_openalgo):
+    broker = OpenAlgoBroker(api_key="k", host="h")
+    client = fake_openalgo["client"]
+    original_history = client.history
+    attempts = 0
+
+    def flaky_history(**kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise requests.exceptions.ReadTimeout("timed out")
+        return original_history(**kwargs)
+
+    client.history = flaky_history
+    monkeypatch.setattr("core.broker.time_module.sleep", lambda _delay: None)
+
+    data = broker.fetch_history("NIFTY", "NFO", "3m", "2026-08-01", "2026-08-08")
+
+    assert not data.empty
+    assert attempts == 2
 
 
 def test_openalgo_exchange_inference(fake_openalgo):

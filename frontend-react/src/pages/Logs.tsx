@@ -198,17 +198,22 @@ const Logs: React.FC = () => {
       // 📍 ENTRY TRIGGERED / ENTRY FILLED
       if (messageUpper.includes('ENTRY') && (messageUpper.includes('FILLED') || messageUpper.includes('TRIGGERED'))) {
         const symbolMatch = log.message.match(/([A-Z]+\d+[A-Z]+\d+[CE|PE]{2})/)?.[0]
-        const priceMatch = log.message.match(/₹?(\d+\.?\d*)/)?.[1]
-        const qtyMatch = log.message.match(/(\d+)\s*(?:contracts|qty|quantity)/i)?.[1]
+        const priceMatch = log.message.match(/@\s*₹?\s*(\d+(?:\.\d+)?)/)
+          ?? log.message.match(/\b(?:average|avg|fill)[_\s-]*price\s*[=:]\s*₹?\s*(\d+(?:\.\d+)?)/i)
+        const quantityMessage = priceMatch
+          ? log.message.replace(priceMatch[0], '')
+          : log.message
+        const qtyMatch = quantityMessage.match(/\b(?:qty|quantity)\s*[=:]\s*(\d+)\b|\b(\d+)\s*(?:contracts|qty|quantity)\b/i)
         
         const symbol = symbolMatch || 'Unknown'
-        const price = priceMatch ? `₹${priceMatch}` : 'Market Price'
-        const qty = qtyMatch || '1'
+        const priceDetail = priceMatch ? ` at ₹${priceMatch[1]}` : ' (fill price unavailable)'
+        const quantity = qtyMatch?.[1] || qtyMatch?.[2]
+        const quantityDetail = quantity ? ` (${quantity} contracts)` : ''
         
         toast.addToast({
           type: 'success',
           title: '📍 Entry Filled',
-          message: `Entry for ${symbol} at ${price} (${qty} contracts)`,
+          message: `Entry for ${symbol}${priceDetail}${quantityDetail}`,
           duration: 6000,
         })
       }
@@ -599,16 +604,12 @@ const Logs: React.FC = () => {
 
   // Get latest candle time from logs
   const getLatestCandleTime = (): string => {
-    if (logs.length === 0) return 'N/A'
-    const sortedLogs = [...logs].sort(
+    const completedLogs = logs.filter((log) => Boolean(log.candleTime && log.candleOhlc))
+    if (completedLogs.length === 0) return 'N/A'
+    const sortedLogs = [...completedLogs].sort(
       (a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()
     )
-    const latestTimestamp = sortedLogs[0].timestamp
-    const date = new Date(latestTimestamp)
-    const hours = String(date.getHours()).padStart(2, '0')
-    const minutes = String(date.getMinutes()).padStart(2, '0')
-    const seconds = String(date.getSeconds()).padStart(2, '0')
-    return `${hours}:${minutes}:${seconds}`
+    return sortedLogs[0].candleTime || 'N/A'
   }
 
   const parseOptionSymbol = (symbol: string) => {
@@ -882,10 +883,11 @@ const Logs: React.FC = () => {
 
   // Get completed 3-minute candle history (all logs for this side)
   const get3MinuteCandleHistory = (logs: LogEntry[]): LogEntry[] => {
-    // Return all logs sorted by timestamp (newest first - descending order)
-    return [...logs].sort(
+    return logs
+      .filter((log) => Boolean(log.candleTime && log.candleOhlc))
+      .sort(
       (a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()
-    )
+      )
   }
 
   // Get unique strategies that have 3-minute logs

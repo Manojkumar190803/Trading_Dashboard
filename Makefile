@@ -26,7 +26,6 @@ help:
 	@echo "  make shell              Open shell in strategy_worker"
 	@echo "  make logs               Follow all logs"
 	@echo "  make logs-strategy      Follow strategy worker logs"
-	@echo "  make logs-streamlit     Follow streamlit logs"
 	@echo "  make logs-react         Follow react dashboard logs"
 	@echo ""
 	@echo "Strategy Execution:"
@@ -63,7 +62,6 @@ up:
 	$(DOCKER_COMPOSE) up -d
 	@echo "Services started. Access dashboard at:"
 	@echo "  React:     http://localhost:3000"
-	@echo "  Streamlit: http://localhost:8502"
 
 down:
 	@echo "Stopping all services..."
@@ -87,9 +85,6 @@ logs:
 
 logs-strategy:
 	$(DOCKER_COMPOSE) logs -f strategy_worker
-
-logs-streamlit:
-	$(DOCKER_COMPOSE) logs -f streamlit_interface
 
 logs-react:
 	$(DOCKER_COMPOSE) logs -f react_dashboard

@@ -30,6 +30,9 @@ class StrategyConfig:
     option_lot_size: int = 65
     full_size_lots: int = 2
     half_size_lots: int = 1
+    partial_booking_enabled: bool = True
+    partial_booking_lots: int = 1
+    partial_booking_interval_rr: float = 0.5
     trailing_step_rr: float = 0.5
     expiry_policy: str = "weekly"
     weekly_expiry_weekday: int = 1  # Monday=0 ... Tuesday=1
@@ -74,6 +77,15 @@ class RiskConfig:
 
 
 @dataclass
+class PendingExit:
+    order_id: Optional[str]
+    quantity: int
+    reason: str
+    is_hard_sl: bool
+    price: float
+
+
+@dataclass
 class Position:
     option_symbol: str
     option_type: str  # CE or PE
@@ -94,6 +106,7 @@ class Position:
     current_price: Optional[float] = None
     progress_status: str = "Monitoring position"
     next_target_rr: Optional[float] = None
+    pending_exit: Optional[PendingExit] = None
 
 
 @dataclass

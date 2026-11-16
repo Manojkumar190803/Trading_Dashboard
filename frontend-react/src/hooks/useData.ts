@@ -1,8 +1,7 @@
-import { useEffect, useCallback, useState } from 'react'
+import { useEffect, useCallback, useRef, useState } from 'react'
 import { fetchAndParseCSV, getTodayDateString, watchFile } from '@/utils/files'
 import { parseCSV } from '@/utils/format'
 import { StrategyAlert, Trade, EquityCurvePoint } from '@/types'
-import { isMarketOpen } from '@/utils/market-hours'
 
 /**
  * Hook to fetch strategy alerts from daily CSV
@@ -284,45 +283,41 @@ export const useRealAccountData = (shouldFetch = true, interval = 1000) => {
     mode?: 'live' | 'analyzer'
     engine_status?: string
   } | null>(null)
-  const [isLoading, setIsLoading] = useState(false)
+  const [isLoading, setIsLoading] = useState(shouldFetch)
   const [error, setError] = useState<string | null>(null)
+  const [lastUpdated, setLastUpdated] = useState<string | null>(null)
+  const hasSuccessfulFetch = useRef(false)
 
   const fetchData = useCallback(async () => {
     try {
-      setIsLoading(true)
+      if (!hasSuccessfulFetch.current) setIsLoading(true)
       // Add timestamp to bypass cache and always get fresh data
       const response = await fetch(`/logs/dashboard_data.json?t=${Date.now()}`)
       if (response.ok) {
         const accountData = await response.json()
-        console.log('[useRealAccountData] Fetched data:', {
-          mode: accountData.mode,
-          availableMargin: accountData.account?.availableMargin,
-          timestamp: new Date().toISOString()
-        })
-        // Store in localStorage for debugging
-        window.localStorage.setItem('lastAccountData', JSON.stringify({
-          mode: accountData.mode,
-          availableMargin: accountData.account?.availableMargin,
-          timestamp: new Date().toISOString()
-        }))
+        const orderPayload = accountData.orders
+        const orders = Array.isArray(orderPayload)
+          ? orderPayload
+          : Array.isArray(orderPayload?.orders)
+            ? orderPayload.orders
+            : []
         setData({
           positions: accountData.positions || [],
-          orders: accountData.orders || [],
+          orders,
           account: accountData.account || {},
           mode: accountData.mode,
           engine_status: accountData.engine_status,
         })
+        hasSuccessfulFetch.current = true
+        setLastUpdated(new Date().toISOString())
         setError(null)
       } else {
-        // File not found or error - clear data
-        console.log('[useRealAccountData] Failed to fetch:', response.status)
-        setData(null)
-        setError(null) // Don't show error if file just doesn't exist
+        if (!hasSuccessfulFetch.current) setData(null)
+        setError(`OpenAlgo dashboard data request failed (${response.status}).`)
       }
     } catch (err) {
-      console.log('[useRealAccountData] Error:', err)
-      setData(null) // Clear data on error
-      setError(null)
+      if (!hasSuccessfulFetch.current) setData(null)
+      setError(err instanceof Error ? err.message : 'Could not load OpenAlgo dashboard data.')
     } finally {
       setIsLoading(false)
     }
@@ -331,80 +326,12 @@ export const useRealAccountData = (shouldFetch = true, interval = 1000) => {
   useEffect(() => {
     if (!shouldFetch) return
 
-    // Only poll during market hours (9:15 AM - 3:30 PM IST, Mon-Fri)
-    if (!isMarketOpen()) {
-      console.log('[useRealAccountData] Market closed - polling disabled')
-      return
-    }
-
     fetchData()
-    
-    // Set up polling interval
-    const timer = setInterval(() => {
-      // Check market status on each poll
-      if (isMarketOpen()) {
-        fetchData()
-      } else {
-        console.log('[useRealAccountData] Market closed - stopping polling')
-      }
-    }, interval)
-
+    const timer = setInterval(fetchData, interval)
     return () => clearInterval(timer)
   }, [shouldFetch, interval, fetchData])
 
-  return { data, isLoading, error, refetch: fetchData }
-}
-
-/**
- * Hook to fetch real Fyers wallet data (live mode)
- */
-export const useRealWalletData = (shouldFetch = true, interval = 1000) => {
-  const [wallet, setWallet] = useState<{
-    available_balance: number
-    used_margin: number
-    available_margin: number
-    pnl: number
-  } | null>(null)
-  const [isLoading, setIsLoading] = useState(false)
-  const [error, setError] = useState<string | null>(null)
-
-  const fetchWallet = useCallback(async () => {
-    try {
-      setIsLoading(true)
-      // Add timestamp to bypass cache and always get fresh data
-      const response = await fetch(`/logs/wallet_data.json?t=${Date.now()}`)
-      if (response.ok) {
-        const walletData = await response.json()
-        setWallet({
-          available_balance: parseFloat(walletData.available_balance || 0),
-          used_margin: parseFloat(walletData.utilisedMargin || 0),
-          available_margin: parseFloat(walletData.availableMargin || 0),
-          pnl: parseFloat(walletData.pnl || 0),
-        })
-        setError(null)
-      } else {
-        // File not found or error - clear wallet
-        setWallet(null)
-        setError(null) // Don't show error if file just doesn't exist
-      }
-    } catch (err) {
-      console.debug('Wallet data not available - live mode may be inactive')
-      setWallet(null) // Clear wallet on error
-      setError(null)
-    } finally {
-      setIsLoading(false)
-    }
-  }, [])
-
-  useEffect(() => {
-    if (!shouldFetch) return
-
-    fetchWallet()
-    const timer = setInterval(fetchWallet, interval)
-    return () => clearInterval(timer)
-  }, [shouldFetch, interval, fetchWallet])
-
-  return { wallet, isLoading, error, refetch: fetchWallet }
+  return { data, isLoading, error, lastUpdated, refetch: fetchData }
 }
 
 /**

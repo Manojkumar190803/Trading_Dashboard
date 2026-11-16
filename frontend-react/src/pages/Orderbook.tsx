@@ -19,7 +19,7 @@ const Orderbook: React.FC = () => {
 
   // Memoize order statistics and data
   const { orderStats, executionLog, liveOrders } = useMemo(() => {
-    if (!accountData?.orders?.orders) {
+    if (!accountData?.orders) {
       return {
         orderStats: {
           buyOrders: 0,
@@ -33,7 +33,7 @@ const Orderbook: React.FC = () => {
       }
     }
 
-    const orders = accountData.orders.orders
+    const orders = accountData.orders
 
     // Calculate order statistics
     let buyCount = 0
@@ -93,7 +93,7 @@ const Orderbook: React.FC = () => {
       executionLog: execLog,
       liveOrders: live,
     }
-  }, [accountData?.orders?.orders])
+  }, [accountData?.orders])
 
   const getStatusBadgeVariant = (status: string) => {
     switch (status) {
@@ -106,7 +106,7 @@ const Orderbook: React.FC = () => {
       case 'rejected':
         return 'danger'
       default:
-        return 'secondary'
+        return 'info'
     }
   }
 
@@ -140,35 +140,35 @@ const Orderbook: React.FC = () => {
           icon={<TrendingUp className="text-emerald-500" />}
           label="Buy orders"
           value={orderStats.buyOrders}
-          subLabel="Total buy orders"
-          color="emerald"
+          sublabel="Total buy orders"
+          color="green"
         />
         <MetricCard
           icon={<TrendingUp className="text-red-500 transform rotate-180" />}
           label="Sell orders"
           value={orderStats.sellOrders}
-          subLabel="Total sell orders"
+          sublabel="Total sell orders"
           color="red"
         />
         <MetricCard
           icon={<Activity className="text-green-500" />}
           label="Completed"
           value={orderStats.completed}
-          subLabel="Filled orders"
-          color="emerald"
+          sublabel="Filled orders"
+          color="green"
         />
         <MetricCard
           icon={<Clock className="text-amber-500" />}
           label="Open"
           value={orderStats.open}
-          subLabel="Pending orders"
-          color="amber"
+          sublabel="Pending orders"
+          color="yellow"
         />
         <MetricCard
           icon={<AlertCircle className="text-red-500" />}
           label="Rejected"
           value={orderStats.rejected}
-          subLabel="Rejected orders"
+          sublabel="Rejected orders"
           color="red"
         />
       </div>
@@ -240,7 +240,7 @@ const Orderbook: React.FC = () => {
                     </td>
                     <td className="px-6 py-4">
                       <Badge
-                        variant={exec.category === 'ORDER' ? 'secondary' : 'danger'}
+                        variant={exec.category === 'ORDER' ? 'primary' : 'danger'}
                         size="sm"
                       >
                         {exec.category}

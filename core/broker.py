@@ -557,13 +557,31 @@ class OpenAlgoBroker(BrokerInterface):
         start_date: str,
         end_date: str,
     ) -> pd.DataFrame:
-        df = self.client.history(
-            symbol=symbol,
-            exchange=exchange,
-            interval=interval,
-            start_date=start_date,
-            end_date=end_date,
+        max_attempts = 2
+        transient_errors = (
+            requests.exceptions.Timeout,
+            requests.exceptions.ConnectionError,
+            TimeoutError,
         )
+        for attempt in range(max_attempts):
+            try:
+                df = self.client.history(
+                    symbol=symbol,
+                    exchange=exchange,
+                    interval=interval,
+                    start_date=start_date,
+                    end_date=end_date,
+                )
+                break
+            except transient_errors as exc:
+                if attempt == max_attempts - 1:
+                    raise
+                logger.warning(
+                    "history request timed out for %s; retrying once: %s",
+                    symbol,
+                    exc,
+                )
+                time_module.sleep(0.5)
         if isinstance(df, dict):
             raise RuntimeError(f"history returned error for {symbol}: {df}")
         if df is None or df.empty:

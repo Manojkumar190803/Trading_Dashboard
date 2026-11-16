@@ -23,7 +23,7 @@ export const Card: React.FC<CardProps> = ({ children, className, hoverable = fal
 interface MetricCardProps {
   label: string
   value: string | number
-  sublabel?: string
+  sublabel?: ReactNode
   icon?: ReactNode
   color?: 'default' | 'green' | 'red' | 'cyan' | 'yellow'
   trend?: 'up' | 'down' | 'neutral'

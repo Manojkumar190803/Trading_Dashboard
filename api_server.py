@@ -676,6 +676,10 @@ def get_instruments():
                     "entryCutoffTime": i.entry_cutoff_time or "14:40",
                     "lotSizeAdjustment": i.lot_size_adjustment,
                     "calculatedLotSize": i.calculated_lot_size,
+                    "partialBookingEnabled": i.partial_booking_enabled,
+                    "partialBookingRR": i.partial_booking_rr,
+                    "partialBookingLots": i.partial_booking_lots,
+                    "partialBookingIntervalRR": i.partial_booking_interval_rr,
                     "strategy": i.strategy,
                     "productType": i.product_type,
                     "premiumMinPrice": i.premium_min_price,
@@ -724,6 +728,18 @@ def create_instrument():
         instrument.entry_cutoff_time = data.get("entryCutoffTime", "14:40")
         instrument.lot_size_adjustment = float(data.get("lotSizeAdjustment", 1.0))
         instrument.calculated_lot_size = int(data.get("calculatedLotSize"))
+        instrument.partial_booking_enabled = bool(data.get("partialBookingEnabled", True))
+        instrument.partial_booking_rr = float(data.get("partialBookingRR", 2.0))
+        instrument.partial_booking_lots = int(data.get("partialBookingLots", 1))
+        instrument.partial_booking_interval_rr = float(data.get("partialBookingIntervalRR", 0.5))
+        if (
+            instrument.partial_booking_rr <= 0
+            or instrument.partial_booking_lots < 1
+            or instrument.partial_booking_interval_rr <= 0
+        ):
+            return jsonify({"error": "Partial booking RR, interval, and lots must be greater than zero"}), 400
+        if instrument.partial_booking_rr <= 0 or instrument.partial_booking_lots < 1:
+            return jsonify({"error": "Partial booking RR and lots must be greater than zero"}), 400
         instrument.premium_min_price = float(data.get("premiumMinPrice")) if data.get("premiumMinPrice") else None
         instrument.premium_max_price = float(data.get("premiumMaxPrice")) if data.get("premiumMaxPrice") else None
         instrument.max_initial_risk_points = float(data.get("maxInitialRiskPoints", 20.0))
@@ -790,6 +806,20 @@ def update_instrument(instrument_id):
             instrument.lot_size_adjustment = float(data["lotSizeAdjustment"])
         if "calculatedLotSize" in data:
             instrument.calculated_lot_size = int(data["calculatedLotSize"])
+        if "partialBookingEnabled" in data:
+            instrument.partial_booking_enabled = bool(data["partialBookingEnabled"])
+        if "partialBookingRR" in data:
+            instrument.partial_booking_rr = float(data["partialBookingRR"])
+            if instrument.partial_booking_rr <= 0:
+                return jsonify({"error": "Partial booking RR must be greater than zero"}), 400
+        if "partialBookingLots" in data:
+            instrument.partial_booking_lots = int(data["partialBookingLots"])
+            if instrument.partial_booking_lots < 1:
+                return jsonify({"error": "Partial booking lots must be at least one"}), 400
+        if "partialBookingIntervalRR" in data:
+            instrument.partial_booking_interval_rr = float(data["partialBookingIntervalRR"])
+            if instrument.partial_booking_interval_rr <= 0:
+                return jsonify({"error": "Partial booking interval must be greater than zero"}), 400
         if "premiumMinPrice" in data:
             instrument.premium_min_price = float(data["premiumMinPrice"]) if data["premiumMinPrice"] else None
         if "premiumMaxPrice" in data:
@@ -873,6 +903,10 @@ def get_all_instruments_debug():
                     "name": i.name,
                     "strategy": i.strategy,
                     "status": i.status,
+                    "partialBookingEnabled": i.partial_booking_enabled,
+                    "partialBookingRR": i.partial_booking_rr,
+                    "partialBookingLots": i.partial_booking_lots,
+                    "partialBookingIntervalRR": i.partial_booking_interval_rr,
                     "createdAt": i.created_at.isoformat(),
                 }
                 for i in instruments

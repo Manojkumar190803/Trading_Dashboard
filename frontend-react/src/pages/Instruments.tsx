@@ -44,6 +44,10 @@ interface FormData {
   lotSizeAdjustment: number
   strategy: string
   maxInitialRiskPoints: number
+  partialBookingEnabled: boolean
+  partialBookingRR: number
+  partialBookingLots: number
+  partialBookingIntervalRR: number
 }
 
 const Instruments: React.FC = () => {
@@ -75,6 +79,10 @@ const Instruments: React.FC = () => {
     lotSizeAdjustment: 1,
     strategy: '21EMA',
     maxInitialRiskPoints: 20,
+    partialBookingEnabled: true,
+    partialBookingRR: 2,
+    partialBookingLots: 1,
+    partialBookingIntervalRR: 0.5,
   })
 
   // Fetch symbol suggestions from API
@@ -198,6 +206,18 @@ const Instruments: React.FC = () => {
       alert('Maximum initial risk must be greater than zero')
       return
     }
+    if (formData.partialBookingRR <= 0) {
+      alert('Partial booking RR must be greater than zero')
+      return
+    }
+    if (formData.partialBookingIntervalRR <= 0) {
+      alert('Partial booking RR interval must be greater than zero')
+      return
+    }
+    if (!Number.isInteger(formData.partialBookingLots) || formData.partialBookingLots < 1) {
+      alert('Partial booking lots must be a positive whole number')
+      return
+    }
 
     const baseLotSize = calculateLotSize(formData.name)
     const lotSize = baseLotSize * formData.lotSizeAdjustment  // Apply adjustment multiplier
@@ -215,6 +235,10 @@ const Instruments: React.FC = () => {
       strategy: formData.strategy,
       productType: 'INTRADAY',
       maxInitialRiskPoints: formData.maxInitialRiskPoints,
+      partialBookingEnabled: formData.partialBookingEnabled,
+      partialBookingRR: formData.partialBookingRR,
+      partialBookingLots: formData.partialBookingLots,
+      partialBookingIntervalRR: formData.partialBookingIntervalRR,
     }
 
     if (editingId) {
@@ -249,6 +273,10 @@ const Instruments: React.FC = () => {
       lotSizeAdjustment: inst.lotSizeAdjustment,
       strategy: inst.strategy,
       maxInitialRiskPoints: inst.maxInitialRiskPoints ?? 20,
+      partialBookingEnabled: inst.partialBookingEnabled ?? true,
+      partialBookingRR: inst.partialBookingRR ?? 2,
+      partialBookingLots: inst.partialBookingLots ?? 1,
+      partialBookingIntervalRR: inst.partialBookingIntervalRR ?? 0.5,
     })
     setEditingId(inst.id)
     setShowForm(true)
@@ -274,6 +302,10 @@ const Instruments: React.FC = () => {
       lotSizeAdjustment: 1,
       strategy: '21EMA',
       maxInitialRiskPoints: 20,
+      partialBookingEnabled: true,
+      partialBookingRR: 2,
+      partialBookingLots: 1,
+      partialBookingIntervalRR: 0.5,
     })
     setSymbolValidation(null)
   }
@@ -481,6 +513,68 @@ const Instruments: React.FC = () => {
                 INTRADAY (Fixed)
               </div>
             </div>
+
+            <section className="col-span-1 md:col-span-3 rounded-lg border border-bg-tertiary bg-bg-primary/50 p-4">
+              <h3 className="text-sm font-semibold text-text-primary">Partial Booking</h3>
+              {formData.strategy === 'HD' ? (
+                <p className="mt-2 text-sm text-text-secondary">
+                  Partial booking is not available for HD; its position exits follow HD trailing rules.
+                </p>
+              ) : (
+                <>
+                  <label className="mt-3 flex items-center gap-2 text-sm text-text-secondary">
+                    <input
+                      type="checkbox"
+                      checked={formData.partialBookingEnabled}
+                      onChange={(e) => setFormData({ ...formData, partialBookingEnabled: e.target.checked })}
+                      className="h-4 w-4 accent-cyan-400"
+                    />
+                    Enable partial booking
+                  </label>
+                  <div className="mt-3 grid grid-cols-1 md:grid-cols-3 gap-4">
+                    <div>
+                      <label className="block text-sm font-medium text-text-secondary mb-2">Initial booking at (R)</label>
+                      <input
+                        type="number"
+                        min="0.1"
+                        step="0.1"
+                        value={formData.partialBookingRR}
+                        disabled={!formData.partialBookingEnabled}
+                        onChange={(e) => setFormData({ ...formData, partialBookingRR: Number(e.target.value) || 2 })}
+                        className="w-full px-3 py-2 bg-bg-primary border border-bg-tertiary rounded-lg text-text-primary disabled:opacity-50"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-sm font-medium text-text-secondary mb-2">RR interval after each booking</label>
+                      <input
+                        type="number"
+                        min="0.1"
+                        step="0.1"
+                        value={formData.partialBookingIntervalRR}
+                        disabled={!formData.partialBookingEnabled}
+                        onChange={(e) => setFormData({ ...formData, partialBookingIntervalRR: Number(e.target.value) || 0.5 })}
+                        className="w-full px-3 py-2 bg-bg-primary border border-bg-tertiary rounded-lg text-text-primary disabled:opacity-50"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-sm font-medium text-text-secondary mb-2">Lots per booking</label>
+                      <input
+                        type="number"
+                        min="1"
+                        step="1"
+                        value={formData.partialBookingLots}
+                        disabled={!formData.partialBookingEnabled}
+                        onChange={(e) => setFormData({ ...formData, partialBookingLots: Number(e.target.value) || 1 })}
+                        className="w-full px-3 py-2 bg-bg-primary border border-bg-tertiary rounded-lg text-text-primary disabled:opacity-50"
+                      />
+                    </div>
+                    <p className="self-end text-sm text-text-secondary md:col-span-3">
+                      Books {formData.partialBookingLots} lot(s) at {formData.partialBookingRR}R, then every {formData.partialBookingIntervalRR}R; always leaves 1 lot to trail.
+                    </p>
+                  </div>
+                </>
+              )}
+            </section>
 
             <div className="col-span-1 md:col-span-3 flex gap-3">
               <button

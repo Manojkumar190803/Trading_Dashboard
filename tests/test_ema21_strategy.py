@@ -448,7 +448,7 @@ def test_engine_places_ema21_stop_entry_at_red_high():
     assert engine.total_entries == 1
 
 
-def test_ema21_does_not_fill_on_confirmation_candle_and_cancels_on_next_low():
+def test_ema21_pending_entry_cancels_only_after_close_below_ema():
     provider = EMA21SignalProvider()
     engine = BaseStrategyEngine(
         StrategyConfig(max_option_risk_points=20.0),
@@ -480,9 +480,15 @@ def test_ema21_does_not_fill_on_confirmation_candle_and_cancels_on_next_low():
     engine.try_fill_pending_entry("CE", engine.state.ce, next_candle["datetime"], next_candle)
 
     assert engine.state.ce.position is None
-    assert engine.state.ce.pending_entry is None
+    assert engine.state.ce.pending_entry is not None
     assert engine.total_entries == 0
-    assert any("SL breached" in alert.message for alert in engine.alerts)
+    assert not any("SL breached" in alert.message for alert in engine.alerts)
+
+    below_ema = _row(6, open_=101, high=104, low=94, close=100, ema=101)
+    engine.try_fill_pending_entry("CE", engine.state.ce, below_ema["datetime"], below_ema)
+
+    assert engine.state.ce.pending_entry is None
+    assert any("EMA21 close failure" in alert.message for alert in engine.alerts)
 
 
 def test_live_pending_entry_cancels_after_trigger_gap():
@@ -530,7 +536,7 @@ def test_ema21_exits_active_position_below_ema_during_warmup():
     engine = BaseStrategyEngine(
         StrategyConfig(max_option_risk_points=20.0),
         RiskConfig(max_sl_per_day=3),
-        HistoricalReplayBroker(),
+        ConsoleBroker(ltp_fallback=246.5),
         provider,
     )
     engine.state.trading_day = datetime(2026, 8, 10).date()
@@ -654,7 +660,7 @@ def test_ema21_preserves_setup_when_daily_entry_cap_rejects_signal():
 
 def test_ema21_does_not_reenter_after_same_candle_position_exit():
     provider = EMA21SignalProvider()
-    broker = ConsoleBroker(ltp_fallback=150.0)
+    broker = HistoricalReplayBroker()
     engine = BaseStrategyEngine(
         StrategyConfig(max_option_risk_points=20.0),
         RiskConfig(max_sl_per_day=3),
@@ -988,7 +994,7 @@ def test_engine_ema21_candle_low_breach_exits_position(tmp_path, monkeypatch):
     engine = BaseStrategyEngine(
         StrategyConfig(),
         RiskConfig(),
-        ConsoleBroker(ltp_fallback=128.50),
+        HistoricalReplayBroker(),
         provider,
     )
     engine.state.ce.position = Position(
@@ -1018,7 +1024,7 @@ def test_engine_ema21_trails_at_one_and_half_rr():
     engine = BaseStrategyEngine(
         StrategyConfig(),
         RiskConfig(),
-        ConsoleBroker(ltp_fallback=72.0),
+        HistoricalReplayBroker(),
         provider,
     )
     engine.state.ce.position = Position(
@@ -1044,12 +1050,12 @@ def test_engine_ema21_trails_at_one_and_half_rr():
     assert engine.state.ce.position.trailing_sl_level == pytest.approx(62.225)
 
 
-def test_engine_ema21_keeps_full_position_and_trails_at_two_rr():
+def test_engine_ema21_books_one_lot_and_trails_remaining_at_two_rr():
     provider = EMA21SignalProvider()
     engine = BaseStrategyEngine(
-        StrategyConfig(t1_rr=1.0),
+        StrategyConfig(),
         RiskConfig(),
-        ConsoleBroker(ltp_fallback=78.0),
+        HistoricalReplayBroker(),
         provider,
     )
     engine.state.ce.position = Position(
@@ -1071,8 +1077,8 @@ def test_engine_ema21_keeps_full_position_and_trails_at_two_rr():
 
     position = engine.state.ce.position
     assert position is not None
-    assert position.quantity == 130
-    assert position.t2_done is False
+    assert position.quantity == 65
+    assert position.t2_done is True
     assert position.trailing_sl_level == pytest.approx(67.35)
 
 

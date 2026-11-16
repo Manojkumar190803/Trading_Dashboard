@@ -1,5 +1,5 @@
 import { useState, useEffect, useMemo, memo } from 'react'
-import { AlertCircle, TrendingUp, Activity, DollarSign, Target, Download } from 'lucide-react'
+import { AlertCircle, TrendingUp, Activity, DollarSign, Target, Download, Clock3 } from 'lucide-react'
 import {
   Card,
   SectionTitle,
@@ -13,6 +13,54 @@ import { formatCurrency, formatPercent, getValueColor } from '@/utils/format'
 import { exportPositionsCSV } from '@/utils/csv-export'
 import { clsx } from 'clsx'
 
+const terminalOrderStatuses = new Set([
+  'complete',
+  'filled',
+  'executed',
+  'cancelled',
+  'canceled',
+  'rejected',
+  'failed',
+  'expired',
+])
+
+const getProtectiveStopPrice = (position: any, orders: any[]): number | null => {
+  const quantity = Math.abs(parseFloat(position.quantity || position.qty || 0))
+  const stopOrders = orders
+    .filter((order) => {
+      const type = String(order.pricetype || order.price_type || order.order_type || '')
+        .toUpperCase()
+        .replace(/[ _]/g, '-')
+      const action = String(order.action || order.side || '').toUpperCase()
+      const triggerPrice = Number(order.trigger_price ?? order.triggerPrice)
+      return (
+        order.symbol === position.symbol
+        && action === 'SELL'
+        && ['SL', 'SL-M', 'SLM', 'STOP', 'STOP-LOSS', 'STOPLOSS'].includes(type)
+        && Number.isFinite(triggerPrice)
+        && triggerPrice > 0
+      )
+    })
+    .sort((left, right) => {
+      const leftTime = String(left.timestamp || left.created_at || '')
+      const rightTime = String(right.timestamp || right.created_at || '')
+      return rightTime.localeCompare(leftTime)
+    })
+
+  const activeStopOrders = stopOrders.filter(
+    (order) => !terminalOrderStatuses.has(String(order.order_status || order.status || '').toLowerCase())
+  )
+  const selectedOrder = quantity > 0
+    ? activeStopOrders.find((order) => {
+        const orderQuantity = Math.abs(parseFloat(order.quantity || 0))
+        return orderQuantity === quantity
+      }) || activeStopOrders[0]
+    : stopOrders[0]
+  const triggerPrice = Number(selectedOrder?.trigger_price ?? selectedOrder?.triggerPrice)
+
+  return Number.isFinite(triggerPrice) && triggerPrice > 0 ? triggerPrice : null
+}
+
 // Custom comparison function for PositionTableRow
 // Only re-render if actual position values change, not object reference
 const arePositionPropsEqual = (prevProps: any, nextProps: any) => {
@@ -25,6 +73,7 @@ const arePositionPropsEqual = (prevProps: any, nextProps: any) => {
     p.entryPrice === n.entryPrice &&
     p.quantity === n.quantity &&
     p.currentPrice === n.currentPrice &&
+    p.protectiveSL === n.protectiveSL &&
     p.pnl === n.pnl &&
     p.pnlPercent === n.pnlPercent
   )
@@ -59,6 +108,11 @@ const PositionTableRow = memo(
       <td className="px-6 py-4">
         <p className="font-mono font-semibold text-text-primary">
           {position.quantity}
+        </p>
+      </td>
+      <td className="px-6 py-4">
+        <p className="font-mono text-text-primary">
+          {position.protectiveSL === null ? '—' : formatCurrency(position.protectiveSL, 2)}
         </p>
       </td>
       <td className="px-6 py-4">
@@ -150,7 +204,7 @@ LiveTickCard.displayName = 'LiveTickCard'
 
 const Positions: React.FC = () => {
   // Fetch real OpenAlgo data - poll every 1 second for live updates
-  const { data: accountData, isLoading: dataLoading } = useRealAccountData(true, 1000)
+  const { data: accountData, isLoading: dataLoading, lastUpdated } = useRealAccountData(true, 1000)
 
   // Create a stable key from position data to only trigger updates when data actually changes
   const positionDataKey = useMemo(() => {
@@ -162,6 +216,21 @@ const Positions: React.FC = () => {
       .map((p: any) => `${p.symbol}:${p.quantity}:${p.pnl}`)
       .join('|')
   }, [accountData?.positions])
+
+  const orderDataKey = useMemo(() => {
+    if (!accountData?.orders) return 'empty'
+    return accountData.orders
+      .map((order: any) => [
+        order.symbol,
+        order.action,
+        order.pricetype,
+        order.order_status,
+        order.trigger_price,
+        order.quantity,
+        order.timestamp,
+      ].join(':'))
+      .join('|')
+  }, [accountData?.orders])
 
   // Memoize metrics and positions data - only update when position data actually changes
   const { metrics, triggeredPositions, liveTickFeed } = useMemo(() => {
@@ -179,11 +248,10 @@ const Positions: React.FC = () => {
     }
 
     const positions = accountData.positions || []
-    const orders = accountData.orders?.orders || []
+    const orders = accountData.orders || []
 
-    // Count only active positions (quantity > 0)
     const activePositions = positions.filter(
-      (p: any) => parseFloat(p.quantity || 0) > 0
+      (p: any) => Math.abs(parseFloat(p.quantity || p.qty || 0)) > 0
     )
     const openPositionsCount = activePositions.length
 
@@ -213,6 +281,7 @@ const Positions: React.FC = () => {
       currentPrice: parseFloat(p.ltp || 0),
       pnl: parseFloat(p.pnl || 0),
       pnlPercent: parseFloat(p.pnlpercent || 0),
+      protectiveSL: getProtectiveStopPrice(p, orders),
     }))
 
     // Prepare live tick feed ONLY for active positions (quantity > 0)
@@ -236,7 +305,7 @@ const Positions: React.FC = () => {
       triggeredPositions: triggered,
       liveTickFeed: activeTicks,
     }
-  }, [positionDataKey]) // Only depend on actual position data changes, not object reference
+  }, [positionDataKey, orderDataKey]) // Recompute when positions or protective orders change
 
   return (
     <div className="space-y-8">
@@ -253,48 +322,63 @@ const Positions: React.FC = () => {
           icon={<Activity className="text-emerald-500" />}
           label="Open Positions"
           value={metrics.openPositions}
-          subLabel="Active trades"
-          color="emerald"
+          sublabel="Active trades"
+          color="green"
         />
         <MetricCard
           icon={<Target className="text-blue-500" />}
           label="Current Strategy"
           value={metrics.currentStrategy}
-          subLabel="Active strategy"
-          color="blue"
+          sublabel="Active strategy"
+          color="cyan"
         />
         <MetricCard
           icon={<DollarSign className="text-amber-500" />}
           label="Total P&L"
           value={formatCurrency(metrics.totalPnL)}
-          subLabel={formatPercent(metrics.totalPnL > 0 ? 2.5 : -1.8)}
-          color={metrics.totalPnL >= 0 ? 'emerald' : 'red'}
+          sublabel={formatPercent(metrics.totalPnL > 0 ? 2.5 : -1.8)}
+          color={metrics.totalPnL >= 0 ? 'green' : 'red'}
         />
         <MetricCard
           icon={<TrendingUp className="text-purple-500" />}
           label="Positions Triggered"
           value={metrics.triggeredToday}
-          subLabel="Total today"
-          color="purple"
+          sublabel="Total today"
+          color="cyan"
         />
       </div>
 
       {/* Triggered Positions Table */}
       <div>
-        <div className="flex items-center justify-between mb-4">
+        <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
           <h3 className="text-lg font-semibold text-text-primary">
             Triggered Positions Today ({triggeredPositions.length})
           </h3>
-          {triggeredPositions.length > 0 && (
-            <button
-              onClick={() => exportPositionsCSV(triggeredPositions)}
-              className="flex items-center gap-2 px-3 py-2 text-sm font-semibold text-emerald-400 hover:text-emerald-300 bg-emerald-500/10 hover:bg-emerald-500/20 rounded transition-colors"
-              title="Download positions as CSV"
-            >
-              <Download size={16} />
-              Export CSV
-            </button>
-          )}
+          <div className="flex flex-wrap items-center gap-4">
+            <p className="flex items-center gap-1.5 text-xs text-text-tertiary whitespace-nowrap">
+              <Clock3 size={14} aria-hidden="true" />
+              <span>Last refreshed</span>
+              <time dateTime={lastUpdated || undefined}>
+                {lastUpdated
+                  ? new Date(lastUpdated).toLocaleTimeString([], {
+                      hour: '2-digit',
+                      minute: '2-digit',
+                      second: '2-digit',
+                    })
+                  : 'Waiting'}
+              </time>
+            </p>
+            {triggeredPositions.length > 0 && (
+              <button
+                onClick={() => exportPositionsCSV(triggeredPositions)}
+                className="flex items-center gap-2 px-3 py-2 text-sm font-semibold text-emerald-400 hover:text-emerald-300 bg-emerald-500/10 hover:bg-emerald-500/20 rounded transition-colors"
+                title="Download positions as CSV"
+              >
+                <Download size={16} />
+                Export CSV
+              </button>
+            )}
+          </div>
         </div>
 
         {dataLoading ? (
@@ -323,6 +407,9 @@ const Positions: React.FC = () => {
                   </th>
                   <th className="px-6 py-3 text-left text-xs font-semibold text-text-secondary uppercase tracking-wider">
                     Quantity
+                  </th>
+                  <th className="px-6 py-3 text-left text-xs font-semibold text-text-secondary uppercase tracking-wider">
+                    Protective SL
                   </th>
                   <th className="px-6 py-3 text-left text-xs font-semibold text-text-secondary uppercase tracking-wider">
                     P&L

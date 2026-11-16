@@ -26,17 +26,14 @@ share `logs` and `data` volumes with the exporter. React's health check probes
 ```
 ┌──────────────────────────────────────────────────────────────────┐
 │                    External Systems                              │
-│  ┌──────────────┐              ┌──────────────┐                │
-│  │  OpenAlgo    │              │    Fyers     │                │
-│  │  Broker API  │              │  Wallet API  │                │
-│  │ :5002        │              │ (optional)   │                │
-│  └──────┬───────┘              └──────┬───────┘                │
-│         │                             │                        │
-│         └─────────────┬───────────────┘                        │
-│                       │                                        │
-│                       │ HTTP                                  │
-└───────────────────────┼──────────────────────────────────────┘
-                        │
+│  ┌──────────────┐                                               │
+│  │  OpenAlgo    │                                               │
+│  │  Broker API  │                                      │
+│  │ :5002        │                                      │
+│  └──────┬───────┘                                               │
+│         │                                                       │
+└─────────┼──────────────────────────────────────────────────────┘
+          │
                         │ (via host.docker.internal)
                         │
            ┌────────────▼──────────────┐
@@ -45,7 +42,6 @@ share `logs` and `data` volumes with the exporter. React's health check probes
            │                           │  - Fetch positions
            │  export_dashboard_        │  - Fetch orders
            │  data.py                  │  - Fetch account funds
-           │                           │  - Fetch wallet (Fyers)
            └────────────┬──────────────┘
                         │
                         │ Write JSON files
@@ -54,8 +50,6 @@ share `logs` and `data` volumes with the exporter. React's health check probes
                 │ Shared Volume  │
                 │ ./logs/        │
                 │ - dashboard_   │
-                │   data.json    │
-                │ - wallet_      │
                 │   data.json    │
                 └───────┬────────┘
                         │
@@ -102,21 +96,20 @@ Dashboard Exporter
 │  ├─ POST /api/v1/positionbook → positions
 │  ├─ POST /api/v1/orderbook → orders
 │  └─ POST /api/v1/funds → account balance
-├─ Optionally polls Fyers wallet API
-└─ Writes JSON to ./logs/dashboard_data.json
-   └─ Format: {account: {...}, positions: [...], orders: [...]}
+├─ Uses OPENALGO_API_KEY and OPENALGO_HOST to read the connected broker account
+├─ Calls the authenticated /api/v1/ping endpoint to identify the active broker
+└─ Writes account, broker name, positions, orders, and funds to dashboard_data.json
 
 React Dashboard (Vite Dev Server)
 ├─ Listens on :3000
 ├─ HMR enabled for live code reload
 ├─ Fetches ./logs/dashboard_data.json every 10s
-├─ Fetches ./logs/wallet_data.json (if available)
 ├─ Displays real-time metrics:
 │  ├─ Net MTM (₹)
 │  ├─ Available Margin (₹)
 │  ├─ Active Trades (#)
 │  └─ Engine Status
-└─ Mode detection: live (Fyers) vs analyzer (OpenAlgo)
+└─ Displays the broker name reported by the configured OpenAlgo instance
 
 Streamlit Interface
 ├─ Listens on :8502
@@ -157,7 +150,6 @@ openalgo_buying_setups/
 │
 ├── logs/                        ← Shared volume (read/write)
 │  ├── dashboard_data.json      ← Current account state
-│  ├── wallet_data.json         ← Fyers wallet (if configured)
 │  ├── *.csv                    ← Trade history, signals
 │  └── *.txt                    ← Monitoring logs
 │

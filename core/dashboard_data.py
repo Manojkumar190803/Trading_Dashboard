@@ -1,11 +1,16 @@
-"""Fetch real account data from OpenAlgo and Fyers for dashboard display."""
+"""Fetch account data from the broker connected to OpenAlgo for dashboard display."""
 
 import json
 import logging
 import os
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 from pathlib import Path
 from typing import Optional
+
+import requests
+from dotenv import load_dotenv
+
+from core import db_sync
 
 logger = logging.getLogger("core.dashboard_data")
 
@@ -110,21 +115,24 @@ class DashboardDataProvider:
 
     def __init__(self, api_key: str, host: str, strategy_tag: str = "HD_Strategy"):
         """Initialize with OpenAlgo credentials."""
+        if not api_key or not api_key.strip() or "YOUR_" in api_key.upper():
+            raise RuntimeError("OPENALGO_API_KEY is missing or is still a placeholder.")
+        if not host or not host.strip():
+            raise RuntimeError("OPENALGO_HOST is missing.")
+
         try:
             from openalgo import api  # type: ignore
-            self.client = api(api_key=api_key, host=host)
+            self.api_key = api_key.strip()
+            self.host = host.strip().rstrip("/")
+            self.client = api(api_key=self.api_key, host=self.host)
             self.strategy_tag = strategy_tag
-            self.available = True
-        except ImportError:
-            logger.warning("openalgo package not installed")
-            self.available = False
-            self.client = None
+        except ImportError as exc:
+            raise RuntimeError(
+                "openalgo package not installed. Install it with `pip install openalgo`."
+            ) from exc
 
     def get_account_summary(self) -> dict:
         """Fetch account summary with balance, P&L, positions, and mode."""
-        if not self.available or not self.client:
-            return self._mock_account_summary()
-
         try:
             data = {
                 "timestamp": datetime.now().isoformat(),
@@ -133,70 +141,107 @@ class DashboardDataProvider:
                 "orders": self._fetch_orders(),
                 "account": self._fetch_account_info(),
             }
+            data["account"]["broker_name"] = self._fetch_broker_name()
             return data
         except Exception as e:
-            logger.error(f"Error fetching account data: {e}")
-            return self._mock_account_summary()
+            logger.exception("Error fetching OpenAlgo account data")
+            raise RuntimeError("Could not fetch account data from OpenAlgo.") from e
+
+    def _fetch_broker_name(self) -> Optional[str]:
+        """Get the active broker identifier from OpenAlgo's authenticated ping."""
+        try:
+            response = requests.post(
+                f"{self.host}/api/v1/ping",
+                json={"apikey": self.api_key},
+                timeout=10,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            broker = payload.get("data", {}).get("broker") if isinstance(payload, dict) else None
+            if payload.get("status") != "success" or not isinstance(broker, str) or not broker.strip():
+                raise ValueError("OpenAlgo ping response did not include a broker name.")
+            return broker.strip()
+        except (requests.RequestException, ValueError, AttributeError) as exc:
+            logger.error("Could not determine the broker connected to OpenAlgo: %s", exc)
+            return None
 
     def _fetch_positions(self) -> list[dict]:
         """Fetch open positions from OpenAlgo."""
         try:
             resp = self.client.positionbook()
-            if resp and "data" in resp:
-                return resp["data"]
-            return []
+            if not isinstance(resp, dict) or "data" not in resp:
+                raise RuntimeError("OpenAlgo returned an invalid position-book response.")
+            return resp["data"]
         except Exception as e:
-            logger.error(f"Error fetching positions: {e}")
-            return []
+            logger.exception("Error fetching positions from OpenAlgo")
+            raise RuntimeError("Could not fetch positions from OpenAlgo.") from e
 
     def _fetch_orders(self) -> list[dict]:
         """Fetch order book from OpenAlgo."""
         try:
             resp = self.client.orderbook()
-            if resp and "data" in resp:
-                return resp["data"]
-            return []
+            if not isinstance(resp, dict) or "data" not in resp:
+                raise RuntimeError("OpenAlgo returned an invalid order-book response.")
+            return resp["data"]
         except Exception as e:
-            logger.error(f"Error fetching orders: {e}")
-            return []
+            logger.exception("Error fetching orders from OpenAlgo")
+            raise RuntimeError("Could not fetch orders from OpenAlgo.") from e
 
     def _fetch_account_info(self) -> dict:
         """Fetch account balance and margin info from OpenAlgo and normalize field names."""
         try:
             resp = self.client.funds()
-            if resp and "data" in resp:
-                data = resp["data"]
-                if isinstance(data, list) and len(data) > 0:
-                    data = data[0]
-                
-                # Transform OpenAlgo field names to standard format
-                # OpenAlgo returns: availablecash, m2munrealized, m2mrealized, utiliseddebits
-                normalized = {
-                    # Available margin = available cash
-                    "availableMargin": self._safe_float(data.get("availablecash")),
-                    "margin": self._safe_float(data.get("availablecash")),
-                    "available_margin": self._safe_float(data.get("availablecash")),
-                    
-                    # MTM = unrealized M2M
-                    "mtm": self._safe_float(data.get("m2munrealized")),
-                    "pnl": self._safe_float(data.get("m2munrealized")),
-                    
-                    # Realized P&L
-                    "realized_pnl": self._safe_float(data.get("m2mrealized")),
-                    "m2mrealized": self._safe_float(data.get("m2mrealized")),
-                    
-                    # Used margin
-                    "used_margin": self._safe_float(data.get("utiliseddebits")),
-                    "utiliseddebits": self._safe_float(data.get("utiliseddebits")),
-                    
-                    # Pass through raw data for debugging
-                    **data
-                }
-                return normalized
-            return {}
+            if not isinstance(resp, dict) or "data" not in resp:
+                raise RuntimeError("OpenAlgo returned an invalid funds response.")
+            data = resp["data"]
+            if isinstance(data, list):
+                if not data:
+                    raise RuntimeError("OpenAlgo returned an empty funds response.")
+                data = data[0]
+            if not isinstance(data, dict):
+                raise RuntimeError("OpenAlgo returned invalid funds data.")
+
+            available_cash = self._first_value(
+                data,
+                "availableMargin",
+                "available_margin",
+                "availablecash",
+                "availableCash",
+                "available_cash",
+                "margin",
+                "cash",
+            )
+            if available_cash is None:
+                raise RuntimeError("OpenAlgo funds response contains no available balance.")
+            cash = self._safe_float(available_cash)
+            unrealized_pnl = self._safe_float(
+                self._first_value(data, "m2munrealized", "m2mUnrealized", "mtm", "pnl")
+            )
+            realized_pnl = self._safe_float(
+                self._first_value(data, "m2mrealized", "m2mRealized", "realized_pnl")
+            )
+            used_margin = self._safe_float(
+                self._first_value(data, "utiliseddebits", "utilisedDebits", "used_margin")
+            )
+
+            normalized = dict(data)
+            normalized.update({
+                "available_balance": cash,
+                "availableMargin": cash,
+                "margin": cash,
+                "available_margin": cash,
+                "mtm": unrealized_pnl,
+                "pnl": unrealized_pnl,
+                "realized_pnl": realized_pnl,
+                "m2mrealized": realized_pnl,
+                "used_margin": used_margin,
+                "utiliseddebits": used_margin,
+                "source": "openalgo",
+            })
+            return normalized
         except Exception as e:
-            logger.error(f"Error fetching account info: {e}")
-            return {}
+            logger.exception("Error fetching funds from OpenAlgo")
+            raise RuntimeError("Could not fetch funds from OpenAlgo.") from e
 
     def _detect_mode(self) -> str:
         """Detect OpenAlgo current mode (live or analyzer).
@@ -246,21 +291,12 @@ class DashboardDataProvider:
         except (ValueError, TypeError):
             return 0.0
 
-    def _mock_account_summary(self) -> dict:
-        """Return mock data when API is unavailable."""
-        return {
-            "timestamp": datetime.now().isoformat(),
-            "mode": self._detect_mode(),  # Include mode in mock data too
-            "positions": [],
-            "orders": [],
-            "account": {
-                "cash": 1000000,
-                "margin": 500000,
-                "used_margin": 0,
-                "pnl": 0,
-                "mtm": 0,
-            },
-        }
+    @staticmethod
+    def _first_value(data: dict, *keys: str) -> object:
+        return next(
+            (data[key] for key in keys if data.get(key) is not None and data[key] != ""),
+            None,
+        )
 
     def write_dashboard_json(self, output_path: Optional[str] = None) -> str:
         """Write account data to JSON file for React dashboard to read."""
@@ -278,90 +314,9 @@ class DashboardDataProvider:
             json.dump(data, f, indent=2)
 
         _write_daily_pnl_snapshot(data, output_path.parent / "daily_pnl.json")
+        db_sync.sync_dashboard_snapshot(data)
 
         logger.info(f"Dashboard data written to {output_path}")
-        return str(output_path)
-
-
-class FyersWalletProvider:
-    """Fetch wallet and balance data from Fyers broker, with OpenAlgo fallback."""
-
-    def __init__(self, fyers_api_key: Optional[str] = None, fyers_access_token: Optional[str] = None, openalgo_client=None):
-        """Initialize with Fyers credentials and optional OpenAlgo fallback."""
-        self.fyers_api_key = fyers_api_key or os.getenv("FYERS_API_KEY")
-        self.fyers_access_token = fyers_access_token or os.getenv("FYERS_ACCESS_TOKEN")
-        self.fyers_available = bool(self.fyers_api_key and self.fyers_access_token and "YOUR_" not in str(self.fyers_api_key))
-        self.openalgo_client = openalgo_client
-
-    def get_wallet_data(self) -> dict:
-        """Fetch wallet balance from Fyers, with OpenAlgo fallback."""
-        # Priority 1: Try Fyers API (live mode)
-        if self.fyers_available:
-            try:
-                from fyers_apiv3 import fyersModel  # type: ignore
-
-                fyers = fyersModel.FyersModel(
-                    client_id=self.fyers_api_key,
-                    token=self.fyers_access_token,
-                    log_path=Path(__file__).parent.parent / "logs",
-                )
-
-                response = fyers.funds()
-                if response and "data" in response:
-                    logger.debug(f"✓ Fetched wallet data from Fyers")
-                    return response["data"]
-            except Exception as e:
-                logger.warning(f"Could not fetch from Fyers, falling back to OpenAlgo: {e}")
-        
-        # Priority 2: Try OpenAlgo API (analyzer mode)
-        if self.openalgo_client:
-            try:
-                resp = self.openalgo_client.funds()
-                if resp and "data" in resp:
-                    data = resp["data"]
-                    if isinstance(data, list) and len(data) > 0:
-                        data = data[0]
-                    logger.debug(f"✓ Fetched wallet data from OpenAlgo (fallback)")
-                    return {
-                        "available_balance": float(data.get("availablecash", 0)),
-                        "utilisedMargin": float(data.get("utiliseddebits", 0)),
-                        "availableMargin": float(data.get("availablecash", 0)),
-                        "pnl": float(data.get("m2munrealized", 0)),
-                    }
-            except Exception as e:
-                logger.warning(f"Could not fetch from OpenAlgo: {e}")
-        
-        # Priority 3: Return mock data
-        logger.debug(f"Using mock wallet data (no live data available)")
-        return self._mock_wallet_data()
-
-    def _mock_wallet_data(self) -> dict:
-        """Return mock wallet data when API is unavailable."""
-        return {
-            "available_balance": 1000000,
-            "utilisedMargin": 0,
-            "availableMargin": 1000000,
-            "pnl": 0,
-            "timestamp": datetime.now().isoformat(),
-        }
-
-    def write_wallet_json(self, output_path: Optional[str] = None) -> str:
-        """Write wallet data to JSON file for React dashboard to read."""
-        if output_path is None:
-            output_path = Path(__file__).parent.parent / "logs" / "wallet_data.json"
-        else:
-            output_path = Path(output_path)
-
-        data = self.get_wallet_data()
-        data["timestamp"] = datetime.now().isoformat()
-
-        # Ensure directory exists
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-
-        with open(output_path, "w") as f:
-            json.dump(data, f, indent=2)
-
-        logger.info(f"Wallet data written to {output_path}")
         return str(output_path)
 
 
@@ -370,25 +325,20 @@ def export_dashboard_data(mode: str = "analyzer") -> dict:
     Export dashboard data based on mode.
     
     Args:
-        mode: "analyzer" (OpenAlgo data) or "live" (Fyers data)
+        mode: Retained for compatibility; all dashboard account data now comes from OpenAlgo.
     
     Returns:
         Dictionary with exported file paths
     """
     result = {}
 
-    # Get OpenAlgo data (always needed for analyzer mode)
-    api_key = os.getenv("OPENALGO_API_KEY", "demo")
-    host = os.getenv("OPENALGO_HOST", "http://localhost:5010")
+    load_dotenv(Path(__file__).parent.parent / ".env")
+    logger.debug("Export requested with compatibility mode %s; using OpenAlgo.", mode)
+    api_key = os.getenv("OPENALGO_API_KEY", "")
+    host = os.getenv("OPENALGO_HOST", "http://127.0.0.1:5002")
     dashboard_provider = DashboardDataProvider(api_key, host)
     dashboard_path = dashboard_provider.write_dashboard_json()
     result["dashboard_data"] = dashboard_path
-
-    # Get Fyers wallet data (for live mode)
-    if mode.lower() == "live":
-        wallet_provider = FyersWalletProvider()
-        wallet_path = wallet_provider.write_wallet_json()
-        result["wallet_data"] = wallet_path
 
     return result
 

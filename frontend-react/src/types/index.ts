@@ -99,6 +99,10 @@ export interface Instrument {
   premiumMaxPrice?: number // Maximum premium price (non-21EMA strategies)
   premiumOptionStrike?: number // ATM strike price for options
   maxInitialRiskPoints?: number // Maximum allowed initial risk in points (default 20, override to 23, 25, etc)
+  partialBookingEnabled?: boolean
+  partialBookingRR?: number
+  partialBookingLots?: number
+  partialBookingIntervalRR?: number
 }
 
 export interface TrailingStopsConfig {

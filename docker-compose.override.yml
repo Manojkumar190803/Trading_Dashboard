@@ -50,17 +50,3 @@ services:
       PYTHONUNBUFFERED: 1
 
     restart: on-failure:3
-
-  streamlit_interface:
-    # Mount local frontend code
-    volumes:
-      - ./frontend:/app/frontend
-      - ./logs:/app/logs
-      - ./data:/app/data
-    
-    environment:
-      STREAMLIT_SERVER_RUNONSAVE: "true"
-      STREAMLIT_CLIENT_LOGGER_LEVEL: "debug"
-      LOG_LEVEL: DEBUG
-    
-    restart: on-failure:3

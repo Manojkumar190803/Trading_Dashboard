@@ -1,71 +1,70 @@
-import { useState, useEffect } from 'react'
 import { TrendingUp, BarChart3, Activity, Zap } from 'lucide-react'
 import clsx from 'clsx'
 import {
   MetricCard,
 } from '@/components/UI'
-import { useRealAccountData, useRealWalletData } from '@/hooks'
+import { useRealAccountData } from '@/hooks'
 import {
   formatCurrency,
   getStatusColor,
 } from '@/utils/format'
 
+const getAccountAmount = (account: Record<string, unknown>, keys: string[]): number => {
+  for (const key of keys) {
+    const value = account[key]
+    if (value === null || value === undefined || value === '') continue
+    const amount = Number(value)
+    if (Number.isFinite(amount)) return amount
+  }
+  return 0
+}
+
+const getBrokerDisplayName = (brokerName: unknown): string => {
+  if (typeof brokerName !== 'string' || !brokerName.trim()) return 'Broker unavailable'
+
+  const broker = brokerName.trim().toLowerCase()
+  const knownBrokerNames: Record<string, string> = {
+    '5paisa': '5paisa',
+    aliceblue: 'AliceBlue',
+    angel: 'Angel One',
+    angelone: 'Angel One',
+    dhan: 'Dhan',
+    fyers: 'Fyers',
+    groww: 'Groww',
+    kotak: 'Kotak',
+    upstox: 'Upstox',
+    zerodha: 'Zerodha',
+  }
+
+  return knownBrokerNames[broker] ?? broker.replace(/[_-]+/g, ' ').replace(/\b\w/g, (letter) => letter.toUpperCase())
+}
+
 const Dashboard: React.FC = () => {
-  // Fetch real OpenAlgo data (analyzer mode) - poll every 1 second for live updates
-  const { data: accountData, isLoading: accountLoading } = useRealAccountData(true, 1000)
-  
-  // Fetch real Fyers wallet data (live mode) - poll every 1 second for live updates
-  const { wallet: walletData, isLoading: walletLoading } = useRealWalletData(true, 1000)
-  
-  const [mode, setMode] = useState<'analyzer' | 'live'>('analyzer')
-  const [metrics, setMetrics] = useState({
-    net_mtm: 0,
-    available_margin: 50000,
-    active_trades: 0,
-    engine_status: 'Ready' as const,
-  })
-
-  // Detect mode based on available data - prioritize live over analyzer
-  useEffect(() => {
-    let newMode: 'analyzer' | 'live' = 'analyzer'
-    
-    // Priority: Live mode (wallet) > Analyzer mode (account) > Mock
-    if (walletData) {
-      newMode = 'live'
-    } else if (accountData) {
-      newMode = 'analyzer'
-    }
-    
-    setMode(newMode)
-    console.log(`[Mode] Switched to: ${newMode} (wallet=${!!walletData}, account=${!!accountData})`)
-  }, [accountData, walletData])
-
-  // Update metrics from real data when available
-  useEffect(() => {
-    if (mode === 'live' && walletData) {
-      // Live mode: Use Fyers wallet data
-      setMetrics({
-        net_mtm: walletData.pnl,
-        available_margin: walletData.available_balance,
-        active_trades: 0, // Would need positions data
-        engine_status: 'Ready',
-      })
-    } else if (accountData?.account) {
-      // Analyzer mode: Use OpenAlgo account data
-      const account = accountData.account
-      const positions = accountData.positions || []
-      const activeTrades = positions.filter((p: any) => parseFloat(p.qty || p.quantity || 0) !== 0).length
-      
-      setMetrics({
-        // Try multiple field names for MTM (OpenAlgo may return different fields)
-        net_mtm: parseFloat(account.mtm || account.pnl || account.m2munrealized || 0),
-        // Try multiple field names for available margin
-        available_margin: parseFloat(account.availableMargin || account.margin || account.available_margin || account.availablecash || 50000),
-        active_trades: activeTrades,
-        engine_status: 'Ready',
-      })
-    }
-  }, [mode, accountData, walletData, accountLoading, walletLoading])
+  const { data: accountData, isLoading: accountLoading, error: accountError } = useRealAccountData(true, 1000)
+  const account = accountData?.account ?? {}
+  const brokerName = getBrokerDisplayName(account.broker_name)
+  const positions = accountData?.positions ?? []
+  const metrics = {
+    net_mtm: getAccountAmount(account, ['mtm', 'm2munrealized', 'pnl']),
+    available_margin: getAccountAmount(account, [
+      'availableMargin',
+      'available_margin',
+      'availablecash',
+      'availableCash',
+      'margin',
+      'cash',
+    ]),
+    active_trades: positions.filter(
+      (position: any) => Number(position.qty ?? position.quantity ?? 0) !== 0
+    ).length,
+    engine_status: accountError
+      ? 'Unavailable'
+      : accountData
+        ? 'Ready'
+        : accountLoading
+          ? 'Connecting'
+          : 'Unavailable',
+  }
 
   const statusColor = getStatusColor(metrics.engine_status)
   const isProfit = metrics.net_mtm >= 0
@@ -118,7 +117,22 @@ const Dashboard: React.FC = () => {
           <MetricCard
             label="Available Margin"
             value={formatCurrency(metrics.available_margin)}
-            sublabel="Buying Power"
+            sublabel={
+              <span
+                className="inline-flex items-center gap-1.5"
+                aria-label={brokerName === 'Broker unavailable' ? brokerName : `Connected to ${brokerName}`}
+                title={brokerName === 'Broker unavailable' ? brokerName : `Connected to ${brokerName}`}
+              >
+                <span
+                  className={clsx(
+                    'h-1.5 w-1.5 rounded-full',
+                    brokerName === 'Broker unavailable' ? 'bg-text-tertiary' : 'bg-accent-green'
+                  )}
+                  aria-hidden="true"
+                />
+                {brokerName === 'Broker unavailable' ? brokerName : `Connected to ${brokerName}`}
+              </span>
+            }
             icon={<BarChart3 size={16} />}
             color="cyan"
           />

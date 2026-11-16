@@ -203,6 +203,28 @@ def _env_float(name: str, default: float) -> float:
     return default if value is None or not value.strip() else float(value)
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _apply_partial_booking_policy(cfg: StrategyConfig) -> None:
+    cfg.partial_booking_enabled = _env_bool(
+        "PARTIAL_BOOKING_ENABLED", cfg.partial_booking_enabled
+    )
+    cfg.partial_booking_lots = _env_int(
+        "PARTIAL_BOOKING_LOTS", cfg.partial_booking_lots
+    )
+    cfg.t2_rr = _env_float("PARTIAL_BOOKING_RR", cfg.t2_rr)
+    cfg.partial_booking_interval_rr = _env_float(
+        "PARTIAL_BOOKING_INTERVAL_RR", cfg.partial_booking_interval_rr
+    )
+    if cfg.partial_booking_lots < 1 or cfg.t2_rr <= 0 or cfg.partial_booking_interval_rr <= 0:
+        raise ValueError("Partial booking lots, RR, and interval must be greater than zero")
+
+
 def _env_time(name: str, default: str):
     from datetime import time
 
@@ -421,6 +443,7 @@ def _run_multi_script_live(
             _apply_ema21_expiry_policy(cfg, script)
         elif strategy_name.lower() == "hd":
             _apply_hd_policy(cfg)
+        _apply_partial_booking_policy(cfg)
         
         # Apply manual overrides
         if args.symbol:
@@ -558,6 +581,7 @@ def _run_single_script(args: argparse.Namespace) -> None:
             cfg.timeframe_minutes = args.timeframe
         if args.max_risk is not None:
             cfg.max_option_risk_points = args.max_risk
+    _apply_partial_booking_policy(cfg)
 
     risk = RiskConfig()
     if "ema21" in strategy_names:
