@@ -3,7 +3,8 @@ import clsx from 'clsx'
 import {
   MetricCard,
 } from '@/components/UI'
-import { useRealAccountData } from '@/hooks'
+import ExecutionModeBadge from '@/components/ExecutionModeBadge'
+import { useRealAccountData, useTestTradingActivity } from '@/hooks'
 import {
   formatCurrency,
   getStatusColor,
@@ -40,7 +41,8 @@ const getBrokerDisplayName = (brokerName: unknown): string => {
 }
 
 const Dashboard: React.FC = () => {
-  const { data: accountData, isLoading: accountLoading, error: accountError } = useRealAccountData(true, 1000)
+  const { data: accountData, isLoading: accountLoading, error: accountError, lastUpdated } = useRealAccountData(true)
+  const { data: testActivity } = useTestTradingActivity()
   const account = accountData?.account ?? {}
   const brokerName = getBrokerDisplayName(account.broker_name)
   const positions = accountData?.positions ?? []
@@ -70,14 +72,6 @@ const Dashboard: React.FC = () => {
   const isProfit = metrics.net_mtm >= 0
   const mtmColor = isProfit ? 'green' : 'red'
 
-  // Get current time for last sync display
-  const lastSyncTime = new Date().toLocaleTimeString('en-IN', {
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit',
-    hour12: false,
-  })
-
   return (
     <div className="space-y-8">
       {/* Hero Section with Clean Design */}
@@ -85,9 +79,6 @@ const Dashboard: React.FC = () => {
         {/* Header */}
         <div className="flex items-start justify-between">
           <div>
-            <p className="text-xs uppercase tracking-widest text-text-tertiary font-semibold mb-2">
-              Live Control Room
-            </p>
             <h1 className="text-4xl font-bold text-text-primary mb-2">Trading Dashboard</h1>
             <p className="text-text-secondary">
               Live overview of your trading account and market positions
@@ -107,7 +98,7 @@ const Dashboard: React.FC = () => {
         {/* Metrics Grid - Only 4 Essential Cards */}
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
           <MetricCard
-            label="Net MTM (₹)"
+            label="Live Net MTM (₹)"
             value={formatCurrency(metrics.net_mtm)}
             sublabel="Mark to Market"
             icon={<TrendingUp size={16} />}
@@ -137,7 +128,7 @@ const Dashboard: React.FC = () => {
             color="cyan"
           />
           <MetricCard
-            label="Active Trades"
+            label="Live Positions"
             value={metrics.active_trades}
             sublabel="Open Positions"
             icon={<Activity size={16} />}
@@ -154,9 +145,64 @@ const Dashboard: React.FC = () => {
 
         {/* Sync Status Footer */}
         <div className="text-sm text-text-secondary">
-          Live account syncing every 1s · Last updated: {lastSyncTime} IST
+          {lastUpdated
+            ? `Account data · Last update: ${new Date(lastUpdated).toLocaleTimeString('en-IN')}`
+            : accountLoading
+              ? 'Connecting to account data'
+              : 'Account data unavailable'}
         </div>
       </div>
+
+      <section className="space-y-4 border-t border-bg-tertiary pt-6">
+        <div className="flex items-center gap-3">
+          <ExecutionModeBadge mode="TEST" />
+          <h2 className="text-lg font-semibold text-text-primary">Test Activity</h2>
+        </div>
+        <div className="grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-4">
+          <MetricCard
+            label="Open Test Positions"
+            value={testActivity.summary.open_positions}
+            sublabel="Virtual positions"
+            icon={<Activity size={16} />}
+            color="yellow"
+          />
+          <MetricCard
+            label="Test Open P&L"
+            value={formatCurrency(testActivity.summary.open_pnl)}
+            sublabel="Unrealized"
+            icon={<TrendingUp size={16} />}
+            color={testActivity.summary.open_pnl >= 0 ? 'green' : 'red'}
+          />
+          <MetricCard
+            label="Test Realized P&L"
+            value={formatCurrency(testActivity.summary.realized_pnl)}
+            sublabel="Closed virtual trades"
+            icon={<BarChart3 size={16} />}
+            color={testActivity.summary.realized_pnl >= 0 ? 'green' : 'red'}
+          />
+          <MetricCard
+            label="Test Trades"
+            value={testActivity.summary.completed_trades}
+            sublabel="Completed virtual trades"
+            icon={<Zap size={16} />}
+            color="cyan"
+          />
+        </div>
+        <div className="divide-y divide-bg-tertiary rounded-md border border-bg-tertiary">
+          {testActivity.alerts.length === 0 ? (
+            <p className="px-4 py-3 text-sm text-text-secondary">No Test signals or events yet.</p>
+          ) : testActivity.alerts.slice(0, 5).map((alert) => (
+            <div key={alert.id} className="flex flex-wrap items-center gap-3 px-4 py-3">
+              <span className="font-mono text-xs text-text-tertiary">
+                {new Date(alert.timestamp).toLocaleTimeString()}
+              </span>
+              <span className="rounded bg-amber-300 px-2 py-0.5 text-[10px] font-black text-black">TEST</span>
+              <span className="text-xs font-semibold text-amber-300">{alert.category}</span>
+              <span className="min-w-0 flex-1 text-sm text-text-primary">{alert.message}</span>
+            </div>
+          ))}
+        </div>
+      </section>
     </div>
   )
 }

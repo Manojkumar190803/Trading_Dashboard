@@ -18,6 +18,8 @@ interface InstrumentPayload {
   partialBookingRR: number
   partialBookingLots: number
   partialBookingIntervalRR: number
+  maxLosingTradesPerDay: number
+  executionMode: 'LIVE' | 'TEST'
   status?: string
 }
 
@@ -56,6 +58,8 @@ export const useInstruments = (includeArchived = false) => {
         partialBookingRR: inst.partialBookingRR ?? inst.partial_booking_rr ?? 2.0,
         partialBookingLots: inst.partialBookingLots ?? inst.partial_booking_lots ?? 1,
         partialBookingIntervalRR: inst.partialBookingIntervalRR ?? inst.partial_booking_interval_rr ?? 0.5,
+        maxLosingTradesPerDay: inst.maxLosingTradesPerDay ?? inst.max_losing_trades_per_day ?? 3,
+        executionMode: inst.executionMode === 'TEST' || inst.execution_mode === 'TEST' ? 'TEST' : 'LIVE',
         premiumOptionStrike: inst.premiumOptionStrike || inst.premium_option_strike,
         createdAt: inst.createdAt || inst.created_at,
         updatedAt: inst.updatedAt || inst.updated_at,
@@ -100,6 +104,8 @@ export const useInstruments = (includeArchived = false) => {
           partialBookingRR: formData.partialBookingRR,
           partialBookingLots: formData.partialBookingLots,
           partialBookingIntervalRR: formData.partialBookingIntervalRR,
+          maxLosingTradesPerDay: formData.maxLosingTradesPerDay,
+          executionMode: formData.executionMode,
         }),
       })
       
@@ -137,6 +143,8 @@ export const useInstruments = (includeArchived = false) => {
               partialBookingRR: formData.partialBookingRR,
               partialBookingLots: formData.partialBookingLots,
               partialBookingIntervalRR: formData.partialBookingIntervalRR,
+              maxLosingTradesPerDay: formData.maxLosingTradesPerDay,
+              executionMode: formData.executionMode,
               status: 'ACTIVE',
             }),
           })
@@ -179,6 +187,8 @@ export const useInstruments = (includeArchived = false) => {
           partialBookingRR: formData.partialBookingRR,
           partialBookingLots: formData.partialBookingLots,
           partialBookingIntervalRR: formData.partialBookingIntervalRR,
+          maxLosingTradesPerDay: formData.maxLosingTradesPerDay,
+          executionMode: formData.executionMode,
         }),
       })
       

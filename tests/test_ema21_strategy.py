@@ -630,17 +630,17 @@ def test_ema21_warmup_can_preserve_setup_for_next_closed_candle():
     assert provider.generate_signal("CE", state, first_red, setup) == Signal.BUY_CE
 
 
-def test_ema21_preserves_setup_when_daily_entry_cap_rejects_signal():
+def test_ema21_preserves_setup_when_daily_loss_cap_rejects_signal():
     provider = EMA21SignalProvider()
     engine = BaseStrategyEngine(
-        StrategyConfig(max_option_risk_points=20.0),
+        StrategyConfig(max_option_risk_points=20.0, max_losing_trades_per_day=1),
         RiskConfig(max_sl_per_day=3),
         HistoricalReplayBroker(),
         provider,
     )
     engine.state.trading_day = datetime(2026, 8, 10).date()
     engine.state.atm_locked = True
-    engine.total_entries = engine.cfg.max_trades_per_day
+    engine.state.losing_trades_today = engine.cfg.max_losing_trades_per_day
     engine.state.ce = provider.create_side_state()
     engine.state.ce.option_symbol = "NIFTY12AUG2625000CE"
 
@@ -654,8 +654,51 @@ def test_ema21_preserves_setup_when_daily_entry_cap_rejects_signal():
     state = engine.state.ce
     assert state.entry_ready is True
     assert state.first_red_high == 108.0
-    assert state.entry_block_reason == "daily-filled-entry-cap"
+    assert state.entry_block_reason == "daily-losing-trade-cap"
     assert provider.format_setup_status(state).startswith("ENTRY_BLOCKED")
+
+
+def test_partial_trade_pnl_counts_only_final_net_loss():
+    provider = EMA21SignalProvider()
+    engine = BaseStrategyEngine(
+        StrategyConfig(max_losing_trades_per_day=2),
+        RiskConfig(max_sl_per_day=3),
+        HistoricalReplayBroker(),
+        provider,
+    )
+    position = Position(
+        option_symbol="NIFTY12AUG2625000CE",
+        option_type="CE",
+        quantity=2,
+        initial_quantity=2,
+        entry_price=100.0,
+        entry_time=datetime(2026, 8, 10, 9, 30),
+        option_stop_level=90.0,
+        option_entry_trigger=101.0,
+        option_risk_points=10.0,
+    )
+
+    engine._record_trade_exit_pnl(position, datetime(2026, 8, 10).date(), -5.0, False)
+    assert engine.state.losing_trades_today == 0
+    engine._record_trade_exit_pnl(position, datetime(2026, 8, 10).date(), 8.0, True)
+    assert position.realized_pnl == 3.0
+    assert engine.state.losing_trades_today == 0
+
+    second_position = Position(
+        option_symbol="NIFTY12AUG2625000PE",
+        option_type="PE",
+        quantity=2,
+        initial_quantity=2,
+        entry_price=100.0,
+        entry_time=datetime(2026, 8, 10, 10, 30),
+        option_stop_level=90.0,
+        option_entry_trigger=101.0,
+        option_risk_points=10.0,
+    )
+    engine._record_trade_exit_pnl(second_position, datetime(2026, 8, 10).date(), 4.0, False)
+    engine._record_trade_exit_pnl(second_position, datetime(2026, 8, 10).date(), -7.0, True)
+    assert second_position.realized_pnl == -3.0
+    assert engine.state.losing_trades_today == 1
 
 
 def test_ema21_does_not_reenter_after_same_candle_position_exit():

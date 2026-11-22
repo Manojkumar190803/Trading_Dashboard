@@ -36,6 +36,9 @@ cp .env.example .env  # Add your OpenAlgo credentials
 # Backtest
 python3 run_strategy.py --script NIFTY --strategy hd --mode backtest --start 2026-08-01 --end 2026-08-07
 
+# HD spot-signal report (tabular output only; no output files)
+python3 demo_hd_signal_backtest.py --start-date 2026-08-01 --end-date 2026-08-07
+
 # Paper trading (dry run, real data)
 python3 run_strategy.py --script BANKNIFTY --strategy cd --mode paper
 
@@ -226,13 +229,9 @@ record_trade(
 )
 ```
 
-### For Detailed Documentation
-📖 **See [DATABASE.md](DATABASE.md)** for:
-- Complete schema definitions with all columns and constraints
-- Connection configuration and networking setup
-- API reference with example responses
-- Troubleshooting guide
-- Data persistence and backup procedures
+For dashboard pages, instrument configuration, and the API/data flow, see
+[DASHBOARD.md](DASHBOARD.md). Database models are defined in
+[`core/db_models.py`](core/db_models.py).
 
 ---
 
@@ -240,7 +239,7 @@ record_trade(
 
 ```env
 # Database (PostgreSQL)
-DB_URL=postgresql://astro:astro@host.docker.internal:5432/TRADING_SETUPS
+DB_URL=postgresql://USER:PASSWORD@host.docker.internal:5432/DATABASE
 
 # OpenAlgo
 OPENALGO_API_KEY=your_api_key
@@ -275,20 +274,17 @@ python3 -m pytest tests/ -v
 ## Docker
 
 ```bash
-# Run intraday live for NIFTY and SENSEX in parallel.
+# Start the dashboard-managed services and active instruments.
 docker compose up -d
 
-# Follow logs for all live services
+# Follow logs for all services
 docker compose logs -f
 
-# Follow logs for one script
-docker compose logs -f live_nifty
+# Follow dashboard-managed strategy processes
+docker compose logs -f strategy_daemon
 
-# Restart only one script service
-docker compose restart live_nifty
-
-# Run a single script service (if needed)
-docker compose up -d live_nifty
+# Inspect per-instrument process status
+cat logs/strategies_status.json
 
 # Stop
 docker compose down
@@ -297,7 +293,7 @@ docker compose down
 ### Dashboard-Managed Docker Trading
 
 In the Compose deployment, `strategy_worker` runs the Flask API only. The
-`hd_strategy_daemon` service (a legacy service name) polls the API and starts
+`strategy_daemon` service polls the API and starts
 individual strategy runners for instruments whose dashboard status is
 `ACTIVE`; inactive and archived rows are excluded. Compose clears
 `STRATEGY_FILTER`, so all strategy types are eligible. The worker's image-level
@@ -314,8 +310,8 @@ tables without replacing their rows. Instrument API handlers close sessions and
 roll back failed writes to avoid SQLAlchemy pool exhaustion. The React container
 health check probes `127.0.0.1:3000`.
 
-See [DOCKER_GUIDE.md](DOCKER_GUIDE.md) for operating steps and
-[DOCKER_ARCHITECTURE.md](DOCKER_ARCHITECTURE.md) for service/data flow.
+See [DOCKER.md](DOCKER.md) for Compose setup and service/data flow, and
+[DASHBOARD.md](DASHBOARD.md) for dashboard pages and instrument configuration.
 
 ---
 

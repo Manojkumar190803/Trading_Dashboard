@@ -3,6 +3,7 @@ import { useLocation, Link } from 'react-router-dom'
 import { Menu, X, TrendingUp, Wallet, BookOpen, BarChart3, Terminal, LayoutDashboard, Package, Moon, Sun } from 'lucide-react'
 import { clsx } from 'clsx'
 import { useAppStore } from '@/stores'
+import { useCurrentTime } from '@/hooks'
 
 interface LayoutProps {
   children: ReactNode
@@ -19,6 +20,7 @@ const Layout: React.FC<LayoutProps> = ({ children }) => {
   const location = useLocation()
   const [sidebarOpen, setSidebarOpen] = useState(true)
   const { setCurrentPage, theme, toggleTheme } = useAppStore()
+  const currentTime = useCurrentTime()
 
   const navItems: NavItem[] = [
     { path: '/', label: 'Dashboard', icon: <LayoutDashboard size={20} /> },
@@ -194,7 +196,7 @@ const Layout: React.FC<LayoutProps> = ({ children }) => {
               <div className="text-right">
                 <p className="text-xs text-text-tertiary light:text-slate-600">Last Updated</p>
                 <p className="text-sm font-mono text-accent-cyan light:text-blue-600">
-                  {new Date().toLocaleTimeString('en-IN', {
+                  {currentTime.toLocaleTimeString('en-IN', {
                     hour: '2-digit',
                     minute: '2-digit',
                     second: '2-digit',

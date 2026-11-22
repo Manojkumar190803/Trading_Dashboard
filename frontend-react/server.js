@@ -25,6 +25,39 @@ if (!fs.existsSync(LOGS_DIR)) {
 
 app.use(express.json())
 
+const dashboardClients = new Set()
+const dashboardFileWatcher = fs.watch(LOGS_DIR, (eventType, filename) => {
+  if (!filename || path.basename(filename.toString()) !== 'dashboard_data.json') return
+  let content
+  try {
+    content = JSON.stringify(JSON.parse(fs.readFileSync(path.join(LOGS_DIR, 'dashboard_data.json'), 'utf8')))
+  } catch {
+    return
+  }
+  for (const client of dashboardClients) client.write(`data: ${content}\n\n`)
+})
+dashboardFileWatcher.on('error', (error) => console.error('Dashboard file watcher error:', error))
+
+app.get('/dashboard-stream', (req, res) => {
+  res.setHeader('Content-Type', 'text/event-stream')
+  res.setHeader('Cache-Control', 'no-cache, no-transform')
+  res.setHeader('Connection', 'keep-alive')
+  res.flushHeaders()
+  dashboardClients.add(res)
+
+  const dashboardFile = path.join(LOGS_DIR, 'dashboard_data.json')
+  if (fs.existsSync(dashboardFile)) {
+    const snapshot = JSON.stringify(JSON.parse(fs.readFileSync(dashboardFile, 'utf8')))
+    res.write(`data: ${snapshot}\n\n`)
+  }
+
+  const heartbeat = setInterval(() => res.write(': heartbeat\n\n'), 30000)
+  req.on('close', () => {
+    clearInterval(heartbeat)
+    dashboardClients.delete(res)
+  })
+})
+
 // CORS middleware - handle preflight requests and set CORS headers on all responses
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*')
@@ -219,6 +252,7 @@ app.post('/api/instruments/export', (req, res) => {
         calculatedLotSize: inst.calculatedLotSize,
         lotSizeAdjustment: inst.lotSizeAdjustment,
         entryCutoffTime: inst.entryCutoffTime,
+        executionMode: inst.executionMode || 'LIVE',
         monitoringStartTime: inst.monitoringStartTime,
         monitoringEndTime: inst.monitoringEndTime,
       }))

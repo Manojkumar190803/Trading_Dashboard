@@ -11,7 +11,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
-from core.broker import OpenAlgoBroker
+from core.broker import OpenAlgoBroker, TestTradingBroker
 from core.engine import BaseStrategyEngine
 from core.indicators import add_indicators
 from core.models import RiskConfig, StrategyConfig
@@ -248,7 +248,10 @@ def _apply_ema21_policy(cfg: StrategyConfig, script: str) -> None:
         cfg.max_option_risk_points = 25.0
     else:
         cfg.max_option_risk_points = _env_float("EMA21_MAX_OPTION_RISK_POINTS", 20.0)
-    cfg.max_trades_per_day = _env_int("EMA21_MAX_TRADES_PER_DAY", 3)
+    cfg.max_losing_trades_per_day = _env_int(
+        "MAX_LOSING_TRADES_PER_DAY",
+        _env_int("EMA21_MAX_TRADES_PER_DAY", 3),
+    )
     cfg.full_size_lots = _env_int("EMA21_FULL_SIZE_LOTS", 2)
     cfg.half_size_lots = _env_int("EMA21_HALF_SIZE_LOTS", 1)
     preferences_path = Path("logs") / "dashboard_preferences.json"
@@ -267,6 +270,58 @@ def _apply_ema21_policy(cfg: StrategyConfig, script: str) -> None:
     cfg.entry_limit_buffer_points = _env_float("EMA21_ENTRY_LIMIT_BUFFER_POINTS", 0.5)
     cfg.stop_buffer_points = _env_float("EMA21_PROTECTIVE_SL_BUFFER_POINTS", 0.0)
     cfg.option_tick_size = _env_float("EMA21_OPTION_TICK_SIZE", 0.05)
+    _apply_dashboard_ema21_overrides(cfg)
+
+
+def _apply_dashboard_ema21_overrides(cfg: StrategyConfig) -> None:
+    start_value = os.getenv("DASHBOARD_EMA21_MONITORING_START_TIME")
+    end_value = os.getenv("DASHBOARD_EMA21_MONITORING_END_TIME")
+    cutoff_value = os.getenv("DASHBOARD_EMA21_ENTRY_CUTOFF")
+    if start_value is not None or end_value is not None or cutoff_value is not None:
+        from datetime import time
+
+        start = _env_time(
+            "DASHBOARD_EMA21_MONITORING_START_TIME",
+            cfg.market_open.strftime("%H:%M"),
+        )
+        end = _env_time(
+            "DASHBOARD_EMA21_MONITORING_END_TIME",
+            cfg.market_close.strftime("%H:%M"),
+        )
+        cutoff = _env_time(
+            "DASHBOARD_EMA21_ENTRY_CUTOFF",
+            cfg.entry_cutoff.strftime("%H:%M"),
+        )
+        if start >= end:
+            raise ValueError("Dashboard EMA21 monitoring start must be earlier than end")
+        if not start <= cutoff <= end:
+            raise ValueError("Dashboard EMA21 entry cutoff must be within monitoring times")
+
+        cfg.market_open = start
+        cfg.entry_start = start
+        cfg.atm_lock_time = max(cfg.atm_lock_time, start, time(9, 20))
+        cfg.market_close = end
+        # A dashboard schedule may bring square-off earlier, but not delay it.
+        cfg.force_square_off = min(cfg.force_square_off, end)
+        cfg.entry_cutoff = cutoff
+        cfg.signal_cutoff = cutoff
+
+    dashboard_lots = os.getenv("DASHBOARD_EMA21_FULL_SIZE_LOTS")
+    if dashboard_lots is not None:
+        lots = _env_int("DASHBOARD_EMA21_FULL_SIZE_LOTS", cfg.full_size_lots)
+        if lots < 1:
+            raise ValueError("Dashboard EMA21 lot size adjustment must be a positive integer")
+        cfg.full_size_lots = lots
+
+    dashboard_risk = os.getenv("DASHBOARD_EMA21_MAX_OPTION_RISK_POINTS")
+    if dashboard_risk is not None:
+        risk_points = _env_float(
+            "DASHBOARD_EMA21_MAX_OPTION_RISK_POINTS",
+            cfg.max_option_risk_points,
+        )
+        if risk_points <= 0:
+            raise ValueError("Dashboard EMA21 maximum initial risk must be greater than zero")
+        cfg.max_option_risk_points = risk_points
 
 
 def _apply_hd_policy(cfg: StrategyConfig) -> None:
@@ -325,6 +380,20 @@ def _build_broker(cfg: StrategyConfig, dry_run: bool) -> OpenAlgoBroker:
         f"ws://{os.getenv('WEBSOCKET_HOST', '127.0.0.1')}:"
         f"{os.getenv('WEBSOCKET_PORT', '8765')}"
     )
+    broker_args = {
+        "api_key": api_key,
+        "host": host,
+        "ws_url": ws_url,
+        "strategy_tag": os.getenv("STRATEGY_NAME", "Strategy"),
+        "product": os.getenv("PRODUCT", "MIS"),
+        "exchange_options": cfg.exchange_options,
+    }
+    if os.getenv("INSTRUMENT_EXECUTION_MODE", "LIVE").strip().upper() == "TEST":
+        return TestTradingBroker(
+            **broker_args,
+            instrument_id=os.getenv("INSTRUMENT_ID", "default"),
+            instrument_name=os.getenv("INSTRUMENT_NAME", cfg.option_index_symbol),
+        )
     return OpenAlgoBroker(
         api_key=api_key,
         host=host,
@@ -382,7 +451,14 @@ def _run_live(cfg: StrategyConfig, risk: RiskConfig, signal_provider: SignalProv
     engine.persist_alerts = True
     engine.diagnose = diagnose
     engine.verbose = verbose
-    print("[ORDER ROUTING] " + ("PAPER mode: orders are simulated" if dry_run else "LIVE mode: orders will be sent to OpenAlgo"))
+    execution_mode = os.getenv("INSTRUMENT_EXECUTION_MODE", "LIVE").strip().upper()
+    routing_message = (
+        "TEST mode: orders are virtual; OpenAlgo is used for market data only"
+        if execution_mode == "TEST"
+        else "PAPER mode: orders are simulated" if dry_run
+        else "LIVE mode: orders will be sent to OpenAlgo"
+    )
+    print(f"[ORDER ROUTING] {routing_message}")
     runner = LiveFeedRunner(engine, broker, cfg)
     try:
         runner.run_forever()
@@ -443,6 +519,10 @@ def _run_multi_script_live(
             _apply_ema21_expiry_policy(cfg, script)
         elif strategy_name.lower() == "hd":
             _apply_hd_policy(cfg)
+        cfg.max_losing_trades_per_day = _env_int(
+            "MAX_LOSING_TRADES_PER_DAY",
+            cfg.max_losing_trades_per_day,
+        )
         _apply_partial_booking_policy(cfg)
         
         # Apply manual overrides
@@ -572,6 +652,10 @@ def _run_single_script(args: argparse.Namespace) -> None:
     strategy_names = [s.strip() for s in args.strategy.split(",")]
     if "hd" in [name.lower() for name in strategy_names]:
         _apply_hd_policy(cfg)
+    cfg.max_losing_trades_per_day = _env_int(
+        "MAX_LOSING_TRADES_PER_DAY",
+        cfg.max_losing_trades_per_day,
+    )
 
     if "ema21" in strategy_names:
         # EMA21 timing and risk policy is configured through EMA21_* in .env.

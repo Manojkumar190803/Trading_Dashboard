@@ -103,6 +103,79 @@ export interface Instrument {
   partialBookingRR?: number
   partialBookingLots?: number
   partialBookingIntervalRR?: number
+  maxLosingTradesPerDay: number
+  executionMode: 'LIVE' | 'TEST'
+}
+
+export interface TestPosition {
+  symbol: string
+  quantity: number
+  average_price: number
+  ltp: number
+  unrealized_pnl: number
+  protective_sl?: number | null
+  instrument_id: string
+  instrument_name: string
+  strategy: string
+  execution_mode: 'TEST'
+}
+
+export interface TestOrder {
+  orderid: string
+  symbol: string
+  action: 'BUY' | 'SELL'
+  quantity: number
+  pricetype: string
+  price: number
+  trigger_price: number
+  order_status: string
+  filled_quantity: number
+  average_price?: number | null
+  timestamp: string
+  execution_mode: 'TEST'
+  instrument_name: string
+  strategy: string
+}
+
+export interface TestTrade {
+  id: string
+  symbol: string
+  entry_time: string
+  exit_time: string
+  entry_price: number
+  exit_price: number
+  quantity: number
+  pnl: number
+  status: string
+  execution_mode: 'TEST'
+  instrument_name: string
+  strategy: string
+}
+
+export interface TestAlert {
+  id: string
+  timestamp: string
+  execution_mode: 'TEST'
+  instrument_name: string
+  strategy: string
+  category: string
+  message: string
+}
+
+export interface TestTradingActivity {
+  execution_mode: 'TEST'
+  positions: TestPosition[]
+  orders: TestOrder[]
+  trades: TestTrade[]
+  alerts: TestAlert[]
+  summary: {
+    open_positions: number
+    open_pnl: number
+    realized_pnl: number
+    net_pnl: number
+    completed_trades: number
+    updated_at: string
+  }
 }
 
 export interface TrailingStopsConfig {

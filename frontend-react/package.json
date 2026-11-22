@@ -9,6 +9,7 @@
     "preview": "vite preview",
     "lint": "eslint src --ext ts,tsx",
     "type-check": "tsc --noEmit",
+    "test": "node --test tests/*.test.js",
     "server": "node server.js"
   },
   "dependencies": {

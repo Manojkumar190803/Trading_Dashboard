@@ -8,14 +8,19 @@ import {
   Badge,
   MetricCard,
 } from '@/components/UI'
-import { useRealAccountData } from '@/hooks'
+import ExecutionModeBadge from '@/components/ExecutionModeBadge'
+import { useCurrentTime, useRealAccountData, useTestTradingActivity } from '@/hooks'
 import { formatCurrency, formatTime } from '@/utils/format'
 import { exportExecutionLogCSV, exportOrdersCSV } from '@/utils/csv-export'
 import { clsx } from 'clsx'
 
 const Orderbook: React.FC = () => {
-  // Fetch real OpenAlgo order data - poll every 5 seconds
-  const { data: accountData, isLoading: dataLoading } = useRealAccountData(true, 5000)
+  const { data: accountData, isLoading: dataLoading, lastUpdated } = useRealAccountData(true, {
+    refreshInterval: 60000,
+    subscribeToStream: false,
+  })
+  const { data: testActivity, isLoading: testLoading } = useTestTradingActivity()
+  const currentTime = useCurrentTime()
 
   // Memoize order statistics and data
   const { orderStats, executionLog, liveOrders } = useMemo(() => {
@@ -128,45 +133,67 @@ const Orderbook: React.FC = () => {
   return (
     <div className="space-y-8">
       {/* Header */}
-      <div>
+      <div className="flex flex-wrap items-start justify-between gap-3">
         <SectionTitle subtitle="Watch every trigger, fill, cancellation, and rejection from OpenAlgo in one place.">
           Order Book
         </SectionTitle>
+        <p className="flex items-center gap-1.5 pt-1 text-xs text-text-tertiary whitespace-nowrap">
+          <Clock size={14} aria-hidden="true" />
+          <span>Last refreshed</span>
+          <time dateTime={lastUpdated || undefined}>
+            {lastUpdated
+              ? new Date(lastUpdated).toLocaleTimeString([], {
+                  hour: '2-digit',
+                  minute: '2-digit',
+                  second: '2-digit',
+                })
+              : 'Waiting'}
+          </time>
+          <span aria-hidden="true">·</span>
+          <span>Now</span>
+          <time dateTime={currentTime.toISOString()}>
+            {currentTime.toLocaleTimeString([], {
+              hour: '2-digit',
+              minute: '2-digit',
+              second: '2-digit',
+            })}
+          </time>
+        </p>
       </div>
 
       {/* Order Status Cards */}
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-4">
         <MetricCard
           icon={<TrendingUp className="text-emerald-500" />}
-          label="Buy orders"
+          label="Live Buy Orders"
           value={orderStats.buyOrders}
           sublabel="Total buy orders"
           color="green"
         />
         <MetricCard
           icon={<TrendingUp className="text-red-500 transform rotate-180" />}
-          label="Sell orders"
+          label="Live Sell Orders"
           value={orderStats.sellOrders}
           sublabel="Total sell orders"
           color="red"
         />
         <MetricCard
           icon={<Activity className="text-green-500" />}
-          label="Completed"
+          label="Live Completed"
           value={orderStats.completed}
           sublabel="Filled orders"
           color="green"
         />
         <MetricCard
           icon={<Clock className="text-amber-500" />}
-          label="Open"
+          label="Live Open"
           value={orderStats.open}
           sublabel="Pending orders"
           color="yellow"
         />
         <MetricCard
           icon={<AlertCircle className="text-red-500" />}
-          label="Rejected"
+          label="Live Rejected"
           value={orderStats.rejected}
           sublabel="Rejected orders"
           color="red"
@@ -272,9 +299,10 @@ const Orderbook: React.FC = () => {
       <div>
         <div className="flex items-center justify-between mb-4">
           <div>
-            <h3 className="text-lg font-semibold text-text-primary">
-              Orders from your broker
-            </h3>
+            <div className="flex items-center gap-3">
+              <h3 className="text-lg font-semibold text-text-primary">Orders from your broker</h3>
+              <ExecutionModeBadge mode="LIVE" />
+            </div>
             <p className="text-sm text-text-secondary">
               Fetched live from OpenAlgo — reflects your actual broker orderbook.
             </p>
@@ -408,6 +436,58 @@ const Orderbook: React.FC = () => {
           </div>
         )}
       </div>
+
+      <section className="space-y-4 border-t border-bg-tertiary pt-6">
+        <div className="flex items-center gap-3">
+          <h3 className="text-lg font-semibold text-text-primary">Test Virtual Orders ({testActivity.orders.length})</h3>
+          <ExecutionModeBadge mode="TEST" />
+        </div>
+        {testLoading ? (
+          <div className="flex justify-center py-8"><LoadingSpinner /></div>
+        ) : testActivity.orders.length === 0 ? (
+          <Card>
+            <EmptyState icon={<AlertCircle size={40} />} title="No Test Orders" description="Virtual orders will appear here." />
+          </Card>
+        ) : (
+          <div className="overflow-x-auto rounded-lg border border-amber-500/40">
+            <table className="w-full">
+              <thead>
+                <tr className="border-b border-amber-500/30 bg-amber-500/10">
+                  <th className="px-4 py-3 text-left text-xs font-semibold text-amber-200">Time</th>
+                  <th className="px-4 py-3 text-left text-xs font-semibold text-amber-200">Instrument</th>
+                  <th className="px-4 py-3 text-left text-xs font-semibold text-amber-200">Order</th>
+                  <th className="px-4 py-3 text-right text-xs font-semibold text-amber-200">Qty</th>
+                  <th className="px-4 py-3 text-right text-xs font-semibold text-amber-200">Price / Trigger</th>
+                  <th className="px-4 py-3 text-left text-xs font-semibold text-amber-200">Status</th>
+                </tr>
+              </thead>
+              <tbody>
+                {testActivity.orders.map((order) => (
+                  <tr key={order.orderid} className="border-b border-bg-tertiary">
+                    <td className="px-4 py-3 font-mono text-xs text-text-secondary">{formatTime(order.timestamp)}</td>
+                    <td className="px-4 py-3">
+                      <p className="text-sm text-text-primary">{order.instrument_name}</p>
+                      <p className="font-mono text-xs text-text-secondary">{order.symbol}</p>
+                    </td>
+                    <td className="px-4 py-3">
+                      <span className="mr-2 rounded bg-amber-300 px-2 py-0.5 text-[10px] font-black text-black">TEST</span>
+                      <span className="text-sm text-text-primary">{order.action} · {order.pricetype}</span>
+                    </td>
+                    <td className="px-4 py-3 text-right font-mono text-sm text-text-primary">{order.filled_quantity || order.quantity}</td>
+                    <td className="px-4 py-3 text-right font-mono text-sm text-text-primary">
+                      {formatCurrency(order.average_price ?? order.price)}
+                      {order.trigger_price > 0 && <span className="block text-xs text-text-secondary">Trigger {formatCurrency(order.trigger_price)}</span>}
+                    </td>
+                    <td className="px-4 py-3">
+                      <Badge variant={getStatusBadgeVariant(order.order_status)} size="sm">{order.order_status.toUpperCase()}</Badge>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </section>
     </div>
   )
 }

@@ -85,6 +85,72 @@ def _increment_shared_sl_count(trading_day: date) -> int:
         return _read_shared_sl_count(trading_day)
 
 
+def _read_daily_loss_state(path: Path, trading_day: date) -> dict[str, Any]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict) or payload.get("trading_day") != trading_day.isoformat():
+            return {"losing_trades": 0, "open_trade_pnl": {}}
+        open_trade_pnl = payload.get("open_trade_pnl")
+        return {
+            "losing_trades": max(0, int(payload.get("losing_trades", 0))),
+            "open_trade_pnl": open_trade_pnl if isinstance(open_trade_pnl, dict) else {},
+        }
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return {"losing_trades": 0, "open_trade_pnl": {}}
+
+
+def _read_open_trade_pnl(path: Path, trading_day: date, symbol: str) -> float:
+    state = _read_daily_loss_state(path, trading_day)
+    try:
+        return float(state["open_trade_pnl"].get(symbol, 0.0))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _record_daily_trade_exit(
+    path: Path,
+    trading_day: date,
+    symbol: str,
+    pnl_delta: float,
+    is_final_exit: bool,
+) -> tuple[int, float]:
+    """Persist partial P&L and count a losing trade only after its final exit."""
+    import fcntl
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        handle.seek(0)
+        try:
+            payload = json.load(handle)
+        except (json.JSONDecodeError, ValueError):
+            payload = {}
+        if not isinstance(payload, dict) or payload.get("trading_day") != trading_day.isoformat():
+            payload = {"trading_day": trading_day.isoformat(), "losing_trades": 0, "open_trade_pnl": {}}
+
+        open_trade_pnl = payload.setdefault("open_trade_pnl", {})
+        if not isinstance(open_trade_pnl, dict):
+            open_trade_pnl = {}
+            payload["open_trade_pnl"] = open_trade_pnl
+        total_trade_pnl = float(open_trade_pnl.get(symbol, 0.0)) + pnl_delta
+        losing_trades = max(0, int(payload.get("losing_trades", 0)))
+        if is_final_exit:
+            if total_trade_pnl < 0:
+                losing_trades += 1
+            open_trade_pnl.pop(symbol, None)
+        else:
+            open_trade_pnl[symbol] = total_trade_pnl
+        payload["losing_trades"] = losing_trades
+
+        handle.seek(0)
+        handle.truncate()
+        json.dump(payload, handle)
+        handle.flush()
+        os.fsync(handle.fileno())
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    return losing_trades, total_trade_pnl
+
+
 def get_atm_strike(spot_price: float, strike_step: int) -> int:
     return int(round(spot_price / strike_step) * strike_step)
 
@@ -236,6 +302,8 @@ class BaseStrategyEngine:
             "remark": remark,
             "sl_hits_today": self.state.sl_hits_today,
             "sl_cap": self.risk.max_sl_per_day,
+            "losing_trades_today": self.state.losing_trades_today,
+            "losing_trade_cap": self.cfg.max_losing_trades_per_day,
             "atm_locked": self.state.atm_locked,
             "has_position": side_state.position is not None,
             "has_pending_entry": side_state.pending_entry is not None,
@@ -297,11 +365,15 @@ class BaseStrategyEngine:
             "SIGNAL", "PENDING_ENTRY", "ENTRY", "EXIT", "TARGET", "SL", "CANCEL",
             "ORDER", "PROTECTIVE_SL", "TSL", "RISK", "REJECT", "FAILED", "ERROR", "UNCERTAIN_ENTRY",
         ):
-            self._persist_trade_alert(ts, category, message)
-            if not self._db_config_saved:
-                self._db_config_saved = True
-                db_sync.save_strategy_config(self.strategy_name, self.cfg, self.risk)
-            db_sync.save_alert(self.strategy_name, ts, category, message)
+            record_test_alert = getattr(self.broker, "record_alert", None)
+            if callable(record_test_alert):
+                record_test_alert(ts, category, message)
+            else:
+                self._persist_trade_alert(ts, category, message)
+                if not self._db_config_saved:
+                    self._db_config_saved = True
+                    db_sync.save_strategy_config(self.strategy_name, self.cfg, self.risk)
+                db_sync.save_alert(self.strategy_name, ts, category, message)
         print(f"[ENGINE][{category}] {message}")
 
     def _sync_shared_sl_count(self, trading_day: date) -> None:
@@ -311,6 +383,58 @@ class BaseStrategyEngine:
             self.state.sl_hits_today,
             _read_shared_sl_count(trading_day),
         )
+
+    def _daily_loss_state_path(self, trading_day: date) -> Path:
+        configured_path = os.getenv("DAILY_LOSS_STATE_FILE", "").strip()
+        if configured_path:
+            base_path = Path(configured_path)
+        else:
+            strategy = getattr(self.signal_provider, "strategy_key", self.strategy_name)
+            namespace = f"{strategy}_{self.cfg.option_index_symbol}"
+            safe_namespace = "".join(char for char in namespace if char.isalnum() or char in "-_")
+            base_path = Path("logs") / f"daily_loss_state_{safe_namespace}.json"
+        return base_path.with_name(f"{base_path.stem}_{trading_day:%Y%m%d}{base_path.suffix}")
+
+    def _sync_daily_loss_count(self, trading_day: date) -> None:
+        if self.broker.is_replay:
+            return
+        state = _read_daily_loss_state(self._daily_loss_state_path(trading_day), trading_day)
+        self.state.losing_trades_today = max(
+            self.state.losing_trades_today,
+            state["losing_trades"],
+        )
+
+    def _record_trade_exit_pnl(
+        self,
+        position: Position,
+        trading_day: date,
+        pnl_delta: float,
+        is_final_exit: bool,
+    ) -> None:
+        if self.broker.is_replay:
+            position.realized_pnl += pnl_delta
+            if is_final_exit and position.realized_pnl < 0:
+                self.state.losing_trades_today += 1
+            return
+
+        try:
+            losing_trades, total_trade_pnl = _record_daily_trade_exit(
+                self._daily_loss_state_path(trading_day),
+                trading_day,
+                position.option_symbol,
+                pnl_delta,
+                is_final_exit,
+            )
+            position.realized_pnl = total_trade_pnl
+            self.state.losing_trades_today = max(self.state.losing_trades_today, losing_trades)
+        except (OSError, TypeError, ValueError):
+            logger.exception("could not persist daily trade loss state")
+            position.realized_pnl += pnl_delta
+            if is_final_exit and position.realized_pnl < 0:
+                self.state.losing_trades_today = max(
+                    self.state.losing_trades_today,
+                    self.cfg.max_losing_trades_per_day,
+                )
 
     def restore_open_position(
         self,
@@ -342,6 +466,11 @@ class BaseStrategyEngine:
             quantity=quantity,
             initial_quantity=initial_quantity,
             entry_price=entry_price,
+            realized_pnl=_read_open_trade_pnl(
+                self._daily_loss_state_path(entry_time.date()),
+                entry_time.date(),
+                side_state.option_symbol or "",
+            ),
             entry_time=entry_time,
             option_stop_level=stop_level,
             option_entry_trigger=entry_trigger,
@@ -836,6 +965,8 @@ class BaseStrategyEngine:
         pnl_entry_price = self._pnl_entry_price(pos)
         trade_pnl = (exit_ltp - pnl_entry_price) * qty
         self.realized_pnl += trade_pnl
+        is_final_exit = qty >= pos.quantity
+        self._record_trade_exit_pnl(pos, ts.date(), trade_pnl, is_final_exit)
 
         pos.quantity -= qty
         pos.progress_status = "Monitoring position"
@@ -859,6 +990,13 @@ class BaseStrategyEngine:
             side_state.position = None
             if hasattr(side_state, "setup_active"):
                 self.signal_provider.reset_after_entry(side_state)
+            if self.state.losing_trades_today >= self.cfg.max_losing_trades_per_day:
+                self._record_alert(
+                    ts,
+                    "RISK",
+                    f"Daily losing-trade cap reached ({self.state.losing_trades_today}/"
+                    f"{self.cfg.max_losing_trades_per_day}) — no new entries today",
+                )
         elif not self.broker.is_replay:
             self._place_protective_stop(pos.option_type, pos, ts)
 
@@ -917,6 +1055,9 @@ class BaseStrategyEngine:
             "pe_symbol": self.state.pe_symbol,
             "sl_hits_today": self.state.sl_hits_today,
             "day_closed": self.state.sl_hits_today >= self.risk.max_sl_per_day,
+            "losing_trades_today": self.state.losing_trades_today,
+            "losing_trade_cap": self.cfg.max_losing_trades_per_day,
+            "loss_limit_reached": self.state.losing_trades_today >= self.cfg.max_losing_trades_per_day,
             "ce": _side_payload(self.state.ce),
             "pe": _side_payload(self.state.pe),
             "realized_pnl": self.realized_pnl,
@@ -935,10 +1076,14 @@ class BaseStrategyEngine:
             ce=self.signal_provider.create_side_state(),
             pe=self.signal_provider.create_side_state(),
         )
+        self._sync_daily_loss_count(new_day)
         self.total_entries = 0
         reset_ts = datetime.combine(new_day, self.cfg.market_open)
         print(f"\n{'='*60}")
-        print(f"  NEW SESSION: {new_day}  |  Max SL/day: {self.risk.max_sl_per_day}")
+        print(
+            f"  NEW SESSION: {new_day}  |  Max losing trades/day: "
+            f"{self.cfg.max_losing_trades_per_day}  |  Max SL/day: {self.risk.max_sl_per_day}"
+        )
         print(f"{'='*60}")
         self._record_alert(reset_ts, "SESSION", f"Session reset for {new_day}")
 
@@ -1244,6 +1389,17 @@ class BaseStrategyEngine:
             )
             return
 
+        self._sync_daily_loss_count(ts.date())
+        if self.state.losing_trades_today >= self.cfg.max_losing_trades_per_day:
+            side_state.entry_block_reason = "daily-losing-trade-cap"
+            self._record_alert(
+                ts,
+                "RISK",
+                f"Trade skipped: daily losing-trade cap reached "
+                f"({self.state.losing_trades_today}/{self.cfg.max_losing_trades_per_day})",
+            )
+            return
+
         if self._is_ema21_strategy():
             if ts.time() < self.cfg.entry_start or ts.time() >= self.cfg.entry_cutoff:
                 self._record_alert(
@@ -1259,11 +1415,6 @@ class BaseStrategyEngine:
             ):
                 self._record_alert(ts, "RISK", f"{side} trade skipped: another side is active")
                 return
-            if self.total_entries >= self.cfg.max_trades_per_day:
-                side_state.entry_block_reason = "daily-filled-entry-cap"
-                self._record_alert(ts, "RISK", "Trade skipped: daily filled-entry cap reached")
-                return
-
         if self.state.sl_hits_today >= self.risk.max_sl_per_day:
             self._record_alert(
                 ts, "RISK",
@@ -2309,7 +2460,10 @@ class BaseStrategyEngine:
 
         if signal in (Signal.BUY_CE, Signal.BUY_PE):
             # Log signal for dashboard display
-            if self.signal_provider.strategy_key == "ema21":
+            if (
+                self.signal_provider.strategy_key == "ema21"
+                and not callable(getattr(self.broker, "record_alert", None))
+            ):
                 try:
                     symbol = side_state.option_symbol or side
                     ts = pd.to_datetime(row.get("datetime", datetime.now()))

@@ -194,7 +194,7 @@ def _write_strategy_config(strategy_name: str, symbol: str, payload: dict) -> No
         row.config_json = json.dumps(payload, default=str)
         row.initial_sl_points = payload.get("max_option_risk_points")
         row.trailing_step_rr = payload.get("trailing_step_rr")
-        row.max_positions = payload.get("max_trades_per_day")
+        row.max_positions = payload.get("max_losing_trades_per_day")
         row.is_active = True
 
 

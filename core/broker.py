@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import logging
+import json
 import os
 import re
+import threading
 import time as time_module
+import uuid
 from datetime import date, datetime, time, timedelta
+from pathlib import Path
 from typing import Optional
 
 import pandas as pd
@@ -19,6 +23,14 @@ def _is_openalgo_auth_failure(response: object, message: str) -> bool:
     """Identify credential failures that will not recover by retrying."""
     text = f"{response} {message}".lower()
     return "403" in text or "invalid openalgo apikey" in text or "invalid api key" in text
+
+
+def _is_rate_limit_error(value: object) -> bool:
+    text = str(value).lower().replace("-", " ")
+    return any(
+        marker in text
+        for marker in ("429", "too many requests", "rate limit", "rate exceeded", "throttl")
+    )
 
 
 class BrokerInterface:
@@ -187,8 +199,10 @@ class OpenAlgoBroker(BrokerInterface):
         self.dry_run = dry_run
         self.position_book_available = False
         self._positionbook_auth_failed = False
-        self._quote_rate_limit_streak: dict[str, int] = {}
-        self._quote_retry_after: dict[str, float] = {}
+        self._quote_rate_limit_streak = 0
+        self._quote_retry_after = 0.0
+        self._history_rate_limit_streak = 0
+        self._history_retry_after = 0.0
         self._nearest_expiry_cache: dict[tuple[str, str, int, int, str, str], Optional[date]] = {}
         logger.info(
             "OpenAlgoBroker initialized host=%s ws_url=%s product=%s dry_run=%s",
@@ -280,40 +294,58 @@ class OpenAlgoBroker(BrokerInterface):
         return None
 
     def _quote_symbol_exists(self, symbol: str) -> bool:
-        """Check symbol existence via quotes with gentle throttling and 429 retry."""
-        max_attempts = 3
-        for attempt in range(max_attempts):
-            try:
-                resp = self.client.quotes(symbol=symbol, exchange=self.exchange_options)
-            except Exception:
-                resp = None
+        """Check a symbol once, respecting the shared quote-endpoint backoff."""
+        if time_module.monotonic() < self._quote_retry_after:
+            return False
+        try:
+            resp = self.client.quotes(symbol=symbol, exchange=self.exchange_options)
+        except Exception as exc:
+            if _is_rate_limit_error(exc):
+                self._record_quote_rate_limit(symbol, str(exc))
+            else:
+                logger.warning("quotes(%s) symbol check failed: %s", symbol, exc)
+            return False
 
-            if isinstance(resp, dict):
-                if resp.get("status") == "success":
-                    time_module.sleep(0.03)
-                    return True
-                message = str(resp.get("message") or "")
-                if "429" in message and attempt < max_attempts - 1:
-                    # Back off slightly when OpenAlgo rate-limits requests.
-                    time_module.sleep(0.25 * (attempt + 1))
-                    continue
-            break
-
+        message = str(resp.get("message") or "") if isinstance(resp, dict) else str(resp)
+        if _is_rate_limit_error(message):
+            self._record_quote_rate_limit(symbol, message)
+            return False
+        if isinstance(resp, dict) and resp.get("status") == "success":
+            self._clear_quote_rate_limit()
+            time_module.sleep(0.03)
+            return True
         time_module.sleep(0.03)
         return False
+
+    def _record_quote_rate_limit(self, symbol: str, message: str) -> None:
+        self._quote_rate_limit_streak += 1
+        delay = min(5.0 * (2 ** (self._quote_rate_limit_streak - 1)), 60.0)
+        self._quote_retry_after = time_module.monotonic() + delay
+        logger.warning(
+            "quotes(%s) rate-limited; suppressing quote requests for %.1fs: %s",
+            symbol,
+            delay,
+            message,
+        )
+
+    def _clear_quote_rate_limit(self) -> None:
+        self._quote_rate_limit_streak = 0
+        self._quote_retry_after = 0.0
 
     def get_ltp(self, symbol: str) -> float:
         exchange = self._infer_exchange(symbol)
         quote_symbol = symbol.split(":", 1)[-1]
         if quote_symbol.endswith("-INDEX"):
             quote_symbol = quote_symbol.removesuffix("-INDEX")
-        now = time_module.monotonic()
-        if now < self._quote_retry_after.get(quote_symbol, 0.0):
+        if time_module.monotonic() < self._quote_retry_after:
             return 0.0
 
         try:
             resp = self.client.quotes(symbol=quote_symbol, exchange=exchange)
         except Exception as exc:
+            if _is_rate_limit_error(exc):
+                self._record_quote_rate_limit(quote_symbol, str(exc))
+                return 0.0
             logger.warning("quotes(%s) error: %s", quote_symbol, exc)
             return 0.0
 
@@ -321,21 +353,12 @@ class OpenAlgoBroker(BrokerInterface):
             data = resp.get("data") or {}
             ltp = data.get("ltp") or resp.get("ltp")
             if ltp is not None:
-                self._quote_rate_limit_streak.pop(quote_symbol, None)
-                self._quote_retry_after.pop(quote_symbol, None)
+                self._clear_quote_rate_limit()
                 return round(float(ltp), 2)
 
         message = str(resp.get("message") if isinstance(resp, dict) else resp)
-        if "429" in message:
-            streak = self._quote_rate_limit_streak.get(quote_symbol, 0) + 1
-            self._quote_rate_limit_streak[quote_symbol] = streak
-            delay = min(5.0 * (2 ** (streak - 1)), 60.0)
-            self._quote_retry_after[quote_symbol] = now + delay
-            logger.warning(
-                "quotes(%s) rate-limited; suppressing requests for %.1fs",
-                quote_symbol,
-                delay,
-            )
+        if _is_rate_limit_error(message):
+            self._record_quote_rate_limit(quote_symbol, message)
             return 0.0
 
         logger.warning("quotes(%s) unexpected response: %s", quote_symbol, resp)
@@ -557,6 +580,10 @@ class OpenAlgoBroker(BrokerInterface):
         start_date: str,
         end_date: str,
     ) -> pd.DataFrame:
+        retry_in = self._history_retry_after - time_module.monotonic()
+        if retry_in > 0:
+            raise RuntimeError(f"history rate-limit cooldown active for {retry_in:.1f}s")
+
         max_attempts = 2
         transient_errors = (
             requests.exceptions.Timeout,
@@ -582,11 +609,29 @@ class OpenAlgoBroker(BrokerInterface):
                     exc,
                 )
                 time_module.sleep(0.5)
+            except Exception as exc:
+                if _is_rate_limit_error(exc):
+                    self._record_history_rate_limit(str(exc))
+                raise
         if isinstance(df, dict):
+            if _is_rate_limit_error(df):
+                self._record_history_rate_limit(str(df))
             raise RuntimeError(f"history returned error for {symbol}: {df}")
         if df is None or df.empty:
             raise RuntimeError(f"No history data for {symbol}")
+        self._history_rate_limit_streak = 0
+        self._history_retry_after = 0.0
         return df
+
+    def _record_history_rate_limit(self, message: str) -> None:
+        self._history_rate_limit_streak += 1
+        delay = min(10.0 * (2 ** min(self._history_rate_limit_streak - 1, 4)), 120.0)
+        self._history_retry_after = time_module.monotonic() + delay
+        logger.warning(
+            "history rate-limited; pausing history requests for %.1fs: %s",
+            delay,
+            message,
+        )
 
     def discover_index_profile(self, script: str) -> dict[str, object]:
         """Discover instrument metadata for index option trading from OpenAlgo.
@@ -1086,6 +1131,354 @@ class OpenAlgoBroker(BrokerInterface):
                 )
             raise RuntimeError(f"Order rejected: {resp}")
         return str(resp)
+
+
+class TestTradingBroker(OpenAlgoBroker):
+    """Use OpenAlgo for market data and keep all order activity virtual."""
+
+    __test__ = False
+    execution_mode = "TEST"
+    requires_position_reconciliation = True
+
+    def __init__(
+        self,
+        api_key: str,
+        host: str,
+        instrument_id: str,
+        instrument_name: str,
+        ws_url: Optional[str] = None,
+        strategy_tag: str = "Strategy",
+        product: str = "MIS",
+        exchange_options: str = "NFO",
+    ) -> None:
+        super().__init__(
+            api_key=api_key,
+            host=host,
+            ws_url=ws_url,
+            strategy_tag=strategy_tag,
+            product=product,
+            exchange_options=exchange_options,
+            dry_run=True,
+        )
+        self.instrument_id = str(instrument_id)
+        self.instrument_name = instrument_name
+        self.position_book_available = True
+        safe_id = re.sub(r"[^A-Za-z0-9_-]", "_", self.instrument_id)
+        logs_dir = Path(os.getenv("LOGS_DIR", "logs"))
+        self.state_path = logs_dir / f"test_trading_{safe_id}.json"
+        self._state_lock = threading.RLock()
+        self._orders: list[dict[str, object]] = []
+        self._positions: dict[str, dict[str, object]] = {}
+        self._trades: list[dict[str, object]] = []
+        self._alerts: list[dict[str, object]] = []
+        self._load_state()
+
+    def _load_state(self) -> None:
+        try:
+            payload = json.loads(self.state_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return
+        if not isinstance(payload, dict) or payload.get("instrument_id") != self.instrument_id:
+            return
+        self._orders = [row for row in payload.get("orders", []) if isinstance(row, dict)]
+        self._positions = {
+            str(row["symbol"]): row
+            for row in payload.get("positions", [])
+            if isinstance(row, dict) and row.get("symbol")
+        }
+        self._trades = [row for row in payload.get("trades", []) if isinstance(row, dict)]
+        self._alerts = [row for row in payload.get("alerts", []) if isinstance(row, dict)]
+
+    def _state_payload(self) -> dict[str, object]:
+        positions = list(self._positions.values())
+        open_pnl = sum(float(position.get("unrealized_pnl", 0) or 0) for position in positions)
+        realized_pnl = sum(float(trade.get("pnl", 0) or 0) for trade in self._trades)
+        return {
+            "instrument_id": self.instrument_id,
+            "instrument_name": self.instrument_name,
+            "strategy": self.strategy_tag,
+            "execution_mode": "TEST",
+            "updated_at": datetime.now().astimezone().isoformat(),
+            "positions": positions,
+            "orders": self._orders[-1000:],
+            "trades": self._trades[-1000:],
+            "alerts": self._alerts[-500:],
+            "summary": {
+                "open_positions": len(positions),
+                "open_pnl": round(open_pnl, 2),
+                "realized_pnl": round(realized_pnl, 2),
+                "net_pnl": round(open_pnl + realized_pnl, 2),
+                "completed_trades": len(self._trades),
+            },
+        }
+
+    def _persist_state(self) -> None:
+        self.state_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path = self.state_path.with_suffix(".json.tmp")
+        temporary_path.write_text(
+            json.dumps(self._state_payload(), indent=2),
+            encoding="utf-8",
+        )
+        os.replace(temporary_path, self.state_path)
+
+    def record_alert(self, timestamp: datetime, category: str, message: str) -> None:
+        with self._state_lock:
+            self._alerts.append({
+                "id": f"{self.instrument_id}-{uuid.uuid4().hex[:12]}",
+                "timestamp": timestamp.isoformat(),
+                "execution_mode": "TEST",
+                "instrument_id": self.instrument_id,
+                "instrument_name": self.instrument_name,
+                "strategy": self.strategy_tag,
+                "category": category,
+                "message": message,
+            })
+            self._alerts = self._alerts[-500:]
+            self._persist_state()
+
+    def _new_order(
+        self,
+        symbol: str,
+        side: OrderSide,
+        quantity: int,
+        order_type: str,
+        price: float,
+        trigger_price: float = 0.0,
+    ) -> dict[str, object]:
+        order = {
+            "orderid": f"TEST-{uuid.uuid4().hex}",
+            "order_id": "",
+            "symbol": symbol,
+            "action": side.value,
+            "quantity": int(quantity),
+            "pricetype": order_type,
+            "price": round(float(price), 2),
+            "trigger_price": round(float(trigger_price), 2),
+            "order_status": "open",
+            "filled_quantity": 0,
+            "average_price": None,
+            "timestamp": datetime.now().astimezone().isoformat(),
+            "execution_mode": "TEST",
+            "instrument_id": self.instrument_id,
+            "instrument_name": self.instrument_name,
+        }
+        order["order_id"] = order["orderid"]
+        self._orders.append(order)
+        return order
+
+    def _apply_fill(self, order: dict[str, object], fill_price: float) -> None:
+        symbol = str(order["symbol"])
+        action = str(order["action"]).upper()
+        quantity = int(order["quantity"])
+        position = self._positions.get(symbol)
+
+        if action == "BUY":
+            if position is None:
+                position = {
+                    "symbol": symbol,
+                    "quantity": quantity,
+                    "average_price": round(fill_price, 2),
+                    "ltp": round(fill_price, 2),
+                    "unrealized_pnl": 0.0,
+                    "realized_pnl": 0.0,
+                    "opened_at": datetime.now().astimezone().isoformat(),
+                    "strategy": self.strategy_tag,
+                    "instrument_id": self.instrument_id,
+                    "instrument_name": self.instrument_name,
+                    "execution_mode": "TEST",
+                    "protective_sl": None,
+                }
+                self._positions[symbol] = position
+            else:
+                old_quantity = int(position["quantity"])
+                total_quantity = old_quantity + quantity
+                position["average_price"] = round(
+                    (float(position["average_price"]) * old_quantity + fill_price * quantity)
+                    / total_quantity,
+                    2,
+                )
+                position["quantity"] = total_quantity
+                position["ltp"] = round(fill_price, 2)
+            order["filled_quantity"] = quantity
+            order["average_price"] = round(fill_price, 2)
+            return
+
+        if position is None:
+            order["order_status"] = "rejected"
+            return
+
+        filled_quantity = min(quantity, int(position["quantity"]))
+        entry_price = float(position["average_price"])
+        pnl = round((fill_price - entry_price) * filled_quantity, 2)
+        position["realized_pnl"] = round(float(position.get("realized_pnl", 0)) + pnl, 2)
+        self._trades.append({
+            "id": f"{self.instrument_id}-{uuid.uuid4().hex[:12]}",
+            "instrument_id": self.instrument_id,
+            "instrument_name": self.instrument_name,
+            "strategy": self.strategy_tag,
+            "execution_mode": "TEST",
+            "symbol": symbol,
+            "entry_time": position["opened_at"],
+            "exit_time": datetime.now().astimezone().isoformat(),
+            "entry_price": entry_price,
+            "exit_price": round(fill_price, 2),
+            "quantity": filled_quantity,
+            "pnl": pnl,
+            "status": "CLOSED" if filled_quantity == int(position["quantity"]) else "PARTIAL_EXIT",
+        })
+        remaining_quantity = int(position["quantity"]) - filled_quantity
+        if remaining_quantity:
+            position["quantity"] = remaining_quantity
+            position["ltp"] = round(fill_price, 2)
+            position["unrealized_pnl"] = round(
+                (fill_price - entry_price) * remaining_quantity,
+                2,
+            )
+        else:
+            del self._positions[symbol]
+        order["filled_quantity"] = filled_quantity
+        order["average_price"] = round(fill_price, 2)
+
+    def _match_open_orders(self, symbol: str, ltp: float) -> bool:
+        changed = False
+        for order in self._orders:
+            if order.get("symbol") != symbol or order.get("order_status") != "open":
+                continue
+            trigger = float(order.get("trigger_price", 0) or 0)
+            limit_price = float(order.get("price", 0) or 0)
+            action = str(order.get("action", "")).upper()
+            is_buy_fill = action == "BUY" and ltp >= trigger and ltp <= limit_price
+            is_sell_fill = action == "SELL" and ltp <= trigger and ltp >= limit_price
+            if not (is_buy_fill or is_sell_fill):
+                continue
+            fill_price = min(limit_price, ltp) if is_buy_fill else max(limit_price, ltp)
+            order["order_status"] = "complete"
+            order["fill_time"] = datetime.now().astimezone().isoformat()
+            self._apply_fill(order, fill_price)
+            if action == "SELL" and symbol in self._positions:
+                self._positions[symbol]["protective_sl"] = None
+            changed = True
+        return changed
+
+    def get_ltp(self, symbol: str) -> float:
+        ltp = super().get_ltp(symbol)
+        if ltp <= 0:
+            return ltp
+        with self._state_lock:
+            changed = self._match_open_orders(symbol, ltp)
+            position = self._positions.get(symbol)
+            if position is not None:
+                position["ltp"] = round(ltp, 2)
+                position["unrealized_pnl"] = round(
+                    (ltp - float(position["average_price"])) * int(position["quantity"]),
+                    2,
+                )
+                changed = True
+            if changed:
+                self._persist_state()
+        return ltp
+
+    def get_position_book(self) -> list[dict[str, object]]:
+        with self._state_lock:
+            return [
+                {
+                    **position,
+                    "quantity": int(position["quantity"]),
+                    "pnl": float(position.get("unrealized_pnl", 0) or 0),
+                    "pnlpercent": (
+                        float(position.get("unrealized_pnl", 0) or 0)
+                        / (float(position["average_price"]) * int(position["quantity"]))
+                        * 100
+                    ),
+                }
+                for position in self._positions.values()
+            ]
+
+    def get_order_status(self, order_id: str) -> dict[str, object]:
+        with self._state_lock:
+            order = next((row for row in self._orders if row.get("orderid") == order_id), None)
+        if order is None:
+            return {}
+        self.get_ltp(str(order["symbol"]))
+        with self._state_lock:
+            return dict(next(row for row in self._orders if row.get("orderid") == order_id))
+
+    def get_open_orders(self) -> Optional[list[dict[str, object]]]:
+        with self._state_lock:
+            return [dict(order) for order in self._orders if order.get("order_status") == "open"]
+
+    def cancel_order(self, order_id: str) -> bool:
+        with self._state_lock:
+            order = next((row for row in self._orders if row.get("orderid") == order_id), None)
+            if order is None or order.get("order_status") != "open":
+                return False
+            order["order_status"] = "cancelled"
+            order["cancelled_at"] = datetime.now().astimezone().isoformat()
+            self._persist_state()
+            return True
+
+    def modify_stop_limit_order(
+        self,
+        order_id: str,
+        symbol: str,
+        side: OrderSide,
+        quantity: int,
+        trigger_price: float,
+        limit_price: float,
+    ) -> bool:
+        with self._state_lock:
+            order = next((row for row in self._orders if row.get("orderid") == order_id), None)
+            if order is None or order.get("order_status") != "open":
+                return False
+            order.update({
+                "symbol": symbol,
+                "action": side.value,
+                "quantity": int(quantity),
+                "trigger_price": round(float(trigger_price), 2),
+                "price": round(float(limit_price), 2),
+            })
+            position = self._positions.get(symbol)
+            if position is not None and side == OrderSide.SELL:
+                position["protective_sl"] = round(float(trigger_price), 2)
+            self._persist_state()
+            return True
+
+    def place_stop_limit_order(
+        self,
+        symbol: str,
+        side: OrderSide,
+        quantity: int,
+        trigger_price: float,
+        limit_price: float,
+    ) -> str:
+        with self._state_lock:
+            order = self._new_order(
+                symbol,
+                side,
+                quantity,
+                "SL",
+                limit_price,
+                trigger_price,
+            )
+            if side == OrderSide.SELL and symbol in self._positions:
+                self._positions[symbol]["protective_sl"] = round(float(trigger_price), 2)
+            order_id = str(order["orderid"])
+            self._persist_state()
+        self.get_ltp(symbol)
+        return order_id
+
+    def place_market_order(self, symbol: str, side: OrderSide, quantity: int) -> str:
+        ltp = super().get_ltp(symbol)
+        if ltp <= 0:
+            raise RuntimeError(f"Cannot simulate market order for {symbol}: live quote unavailable")
+        with self._state_lock:
+            order = self._new_order(symbol, side, quantity, "MARKET", ltp)
+            order["order_status"] = "complete"
+            order["fill_time"] = datetime.now().astimezone().isoformat()
+            self._apply_fill(order, ltp)
+            order_id = str(order["orderid"])
+            self._persist_state()
+            return order_id
 
 
 class HistoricalReplayBroker(BrokerInterface):

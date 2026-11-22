@@ -76,6 +76,17 @@ def test_hd_daemon_filter_excludes_ema21_instruments(monkeypatch):
     ]
 
 
+def test_test_instrument_starts_with_simulated_runner_mode():
+    command = strategy_daemon._build_command({
+        "id": 3,
+        "strategy": "HD",
+        "brokerSymbol": "NIFTY",
+        "executionMode": "TEST",
+    })
+
+    assert command[-2:] == ["--mode", "paper"]
+
+
 def test_manager_supports_all_dashboard_strategies(monkeypatch):
     strategies = ["21EMA", "HD", "CD", "TC", "2BC", "BO"]
     monkeypatch.setenv("STRATEGY_FILTER", ",".join(strategies))

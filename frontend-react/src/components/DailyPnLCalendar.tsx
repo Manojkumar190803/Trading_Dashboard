@@ -48,10 +48,10 @@ const DayCell: React.FC<{
         'relative w-full aspect-square rounded border-2 p-1 cursor-pointer transition-transform hover:scale-105 hover:shadow-xl flex flex-col items-center justify-center',
         getColorStyles(color)
       )}
-      title={`Day ${day}: ₹${pnl.toLocaleString('en-IN')} (${trades} trades)`}
+      title={`Day ${day}: ₹${pnl.toLocaleString('en-IN')} (${trades > 0 ? `${trades} trades` : pnl !== 0 ? 'trade count unavailable' : 'no trades'})`}
     >
       <div className="text-xs font-bold">{day}</div>
-      {trades > 0 && (
+      {(trades > 0 || pnl !== 0) && (
         <div className="text-xs font-semibold truncate">₹{(pnl / 1000).toFixed(1)}k</div>
       )}
     </div>

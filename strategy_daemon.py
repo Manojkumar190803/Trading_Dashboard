@@ -123,7 +123,7 @@ def _build_command(instrument: dict[str, Any]) -> list[str]:
         'run_strategy.py',
         '--script', script,
         '--strategy', strategy,
-        '--mode', 'live',
+        '--mode', 'paper' if str(instrument.get('executionMode', 'LIVE')).upper() == 'TEST' else 'live',
     ]
     
     return cmd
@@ -182,6 +182,7 @@ def _start_strategy(instrument: dict[str, Any]) -> Optional[subprocess.Popen]:
         running_status[inst_id] = {
             'instrument_name': inst_name,
             'strategy': strategy,
+            'execution_mode': str(instrument.get('executionMode', 'LIVE')).upper(),
             'pid': proc.pid,
             'started_at': datetime.now().isoformat(),
             'status': 'running',
@@ -222,11 +223,38 @@ def _strategy_environment(
         environment.pop('SHARED_SL_COUNT_FILE', None)
 
     environment.update({
+        'INSTRUMENT_EXECUTION_MODE': str(instrument.get('executionMode', 'LIVE')).upper(),
+        'INSTRUMENT_ID': str(instrument.get('id', instrument.get('brokerSymbol', 'default'))),
+        'INSTRUMENT_NAME': str(instrument.get('name', instrument.get('brokerSymbol', 'Unknown'))),
+        'MAX_LOSING_TRADES_PER_DAY': str(instrument.get('maxLosingTradesPerDay', 3)),
+        'DAILY_LOSS_STATE_FILE': str(LOGS_DIR / f"daily_loss_state_{instrument.get('id', instrument.get('brokerSymbol', 'default'))}.json"),
         'PARTIAL_BOOKING_ENABLED': str(instrument.get('partialBookingEnabled', True)).lower(),
         'PARTIAL_BOOKING_RR': str(instrument.get('partialBookingRR', 2.0)),
         'PARTIAL_BOOKING_LOTS': str(instrument.get('partialBookingLots', 1)),
         'PARTIAL_BOOKING_INTERVAL_RR': str(instrument.get('partialBookingIntervalRR', 0.5)),
     })
+    if strategy_key == 'EMA21':
+        lot_size_adjustment = instrument.get('lotSizeAdjustment')
+        max_initial_risk = instrument.get('maxInitialRiskPoints')
+        environment.update({
+            'DASHBOARD_EMA21_FULL_SIZE_LOTS': str(
+                1 if lot_size_adjustment is None else lot_size_adjustment
+            ),
+            'DASHBOARD_EMA21_MONITORING_START_TIME': str(
+                instrument.get('monitoringStartTime') or '09:15'
+            ),
+            'DASHBOARD_EMA21_MONITORING_END_TIME': str(
+                instrument.get('monitoringEndTime') or '15:30'
+            ),
+            'DASHBOARD_EMA21_ENTRY_CUTOFF': str(
+                instrument.get('entryCutoffTime') or '14:40'
+            ),
+            'DASHBOARD_EMA21_MAX_OPTION_RISK_POINTS': str(
+                20 if max_initial_risk is None else max_initial_risk
+            ),
+        })
+        return environment
+
     if strategy_key != 'HD':
         return environment
 
@@ -293,6 +321,8 @@ def _runtime_signature(instrument: dict[str, Any], trailing: dict[str, Any]) -> 
         instrument.get('partialBookingRR', 2.0),
         instrument.get('partialBookingLots', 1),
         instrument.get('partialBookingIntervalRR', 0.5),
+        instrument.get('maxLosingTradesPerDay', 3),
+        str(instrument.get('executionMode', 'LIVE')).upper(),
         trailing.get('breakEvenRR'),
         trailing.get('trailStepRR'),
     )

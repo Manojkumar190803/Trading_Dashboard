@@ -8,7 +8,8 @@ import {
   Badge,
   MetricCard,
 } from '@/components/UI'
-import { useRealAccountData } from '@/hooks'
+import ExecutionModeBadge from '@/components/ExecutionModeBadge'
+import { useCurrentTime, useRealAccountData, useTestTradingActivity } from '@/hooks'
 import { formatCurrency, formatPercent, getValueColor } from '@/utils/format'
 import { exportPositionsCSV } from '@/utils/csv-export'
 import { clsx } from 'clsx'
@@ -177,8 +178,8 @@ const LiveTickCard = memo(
             {tick.symbol}
           </p>
           <div className="flex items-center gap-1">
-            <div className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
-            <span className="text-xs text-emerald-500 font-semibold">LIVE</span>
+            <div className="w-2 h-2 rounded-full bg-text-tertiary" />
+            <span className="text-xs text-text-tertiary font-semibold">SNAPSHOT</span>
           </div>
         </div>
         <div className="border-t border-bg-tertiary pt-2">
@@ -203,8 +204,66 @@ const LiveTickCard = memo(
 LiveTickCard.displayName = 'LiveTickCard'
 
 const Positions: React.FC = () => {
-  // Fetch real OpenAlgo data - poll every 1 second for live updates
-  const { data: accountData, isLoading: dataLoading, lastUpdated } = useRealAccountData(true, 1000)
+  const { data: accountData, isLoading: dataLoading, lastUpdated } = useRealAccountData(true, {
+    refreshInterval: 60000,
+    subscribeToStream: false,
+  })
+  const { data: testActivity, isLoading: testLoading } = useTestTradingActivity()
+  const currentTime = useCurrentTime()
+  const [strategyStatus, setStrategyStatus] = useState<{
+    available: boolean
+    names: string[]
+  } | null>(null)
+
+  useEffect(() => {
+    let isMounted = true
+
+    const fetchStrategyStatus = async () => {
+      try {
+        const response = await fetch(`/logs/strategies_status.json?t=${Date.now()}`)
+        if (!response.ok) throw new Error('Strategy status unavailable')
+
+        const payload = await response.json()
+        const entries = Object.values(payload.running_strategies || {}) as any[]
+        const names = [...new Set(
+          entries
+            .filter((entry) => entry?.status?.toLowerCase() === 'running' && typeof entry.strategy === 'string')
+            .map((entry) => entry.strategy.trim())
+            .filter(Boolean)
+        )]
+
+        if (isMounted) setStrategyStatus({ available: true, names })
+      } catch {
+        if (isMounted) setStrategyStatus({ available: false, names: [] })
+      }
+    }
+
+    void fetchStrategyStatus()
+    const intervalId = window.setInterval(() => void fetchStrategyStatus(), 60000)
+    return () => {
+      isMounted = false
+      window.clearInterval(intervalId)
+    }
+  }, [])
+
+  const strategyLabel = strategyStatus === null
+    ? 'Loading...'
+    : !strategyStatus.available
+      ? 'Unavailable'
+      : strategyStatus.names.length === 0
+        ? 'None'
+        : strategyStatus.names.length === 1
+          ? strategyStatus.names[0]
+          : 'Multiple'
+  const strategySublabel = strategyStatus === null
+    ? 'Reading strategy status'
+    : !strategyStatus.available
+      ? 'Strategy status unavailable'
+      : strategyStatus.names.length === 0
+        ? 'No strategies running'
+        : strategyStatus.names.length > 1
+          ? strategyStatus.names.join(', ')
+          : 'Running strategy'
 
   // Create a stable key from position data to only trigger updates when data actually changes
   const positionDataKey = useMemo(() => {
@@ -238,7 +297,6 @@ const Positions: React.FC = () => {
       return {
         metrics: {
           openPositions: 0,
-          currentStrategy: 'None',
           totalPnL: 0,
           triggeredToday: 0,
         },
@@ -260,14 +318,6 @@ const Positions: React.FC = () => {
       (sum: number, p: any) => sum + parseFloat(p.pnl || 0),
       0
     )
-
-    // Extract active strategy from orders
-    const completedOrders = orders.filter(
-      (o: any) => o.order_status === 'complete'
-    )
-    const activeStrategy = completedOrders.length > 0 
-      ? completedOrders[0].strategy?.split('_')[0] || 'Unknown'
-      : 'None'
 
     // Count triggered positions (all positions from today)
     const triggeredCount = positions.length
@@ -298,7 +348,6 @@ const Positions: React.FC = () => {
     return {
       metrics: {
         openPositions: openPositionsCount,
-        currentStrategy: activeStrategy,
         totalPnL: totalPnL,
         triggeredToday: triggeredCount,
       },
@@ -311,7 +360,11 @@ const Positions: React.FC = () => {
     <div className="space-y-8">
       {/* Header */}
       <div>
-        <SectionTitle subtitle="Real-time position tracking and P&L analysis">
+        <div className="mb-2 flex items-center gap-2">
+          <ExecutionModeBadge mode="LIVE" />
+          <ExecutionModeBadge mode="TEST" />
+        </div>
+        <SectionTitle subtitle="Live broker positions and Test virtual positions are shown separately.">
           Positions & Trades
         </SectionTitle>
       </div>
@@ -328,8 +381,8 @@ const Positions: React.FC = () => {
         <MetricCard
           icon={<Target className="text-blue-500" />}
           label="Current Strategy"
-          value={metrics.currentStrategy}
-          sublabel="Active strategy"
+          value={strategyLabel}
+          sublabel={strategySublabel}
           color="cyan"
         />
         <MetricCard
@@ -351,9 +404,12 @@ const Positions: React.FC = () => {
       {/* Triggered Positions Table */}
       <div>
         <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
-          <h3 className="text-lg font-semibold text-text-primary">
-            Triggered Positions Today ({triggeredPositions.length})
-          </h3>
+          <div className="flex items-center gap-3">
+            <h3 className="text-lg font-semibold text-text-primary">
+              Triggered Positions Today ({triggeredPositions.length})
+            </h3>
+            <ExecutionModeBadge mode="LIVE" />
+          </div>
           <div className="flex flex-wrap items-center gap-4">
             <p className="flex items-center gap-1.5 text-xs text-text-tertiary whitespace-nowrap">
               <Clock3 size={14} aria-hidden="true" />
@@ -366,6 +422,15 @@ const Positions: React.FC = () => {
                       second: '2-digit',
                     })
                   : 'Waiting'}
+              </time>
+              <span aria-hidden="true">·</span>
+              <span>Now</span>
+              <time dateTime={currentTime.toISOString()}>
+                {currentTime.toLocaleTimeString([], {
+                  hour: '2-digit',
+                  minute: '2-digit',
+                  second: '2-digit',
+                })}
               </time>
             </p>
             {triggeredPositions.length > 0 && (
@@ -442,6 +507,62 @@ const Positions: React.FC = () => {
           </div>
         </div>
       )}
+
+      <section className="space-y-4 border-t border-bg-tertiary pt-6">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div className="flex items-center gap-3">
+            <h3 className="text-lg font-semibold text-text-primary">
+              Test Virtual Positions ({testActivity.positions.length})
+            </h3>
+            <ExecutionModeBadge mode="TEST" />
+          </div>
+          <p className="text-sm font-mono text-amber-300">
+            Test P&amp;L {formatCurrency(testActivity.summary.net_pnl)}
+          </p>
+        </div>
+        {testLoading ? (
+          <div className="flex justify-center py-8"><LoadingSpinner /></div>
+        ) : testActivity.positions.length === 0 ? (
+          <EmptyState
+            icon={<Activity size={40} />}
+            title="No Test Positions"
+            description="No virtual positions are open."
+          />
+        ) : (
+          <div className="overflow-x-auto rounded-lg border border-amber-500/40">
+            <table className="w-full">
+              <thead>
+                <tr className="border-b border-amber-500/30 bg-amber-500/10">
+                  <th className="px-4 py-3 text-left text-xs font-semibold text-amber-200">Instrument</th>
+                  <th className="px-4 py-3 text-left text-xs font-semibold text-amber-200">Symbol</th>
+                  <th className="px-4 py-3 text-right text-xs font-semibold text-amber-200">Qty</th>
+                  <th className="px-4 py-3 text-right text-xs font-semibold text-amber-200">Entry</th>
+                  <th className="px-4 py-3 text-right text-xs font-semibold text-amber-200">LTP</th>
+                  <th className="px-4 py-3 text-right text-xs font-semibold text-amber-200">Stop</th>
+                  <th className="px-4 py-3 text-right text-xs font-semibold text-amber-200">Unrealized P&amp;L</th>
+                </tr>
+              </thead>
+              <tbody>
+                {testActivity.positions.map((position) => (
+                  <tr key={`${position.instrument_id}-${position.symbol}`} className="border-b border-bg-tertiary">
+                    <td className="px-4 py-3 text-sm text-text-primary">{position.instrument_name}</td>
+                    <td className="px-4 py-3 font-mono text-sm text-text-primary">{position.symbol}</td>
+                    <td className="px-4 py-3 text-right font-mono text-text-primary">{position.quantity}</td>
+                    <td className="px-4 py-3 text-right font-mono text-text-primary">{formatCurrency(position.average_price)}</td>
+                    <td className="px-4 py-3 text-right font-mono text-text-primary">{formatCurrency(position.ltp)}</td>
+                    <td className="px-4 py-3 text-right font-mono text-text-primary">
+                      {position.protective_sl == null ? '—' : formatCurrency(position.protective_sl)}
+                    </td>
+                    <td className={clsx('px-4 py-3 text-right font-mono font-bold', getValueColor(position.unrealized_pnl))}>
+                      {formatCurrency(position.unrealized_pnl)}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </section>
     </div>
   )
 }

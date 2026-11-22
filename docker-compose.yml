@@ -108,12 +108,14 @@ services:
     environment:
       <<: *common-environment
       STRATEGY_MODE: ${STRATEGY_MODE:-analyzer}
-      EXPORT_INTERVAL: "1"
+      OPENALGO_WS_URL: ws://host.docker.internal:5005
+      EXPORT_INTERVAL: "120"
+      ACTIVE_EXPORT_INTERVAL: "30"
       PYTHONUNBUFFERED: "1"
     volumes:
       - ./logs:/app/logs
       - ./data:/app/data
-    command: python3 export_dashboard_data.py both 1
+    command: python3 export_dashboard_data.py both 120
     depends_on:
       - strategy_worker
 

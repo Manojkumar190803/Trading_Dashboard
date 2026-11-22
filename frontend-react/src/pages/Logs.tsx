@@ -1,4 +1,5 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
+import { collectUnseenAlerts } from '@/utils/alert-notifications.js'
 import { AlertCircle, AlertTriangle, CheckCircle2, Info, Pause, TrendingUp, Clock, Download, RotateCcw, X } from 'lucide-react'
 import {
   Card,
@@ -9,6 +10,8 @@ import { formatTime } from '@/utils/format'
 import { useAppStore } from '@/stores'
 import { useToast } from '@/components/Toast'
 import { useInstruments } from '@/hooks/useInstruments'
+import ExecutionModeBadge from '@/components/ExecutionModeBadge'
+import { useTestTradingActivity } from '@/hooks'
 import { clsx } from 'clsx'
 import { isMarketOpen } from '@/utils/market-hours'
 import Papa from 'papaparse'
@@ -69,13 +72,15 @@ const parseAtmLockSnapshot = (payload: unknown): AtmLockSnapshot | null => {
 const Logs: React.FC = () => {
   const { logs: storeLogs, setLogs: setStoreLogs, setInstruments: setStoreInstruments } = useAppStore()
   const { instruments: apiInstruments } = useInstruments()
+  const { data: testActivity } = useTestTradingActivity()
   const [atmLocks, setAtmLocks] = useState<Record<string, AtmLockSnapshot>>({})
   const [atmLocksLoaded, setAtmLocksLoaded] = useState(false)
   const [logs, setLogs] = useState<LogEntry[]>([])
   const [alerts, setAlerts] = useState<AlertEntry[]>([])
   const [dismissedAlertIds, setDismissedAlertIds] = useState<Set<string>>(new Set())
   const [previousLogCount, setPreviousLogCount] = useState(0)
-  const [previousAlertCount, setPreviousAlertCount] = useState(0)
+  const processedAlertIds = useRef(new Set<string>())
+  const alertsInitialized = useRef(false)
   const [isInitialLoad, setIsInitialLoad] = useState(true)
   const [lastToastTime, setLastToastTime] = useState<number>(Date.now())
   const toast = useToast()
@@ -299,25 +304,11 @@ const Logs: React.FC = () => {
 
   // Detect and show toast for alert events
   useEffect(() => {
-    // Skip toast triggers on initial load
-    if (isInitialLoad) {
-      setPreviousAlertCount(alerts.length)
-      return
-    }
-
-    // Only show toasts for new alerts
-    if (alerts.length <= previousAlertCount) return
-
-    // Get new alerts since last check
-    const newAlerts = alerts.slice(previousAlertCount)
-    setPreviousAlertCount(alerts.length)
-
-    // Only trigger toasts for alerts that arrived within the last 60 seconds
-    // This prevents replaying old alerts when the file is reloaded
     const sixtySecondsAgo = Date.now() - 60000
 
-    newAlerts.forEach((alert) => {
-      // Skip alerts older than 60 seconds (prevents replay of old alerts)
+    if (!alertsInitialized.current) return
+
+    collectUnseenAlerts(alerts, processedAlertIds.current).forEach((alert) => {
       const alertTime = new Date(alert.timestamp).getTime()
       if (alertTime < sixtySecondsAgo) return
       const timeStr = new Date(alert.timestamp).toLocaleTimeString('en-IN')
@@ -348,7 +339,7 @@ const Logs: React.FC = () => {
         duration: 6000,
       })
     })
-  }, [alerts, previousAlertCount, isInitialLoad, toast])
+  }, [alerts, toast])
 
   // Load per-strategy setup status from the shared monitoring file.
   // Only load when instruments are configured
@@ -578,6 +569,10 @@ const Logs: React.FC = () => {
         const sortedAlerts = [...allAlerts]
           .filter((alert) => !persistedDismissedIds.has(alert.id))
           .sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime())
+        if (!alertsInitialized.current) {
+          sortedAlerts.forEach((alert) => processedAlertIds.current.add(alert.id))
+          alertsInitialized.current = true
+        }
         setAlerts(sortedAlerts)
       } catch (error) {
         console.error('❌ Error loading alerts:', error)
@@ -961,7 +956,6 @@ const Logs: React.FC = () => {
       const data = await response.json()
       setDismissedAlertIds(new Set(data.dismissedIds || idsToDismiss))
       setAlerts([])
-      setPreviousAlertCount(0)
       toast.clearAll()
       
       toast.addToast({
@@ -987,7 +981,6 @@ const Logs: React.FC = () => {
   const clearAllMessages = () => {
     setDismissedAlertIds((current) => new Set([...current, ...alerts.map((alert) => alert.id)]))
     setAlerts([])
-    setPreviousAlertCount(0)
     toast.clearAll()
   }
 
@@ -1293,6 +1286,31 @@ const Logs: React.FC = () => {
           </div>
         </Card>
       </div>
+
+      <section className="space-y-4 border-t border-bg-tertiary pt-6">
+        <div className="flex items-center gap-3">
+          <h2 className="text-lg font-semibold text-text-primary">Test Signals & Events</h2>
+          <ExecutionModeBadge mode="TEST" />
+        </div>
+        {testActivity.alerts.length === 0 ? (
+          <Card>
+            <p className="px-4 py-3 text-sm text-text-secondary">No Test signals or events yet.</p>
+          </Card>
+        ) : (
+          <div className="divide-y divide-amber-500/20 overflow-hidden rounded-md border border-amber-500/40">
+            {testActivity.alerts.slice(0, 100).map((alert) => (
+              <div key={alert.id} className="grid grid-cols-1 gap-2 bg-amber-500/5 px-4 py-3 md:grid-cols-[150px_110px_1fr] md:items-start">
+                <time className="font-mono text-xs text-text-tertiary">{formatTime(alert.timestamp)}</time>
+                <span className="inline-flex w-fit rounded bg-amber-300 px-2 py-0.5 text-[10px] font-black text-black">{alert.category}</span>
+                <p className="min-w-0 break-words text-sm text-text-primary">
+                  <span className="mr-2 font-semibold text-amber-300">{alert.instrument_name} · {alert.strategy}</span>
+                  {alert.message}
+                </p>
+              </div>
+            ))}
+          </div>
+        )}
+      </section>
 
       {/* ACTIVE LOGS SECTION - CE/PE Columns with 3-minute Data - Reference Layout */}
       <div className="space-y-4">

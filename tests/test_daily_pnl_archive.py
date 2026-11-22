@@ -12,8 +12,8 @@ def test_daily_pnl_snapshot_replaces_same_day_and_retains_other_months(tmp_path)
         {
             "positions": [{"pnl": 100}, {"pnl": -25}],
             "orders": {"orders": [
-                {"order_status": "complete", "timestamp": "2026-09-18 09:30:00"},
-                {"order_status": "complete", "timestamp": "2026-09-18 10:00:00"},
+                {"order_status": "complete", "action": "BUY", "timestamp": "2026-09-18 09:30:00"},
+                {"order_status": "complete", "action": "SELL", "timestamp": "2026-09-18 10:00:00"},
                 {"order_status": "rejected"},
             ]},
         },
@@ -23,7 +23,7 @@ def test_daily_pnl_snapshot_replaces_same_day_and_retains_other_months(tmp_path)
     _write_daily_pnl_snapshot(
         {
             "positions": [{"pnl": 15}],
-            "orders": {"orders": [{"order_status": "complete", "timestamp": "2026-09-18 10:30:00"}]},
+            "orders": {"orders": [{"order_status": "complete", "action": "BUY", "timestamp": "2026-09-18 10:30:00"}]},
         },
         archive_path,
         datetime(2026, 9, 18, 11),
@@ -31,7 +31,7 @@ def test_daily_pnl_snapshot_replaces_same_day_and_retains_other_months(tmp_path)
     _write_daily_pnl_snapshot(
         {
             "positions": [{"pnl": -5}],
-            "orders": {"orders": [{"order_status": "complete", "timestamp": "2026-10-01 10:00:00"}]},
+            "orders": {"orders": [{"order_status": "complete", "action": "BUY", "timestamp": "2026-10-01 10:00:00"}]},
         },
         archive_path,
         datetime(2026, 10, 1, 10),
@@ -53,7 +53,7 @@ def test_snapshot_does_not_copy_yesterdays_orders_and_persists_today_zero(tmp_pa
         {
             "positions": [],
             "orders": {"orders": [
-                {"order_status": "complete", "timestamp": "2026-10-13 14:00:00"},
+                {"order_status": "complete", "action": "BUY", "timestamp": "2026-10-13 14:00:00"},
             ]},
             "account": {"today_realized_pnl": 0, "realized_pnl": 5057},
         },
@@ -65,6 +65,25 @@ def test_snapshot_does_not_copy_yesterdays_orders_and_persists_today_zero(tmp_pa
     assert archive["2026-10"]["13"]["pnl"] == 5057
     assert archive["2026-10"]["14"]["pnl"] == 0
     assert archive["2026-10"]["14"]["trades"] == 0
+
+
+def test_snapshot_parses_broker_timestamps_and_counts_entries_not_exits(tmp_path):
+    archive_path = tmp_path / "daily_pnl.json"
+
+    assert _write_daily_pnl_snapshot(
+        {
+            "positions": [{"pnl": -2028}],
+            "orders": {"orders": [
+                {"order_status": "complete", "action": "BUY", "timestamp": "18-Nov-2026 12:01:54"},
+                {"order_status": "complete", "action": "SELL", "timestamp": "18-Nov-2026 12:15:09"},
+            ]},
+        },
+        archive_path,
+        datetime(2026, 11, 18, 12, 20),
+    )
+
+    archive = json.loads(archive_path.read_text(encoding="utf-8"))
+    assert archive["2026-11"]["18"]["trades"] == 1
 
 
 def test_live_analytics_overrides_stale_archive_with_valid_zero_day(tmp_path, monkeypatch):
@@ -119,12 +138,12 @@ def test_daily_analytics_returns_requested_month_and_month_summary(tmp_path, mon
     assert payload["month"] == "February 2020"
     assert payload["days"]["3"]["pnl"] == 120
     assert payload["month_summary"] == {
-        "total_pnl": 40,
-        "best_day": {"day": 3, "pnl": 120},
+        "total_pnl": 940,
+        "best_day": {"day": 12, "pnl": 900},
         "worst_day": {"day": 11, "pnl": -80},
-        "winning_days": 1,
+        "winning_days": 2,
         "losing_days": 1,
-        "total_trading_days": 2,
+        "total_trading_days": 3,
     }
 
 

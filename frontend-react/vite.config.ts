@@ -79,6 +79,10 @@ export default defineConfig({
     port: 3000,
     open: false,
     proxy: {
+      '/dashboard-stream': {
+        target: 'http://localhost:4000',
+        changeOrigin: true,
+      },
       '/api': {
         // Use host.docker.internal to reach services from the host
         // This allows React container to reach strategy_worker service

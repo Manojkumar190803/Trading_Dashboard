@@ -26,6 +26,72 @@ def _sample_df() -> pd.DataFrame:
     )
 
 
+@pytest.mark.parametrize("runner_type", [runner.LiveFeedRunner, runner.MultiEngineLiveFeedRunner])
+def test_live_option_history_backfills_once_then_refreshes_today(monkeypatch, runner_type):
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 8, 10, 10, 0)
+
+    class HistoryBroker:
+        def __init__(self):
+            self.calls = []
+            self.responses = [
+                pd.DataFrame(
+                    {
+                        "datetime": [
+                            datetime(2026, 8, 6, 9, 20),
+                            datetime(2026, 8, 10, 9, 20),
+                        ],
+                        "open": [90.0, 100.0],
+                        "high": [91.0, 101.0],
+                        "low": [89.0, 99.0],
+                        "close": [90.5, 100.5],
+                        "volume": [1000.0, 1100.0],
+                    }
+                ),
+                pd.DataFrame(
+                    {
+                        "datetime": [
+                            datetime(2026, 8, 10, 9, 20),
+                            datetime(2026, 8, 10, 9, 23),
+                        ],
+                        "open": [101.0, 102.0],
+                        "high": [102.0, 103.0],
+                        "low": [100.0, 101.0],
+                        "close": [101.5, 102.5],
+                        "volume": [1200.0, 1300.0],
+                    }
+                ),
+            ]
+
+        def fetch_history(self, **kwargs):
+            self.calls.append(kwargs)
+            return self.responses.pop(0)
+
+    monkeypatch.setattr(runner, "datetime", FixedDateTime)
+    live_runner = runner_type.__new__(runner_type)
+    live_runner.cfg = StrategyConfig()
+    live_runner.broker = HistoryBroker()
+    live_runner.lookback_days = 5
+    live_runner._init_live_history_cache()
+
+    first = live_runner._fetch_option_history("NIFTY10AUG2625000CE")
+    second = live_runner._fetch_option_history("NIFTY10AUG2625000CE")
+
+    assert [call["start_date"] for call in live_runner.broker.calls] == [
+        "2026-08-05",
+        "2026-08-10",
+    ]
+    assert live_runner.broker.calls[0]["end_date"] == "2026-08-10"
+    assert first["datetime"].tolist() == [datetime(2026, 8, 10, 9, 20)]
+    assert second["datetime"].tolist() == [
+        datetime(2026, 8, 10, 9, 20),
+        datetime(2026, 8, 10, 9, 23),
+    ]
+    assert second["close"].tolist() == [101.5, 102.5]
+
+
 def test_normalize_history_drops_invalid_ohlc_rows_and_fills_volume():
     raw = pd.DataFrame(
         {

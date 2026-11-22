@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Utility script to set and display OpenAlgo mode (live or analyzer).
-Changes are reflected immediately in the React dashboard.
+The dashboard snapshot reflects the new mode after the exporter reloads its environment.
 
 Usage:
     python3 set_openalgo_mode.py --set live      # Switch to live mode
@@ -57,11 +57,10 @@ def set_mode(new_mode: str) -> bool:
     print(f"✅ Set OPENALGO_MODE={new_mode} in {env_file}")
     
     # Also print what to do to apply changes
-    print("\n📋 To apply changes:")
-    print("   1. The React dashboard will detect the mode change within 1 second")
-    print("   2. For running processes, restart with:")
-    print("      - docker-compose restart react_dashboard  (React dashboard)")
-    print("      - Restart strategy workers if they check env")
+    print("\nTo apply changes:")
+    print("   1. Recreate dashboard_exporter to reload .env and publish a new snapshot:")
+    print("      docker compose up -d --force-recreate dashboard_exporter")
+    print("   2. Restart strategy services separately if they use this mode setting.")
     
     return True
 
@@ -83,7 +82,7 @@ def display_mode() -> None:
         print("  Risk Level: LOW - Safe for testing")
     
     print("\n  Dashboard Location: http://localhost:3000")
-    print("  Mode updates reflected every 1 second\n")
+    print("  Dashboard mode is shown in the latest exported account snapshot.\n")
     print("=" * 60 + "\n")
 
 

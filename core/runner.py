@@ -115,6 +115,8 @@ def _save_runner_checkpoint(
 
 
 def _persist_monitoring_row(row: dict[str, object]) -> None:
+    if os.getenv("INSTRUMENT_EXECUTION_MODE", "LIVE").strip().upper() == "TEST":
+        return
     logs_dir = Path("logs")
     logs_dir.mkdir(parents=True, exist_ok=True)
     timestamp = pd.to_datetime(row.get("timestamp"), errors="coerce")

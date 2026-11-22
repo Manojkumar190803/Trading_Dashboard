@@ -325,6 +325,8 @@ class Instrument(Base):
     partial_booking_rr = Column(Float, nullable=False, default=2.0)
     partial_booking_lots = Column(Integer, nullable=False, default=1)
     partial_booking_interval_rr = Column(Float, nullable=False, default=0.5)
+    max_losing_trades_per_day = Column(Integer, nullable=False, default=3)
+    execution_mode = Column(String(10), nullable=False, default="LIVE", server_default="LIVE")
     
     # Premium constraints
     premium_min_price = Column(Float, nullable=True)
@@ -361,6 +363,8 @@ def create_all_tables(engine):
             "partial_booking_rr": "FLOAT NOT NULL DEFAULT 2.0",
             "partial_booking_lots": "INTEGER NOT NULL DEFAULT 1",
             "partial_booking_interval_rr": "FLOAT NOT NULL DEFAULT 0.5",
+            "max_losing_trades_per_day": "INTEGER NOT NULL DEFAULT 3",
+            "execution_mode": "VARCHAR(10) NOT NULL DEFAULT 'LIVE'",
         }
         with engine.begin() as connection:
             for column_name, definition in column_definitions.items():

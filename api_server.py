@@ -175,6 +175,56 @@ def get_wallet_data():
     return get_log_file("wallet_data.json")
 
 
+@app.route("/api/test-trading", methods=["GET"])
+def get_test_trading_data():
+    """Return virtual Test activity without mixing it into broker snapshots."""
+    instruments = []
+    positions = []
+    orders = []
+    trades = []
+    alerts = []
+    for filepath in Path("logs").glob("test_trading_*.json"):
+        try:
+            payload = json.loads(filepath.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.warning("Skipping unreadable Test activity file %s: %s", filepath, exc)
+            continue
+        if not isinstance(payload, dict) or payload.get("execution_mode") != "TEST":
+            continue
+        instruments.append({
+            "id": payload.get("instrument_id"),
+            "name": payload.get("instrument_name"),
+            "strategy": payload.get("strategy"),
+            "updated_at": payload.get("updated_at"),
+        })
+        positions.extend(row for row in payload.get("positions", []) if isinstance(row, dict))
+        orders.extend(row for row in payload.get("orders", []) if isinstance(row, dict))
+        trades.extend(row for row in payload.get("trades", []) if isinstance(row, dict))
+        alerts.extend(row for row in payload.get("alerts", []) if isinstance(row, dict))
+
+    open_pnl = sum(float(position.get("unrealized_pnl", 0) or 0) for position in positions)
+    realized_pnl = sum(float(trade.get("pnl", 0) or 0) for trade in trades)
+    return jsonify({
+        "execution_mode": "TEST",
+        "instruments": instruments,
+        "positions": positions,
+        "orders": sorted(orders, key=lambda row: str(row.get("timestamp") or ""), reverse=True),
+        "trades": sorted(trades, key=lambda row: str(row.get("exit_time") or ""), reverse=True),
+        "alerts": sorted(alerts, key=lambda row: str(row.get("timestamp") or ""), reverse=True),
+        "summary": {
+            "open_positions": len(positions),
+            "open_pnl": round(open_pnl, 2),
+            "realized_pnl": round(realized_pnl, 2),
+            "net_pnl": round(open_pnl + realized_pnl, 2),
+            "completed_trades": len(trades),
+            "updated_at": max(
+                (str(instrument.get("updated_at") or "") for instrument in instruments),
+                default="",
+            ),
+        },
+    }), 200
+
+
 @app.route("/api/analytics/summary", methods=["GET"])
 def get_analytics_summary():
     """
@@ -369,7 +419,10 @@ def get_daily_analytics():
                 "color": color
             }
 
-        trading_days = [data for data in days.values() if data["trades"] > 0]
+        trading_days = [
+            data for data in days.values()
+            if data["trades"] > 0 or data["pnl"] != 0
+        ]
         total_pnl = sum(data["pnl"] for data in trading_days)
         winning_days = sum(1 for data in trading_days if data["pnl"] > 0)
         losing_days = sum(1 for data in trading_days if data["pnl"] < 0)
@@ -378,7 +431,7 @@ def get_daily_analytics():
         best_pnl = float('-inf')
         worst_pnl = float('inf')
         for day_str, day_data in days.items():
-            if day_data["trades"] > 0:
+            if day_data["trades"] > 0 or day_data["pnl"] != 0:
                 if day_data["pnl"] > best_pnl:
                     best_pnl = day_data["pnl"]
                     best_day = int(day_str)
@@ -680,6 +733,8 @@ def get_instruments():
                     "partialBookingRR": i.partial_booking_rr,
                     "partialBookingLots": i.partial_booking_lots,
                     "partialBookingIntervalRR": i.partial_booking_interval_rr,
+                    "maxLosingTradesPerDay": i.max_losing_trades_per_day,
+                    "executionMode": i.execution_mode,
                     "strategy": i.strategy,
                     "productType": i.product_type,
                     "premiumMinPrice": i.premium_min_price,
@@ -732,12 +787,18 @@ def create_instrument():
         instrument.partial_booking_rr = float(data.get("partialBookingRR", 2.0))
         instrument.partial_booking_lots = int(data.get("partialBookingLots", 1))
         instrument.partial_booking_interval_rr = float(data.get("partialBookingIntervalRR", 0.5))
+        instrument.max_losing_trades_per_day = int(data.get("maxLosingTradesPerDay", 3))
+        instrument.execution_mode = str(data.get("executionMode", instrument.execution_mode or "LIVE")).strip().upper()
+        if instrument.execution_mode not in {"LIVE", "TEST"}:
+            return jsonify({"error": "Execution mode must be LIVE or TEST"}), 400
         if (
             instrument.partial_booking_rr <= 0
             or instrument.partial_booking_lots < 1
             or instrument.partial_booking_interval_rr <= 0
         ):
             return jsonify({"error": "Partial booking RR, interval, and lots must be greater than zero"}), 400
+        if instrument.max_losing_trades_per_day < 1:
+            return jsonify({"error": "Max losing trades per day must be at least one"}), 400
         if instrument.partial_booking_rr <= 0 or instrument.partial_booking_lots < 1:
             return jsonify({"error": "Partial booking RR and lots must be greater than zero"}), 400
         instrument.premium_min_price = float(data.get("premiumMinPrice")) if data.get("premiumMinPrice") else None
@@ -820,6 +881,15 @@ def update_instrument(instrument_id):
             instrument.partial_booking_interval_rr = float(data["partialBookingIntervalRR"])
             if instrument.partial_booking_interval_rr <= 0:
                 return jsonify({"error": "Partial booking interval must be greater than zero"}), 400
+        if "maxLosingTradesPerDay" in data:
+            instrument.max_losing_trades_per_day = int(data["maxLosingTradesPerDay"])
+            if instrument.max_losing_trades_per_day < 1:
+                return jsonify({"error": "Max losing trades per day must be at least one"}), 400
+        if "executionMode" in data:
+            execution_mode = str(data["executionMode"]).strip().upper()
+            if execution_mode not in {"LIVE", "TEST"}:
+                return jsonify({"error": "Execution mode must be LIVE or TEST"}), 400
+            instrument.execution_mode = execution_mode
         if "premiumMinPrice" in data:
             instrument.premium_min_price = float(data["premiumMinPrice"]) if data["premiumMinPrice"] else None
         if "premiumMaxPrice" in data:
@@ -907,6 +977,8 @@ def get_all_instruments_debug():
                     "partialBookingRR": i.partial_booking_rr,
                     "partialBookingLots": i.partial_booking_lots,
                     "partialBookingIntervalRR": i.partial_booking_interval_rr,
+                    "maxLosingTradesPerDay": i.max_losing_trades_per_day,
+                    "executionMode": i.execution_mode,
                     "createdAt": i.created_at.isoformat(),
                 }
                 for i in instruments

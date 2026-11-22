@@ -1,6 +1,7 @@
 """Tests for core.broker implementations."""
 
 import builtins
+import json
 from types import SimpleNamespace
 
 import pandas as pd
@@ -12,6 +13,7 @@ from core.broker import (
     ConsoleBroker,
     HistoricalReplayBroker,
     OpenAlgoBroker,
+    TestTradingBroker,
 )
 from core.models import OrderSide
 
@@ -113,6 +115,49 @@ def test_openalgo_broker_init_and_dry_run_order_paths(fake_openalgo):
     assert fake_openalgo["api_kwargs"] == {"api_key": "k", "host": "h"}
     assert broker.place_stop_limit_order("NIFTYCE", OrderSide.BUY, 2, 10.0, 10.5).startswith("DRY-SL-L-")
     assert broker.place_market_order("NIFTYCE", OrderSide.SELL, 2).startswith("DRY-MKT-")
+
+
+def test_test_trading_broker_simulates_and_persists_without_openalgo_orders(
+    fake_openalgo,
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setenv("LOGS_DIR", str(tmp_path))
+    broker = TestTradingBroker(
+        api_key="k",
+        host="h",
+        instrument_id="instrument-7",
+        instrument_name="NIFTY Test",
+    )
+
+    entry_id = broker.place_stop_limit_order("NIFTYCE", OrderSide.BUY, 2, 120.0, 124.0)
+    assert broker.get_order_status(entry_id)["order_status"] == "complete"
+    assert broker.get_position_book()[0]["quantity"] == 2
+    assert fake_openalgo["client"].last_placeorder_kwargs is None
+
+    fake_openalgo["client"].quotes_response = {"status": "success", "data": {"ltp": 130.0}}
+    broker.get_ltp("NIFTYCE")
+    assert broker.get_position_book()[0]["pnl"] == 13.1
+
+    exit_id = broker.place_market_order("NIFTYCE", OrderSide.SELL, 2)
+    assert broker.get_order_status(exit_id)["order_status"] == "complete"
+    assert broker.get_position_book() == []
+    assert fake_openalgo["client"].last_placeorder_kwargs is None
+
+    payload = json.loads((tmp_path / "test_trading_instrument-7.json").read_text())
+    assert payload["execution_mode"] == "TEST"
+    assert payload["positions"] == []
+    assert payload["trades"][0]["pnl"] == 13.1
+    assert all(order["execution_mode"] == "TEST" for order in payload["orders"])
+
+    restored = TestTradingBroker(
+        api_key="k",
+        host="h",
+        instrument_id="instrument-7",
+        instrument_name="NIFTY Test",
+    )
+    assert restored.get_position_book() == []
+    assert len(restored._trades) == 1
 
 
 def test_openalgo_broker_fetches_chain_for_selected_expiry(fake_openalgo):
@@ -234,6 +279,72 @@ def test_openalgo_broker_backs_off_after_quote_rate_limit(fake_openalgo, monkeyp
     assert broker.get_ltp(symbol) == 123.45
 
 
+def test_openalgo_broker_backs_off_after_angel_403_rate_limit_across_symbols(
+    fake_openalgo, monkeypatch
+):
+    broker = OpenAlgoBroker(api_key="k", host="h", dry_run=True)
+    client = fake_openalgo["client"]
+    clock = [100.0]
+    calls = []
+    monkeypatch.setattr("core.broker.time_module.monotonic", lambda: clock[0])
+
+    def _rate_limited_quotes(symbol, **_kwargs):
+        calls.append(symbol)
+        return {
+            "status": "error",
+            "message": "HTTP 403 Angel API rate limit exceeded. Please retry shortly.",
+        }
+
+    client.quotes = _rate_limited_quotes
+
+    assert broker.get_ltp("NIFTY08AUG2625000CE") == 0.0
+    assert broker.get_ltp("BANKNIFTY08AUG2655000CE") == 0.0
+    assert calls == ["NIFTY08AUG2625000CE"]
+
+    clock[0] += 5.0
+    client.quotes = lambda **_kwargs: {"status": "success", "data": {"ltp": 123.45}}
+    assert broker.get_ltp("BANKNIFTY08AUG2655000CE") == 123.45
+
+
+def test_openalgo_broker_backs_off_when_quote_sdk_raises_rate_limit(
+    fake_openalgo, monkeypatch
+):
+    broker = OpenAlgoBroker(api_key="k", host="h", dry_run=True)
+    client = fake_openalgo["client"]
+    clock = [100.0]
+    calls = [0]
+    monkeypatch.setattr("core.broker.time_module.monotonic", lambda: clock[0])
+
+    def _rate_limited_quotes(*_args, **_kwargs):
+        calls[0] += 1
+        raise RuntimeError("Angel API rate limit exceeded")
+
+    client.quotes = _rate_limited_quotes
+
+    assert broker.get_ltp("NIFTY08AUG2625000CE") == 0.0
+    assert broker.get_ltp("NIFTY08AUG2625000CE") == 0.0
+    assert calls[0] == 1
+
+
+def test_openalgo_broker_stops_expiry_probes_during_quote_backoff(
+    fake_openalgo, monkeypatch
+):
+    broker = OpenAlgoBroker(api_key="k", host="h", dry_run=True)
+    client = fake_openalgo["client"]
+    calls = []
+    monkeypatch.setattr("core.broker.time_module.monotonic", lambda: 100.0)
+
+    def _rate_limited_quotes(symbol, **_kwargs):
+        calls.append(symbol)
+        return {"status": "error", "message": "Angel API rate limit exceeded"}
+
+    client.quotes = _rate_limited_quotes
+
+    assert broker._quote_symbol_exists("NIFTY08AUG2625000CE") is False
+    assert broker._quote_symbol_exists("NIFTY08AUG2625000PE") is False
+    assert calls == ["NIFTY08AUG2625000CE"]
+
+
 def test_openalgo_broker_latches_positionbook_auth_failure(fake_openalgo, caplog):
     broker = OpenAlgoBroker(api_key="k", host="h")
     client = fake_openalgo["client"]
@@ -321,6 +432,33 @@ def test_openalgo_fetch_history_retries_transient_timeout(monkeypatch, fake_open
 
     assert not data.empty
     assert attempts == 2
+
+
+def test_openalgo_fetch_history_backs_off_after_rate_limit(monkeypatch, fake_openalgo):
+    broker = OpenAlgoBroker(api_key="k", host="h")
+    client = fake_openalgo["client"]
+    now = [100.0]
+    attempts = 0
+    success_response = client.history_response
+
+    def rate_limited_history(**kwargs):
+        nonlocal attempts
+        attempts += 1
+        return {"status": "error", "message": "Too many requests"}
+
+    client.history = rate_limited_history
+    monkeypatch.setattr("core.broker.time_module.monotonic", lambda: now[0])
+
+    with pytest.raises(RuntimeError, match="history returned error"):
+        broker.fetch_history("NIFTY", "NFO", "3m", "2026-08-10", "2026-08-10")
+    with pytest.raises(RuntimeError, match="cooldown active"):
+        broker.fetch_history("NIFTY", "NFO", "3m", "2026-08-10", "2026-08-10")
+    assert attempts == 1
+
+    now[0] += 10.0
+    client.history = lambda **_kwargs: success_response
+    assert not broker.fetch_history("NIFTY", "NFO", "3m", "2026-08-10", "2026-08-10").empty
+    assert broker._history_rate_limit_streak == 0
 
 
 def test_openalgo_exchange_inference(fake_openalgo):

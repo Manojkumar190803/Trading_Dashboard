@@ -1,7 +1,7 @@
 import { useEffect, useCallback, useRef, useState } from 'react'
 import { fetchAndParseCSV, getTodayDateString, watchFile } from '@/utils/files'
 import { parseCSV } from '@/utils/format'
-import { StrategyAlert, Trade, EquityCurvePoint } from '@/types'
+import { StrategyAlert, Trade, EquityCurvePoint, TestTradingActivity } from '@/types'
 
 /**
  * Hook to fetch strategy alerts from daily CSV
@@ -258,24 +258,28 @@ export const useEquityCurve = (trades: Trade[]) => {
 /**
  * Hook for polling live metrics
  */
-export const useLiveMetrics = () => {
-  const [lastUpdate, setLastUpdate] = useState<string>(new Date().toISOString())
+export const useCurrentTime = () => {
+  const [currentTime, setCurrentTime] = useState(() => new Date())
 
   useEffect(() => {
     const interval = setInterval(() => {
-      setLastUpdate(new Date().toISOString())
-    }, 5000)
+      setCurrentTime(new Date())
+    }, 1000)
 
     return () => clearInterval(interval)
   }, [])
 
-  return { lastUpdate }
+  return currentTime
 }
 
 /**
  * Hook to fetch real OpenAlgo account data
  */
-export const useRealAccountData = (shouldFetch = true, interval = 1000) => {
+export const useRealAccountData = (
+  shouldFetch = true,
+  options: { refreshInterval?: number; subscribeToStream?: boolean } = {},
+) => {
+  const { refreshInterval = 120000, subscribeToStream = true } = options
   const [data, setData] = useState<{
     positions: any[]
     orders: any[]
@@ -288,29 +292,33 @@ export const useRealAccountData = (shouldFetch = true, interval = 1000) => {
   const [lastUpdated, setLastUpdated] = useState<string | null>(null)
   const hasSuccessfulFetch = useRef(false)
 
+  const applySnapshot = useCallback((accountData: any) => {
+    const orderPayload = accountData.orders
+    const orders = Array.isArray(orderPayload)
+      ? orderPayload
+      : Array.isArray(orderPayload?.orders)
+        ? orderPayload.orders
+        : []
+    setData({
+      positions: accountData.positions || [],
+      orders,
+      account: accountData.account || {},
+      mode: accountData.mode,
+      engine_status: accountData.engine_status,
+    })
+    hasSuccessfulFetch.current = true
+    setLastUpdated(new Date().toISOString())
+    setError(null)
+    setIsLoading(false)
+  }, [])
+
   const fetchData = useCallback(async () => {
     try {
       if (!hasSuccessfulFetch.current) setIsLoading(true)
       // Add timestamp to bypass cache and always get fresh data
       const response = await fetch(`/logs/dashboard_data.json?t=${Date.now()}`)
       if (response.ok) {
-        const accountData = await response.json()
-        const orderPayload = accountData.orders
-        const orders = Array.isArray(orderPayload)
-          ? orderPayload
-          : Array.isArray(orderPayload?.orders)
-            ? orderPayload.orders
-            : []
-        setData({
-          positions: accountData.positions || [],
-          orders,
-          account: accountData.account || {},
-          mode: accountData.mode,
-          engine_status: accountData.engine_status,
-        })
-        hasSuccessfulFetch.current = true
-        setLastUpdated(new Date().toISOString())
-        setError(null)
+        applySnapshot(await response.json())
       } else {
         if (!hasSuccessfulFetch.current) setData(null)
         setError(`OpenAlgo dashboard data request failed (${response.status}).`)
@@ -321,17 +329,71 @@ export const useRealAccountData = (shouldFetch = true, interval = 1000) => {
     } finally {
       setIsLoading(false)
     }
-  }, [])
+  }, [applySnapshot])
 
   useEffect(() => {
     if (!shouldFetch) return
 
     fetchData()
-    const timer = setInterval(fetchData, interval)
-    return () => clearInterval(timer)
-  }, [shouldFetch, interval, fetchData])
+    const source = subscribeToStream ? new EventSource('/dashboard-stream') : null
+    if (source) {
+      source.onmessage = (event) => {
+        try {
+          applySnapshot(JSON.parse(event.data))
+        } catch {
+          setError('Received invalid dashboard data.')
+        }
+      }
+    }
+    const fallbackTimer = setInterval(fetchData, refreshInterval)
+    return () => {
+      source?.close()
+      clearInterval(fallbackTimer)
+    }
+  }, [shouldFetch, fetchData, applySnapshot, refreshInterval, subscribeToStream])
 
   return { data, isLoading, error, lastUpdated, refetch: fetchData }
+}
+
+export const useTestTradingActivity = () => {
+  const [data, setData] = useState<TestTradingActivity>({
+    execution_mode: 'TEST',
+    positions: [],
+    orders: [],
+    trades: [],
+    alerts: [],
+    summary: {
+      open_positions: 0,
+      open_pnl: 0,
+      realized_pnl: 0,
+      net_pnl: 0,
+      completed_trades: 0,
+      updated_at: '',
+    },
+  })
+  const [isLoading, setIsLoading] = useState(true)
+  const [error, setError] = useState<string | null>(null)
+
+  const fetchActivity = useCallback(async () => {
+    try {
+      const response = await fetch(`/api/test-trading?t=${Date.now()}`)
+      if (!response.ok) throw new Error(`Test activity request failed (${response.status})`)
+      setData(await response.json())
+      setError(null)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to fetch Test activity')
+    } finally {
+      setIsLoading(false)
+    }
+  }, [])
+
+  useEffect(() => {
+    void fetchActivity()
+    const intervalId = window.setInterval(() => void fetchActivity(), 5000)
+    return () => window.clearInterval(intervalId)
+  }, [fetchActivity])
+
+  return { data, isLoading, error, refetch: fetchActivity }
 }
 
 /**

@@ -1,4 +1,6 @@
 import pytest
+import threading
+import json
 
 from core.dashboard_data import DashboardDataProvider
 import core.dashboard_data as dashboard_data_module
@@ -16,7 +18,30 @@ def make_provider(client):
     provider = DashboardDataProvider.__new__(DashboardDataProvider)
     provider.client = client
     provider.strategy_tag = "test"
+    provider._snapshot_lock = threading.Lock()
     return provider
+
+
+def test_position_tick_updates_active_position_and_account_pnl(tmp_path):
+    provider = make_provider(FakeOpenAlgoClient({}))
+    snapshot_path = tmp_path / "dashboard_data.json"
+    snapshot_path.write_text(json.dumps({
+        "timestamp": "2026-11-20T10:00:00",
+        "positions": [
+            {"symbol": "NIFTY26NOV25000CE", "exchange": "NFO", "quantity": "50", "ltp": 100, "pnl": 250},
+            {"symbol": "FLAT", "exchange": "NSE", "quantity": "0", "ltp": 20, "pnl": 0},
+        ],
+        "account": {"mtm": 500, "pnl": 500},
+    }))
+
+    assert provider.write_position_tick("NIFTY26NOV25000CE", 103, str(snapshot_path))
+
+    snapshot = json.loads(snapshot_path.read_text())
+    assert snapshot["positions"][0]["ltp"] == 103
+    assert snapshot["positions"][0]["pnl"] == 400
+    assert snapshot["positions"][1]["ltp"] == 20
+    assert snapshot["account"]["mtm"] == 650
+    assert snapshot["account"]["pnl"] == 650
 
 
 def test_openalgo_funds_fields_are_normalized_for_dashboard():

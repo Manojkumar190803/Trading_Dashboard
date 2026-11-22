@@ -3,6 +3,7 @@
 import json
 import logging
 import os
+import threading
 from datetime import date, datetime
 from pathlib import Path
 from typing import Optional
@@ -53,26 +54,35 @@ def _extract_daily_pnl_snapshot_data(
 
     orders_data = dashboard_data.get("orders") or {}
     orders = orders_data.get("orders", []) if isinstance(orders_data, dict) else orders_data
-    completed_orders_today = 0
+    completed_entries_today = 0
     for order in orders:
-        if not isinstance(order, dict) or str(order.get("order_status", "")).lower() != "complete":
+        if not isinstance(order, dict):
+            continue
+        order_status = str(order.get("order_status") or order.get("status") or "").lower()
+        action = str(order.get("action") or order.get("side") or "").upper()
+        if order_status not in {"complete", "filled", "executed"} or action != "BUY":
             continue
         timestamp = order.get("timestamp") or order.get("created_at") or order.get("order_timestamp")
         if not timestamp:
             continue
         try:
-            order_time = timestamp if isinstance(timestamp, datetime) else datetime.fromisoformat(
-                str(timestamp).replace("Z", "+00:00")
-            )
+            if isinstance(timestamp, datetime):
+                order_time = timestamp
+            else:
+                timestamp_text = str(timestamp).strip()
+                try:
+                    order_time = datetime.fromisoformat(timestamp_text.replace("Z", "+00:00"))
+                except ValueError:
+                    order_time = datetime.strptime(timestamp_text, "%d-%b-%Y %H:%M:%S")
             if order_time.tzinfo is not None:
                 local_timezone = datetime.now().astimezone().tzinfo
                 order_time = order_time.astimezone(local_timezone)
         except (TypeError, ValueError):
             continue
         if order_time.date() == trading_date:
-            completed_orders_today += 1
+            completed_entries_today += 1
 
-    return pnl, completed_orders_today, has_pnl_data or completed_orders_today > 0
+    return pnl, completed_entries_today, has_pnl_data or completed_entries_today > 0
 
 
 def _write_daily_pnl_snapshot(
@@ -126,6 +136,7 @@ class DashboardDataProvider:
             self.host = host.strip().rstrip("/")
             self.client = api(api_key=self.api_key, host=self.host)
             self.strategy_tag = strategy_tag
+            self._snapshot_lock = threading.Lock()
         except ImportError as exc:
             raise RuntimeError(
                 "openalgo package not installed. Install it with `pip install openalgo`."
@@ -134,10 +145,11 @@ class DashboardDataProvider:
     def get_account_summary(self) -> dict:
         """Fetch account summary with balance, P&L, positions, and mode."""
         try:
+            positions = self._fetch_positions()
             data = {
                 "timestamp": datetime.now().isoformat(),
-                "mode": self._detect_mode(),  # Get current OpenAlgo mode
-                "positions": self._fetch_positions(),
+                "mode": self._detect_mode(positions),  # Get current OpenAlgo mode
+                "positions": positions,
                 "orders": self._fetch_orders(),
                 "account": self._fetch_account_info(),
             }
@@ -243,7 +255,7 @@ class DashboardDataProvider:
             logger.exception("Error fetching funds from OpenAlgo")
             raise RuntimeError("Could not fetch funds from OpenAlgo.") from e
 
-    def _detect_mode(self) -> str:
+    def _detect_mode(self, positions: Optional[list[dict]] = None) -> str:
         """Detect OpenAlgo current mode (live or analyzer).
         
         Returns 'live' if real account/trades are being used, 'analyzer' if in analysis mode.
@@ -272,7 +284,7 @@ class DashboardDataProvider:
         
         # Try to infer from account data (check if positions/trades exist)
         try:
-            positions = self._fetch_positions()
+            positions = positions if positions is not None else self._fetch_positions()
             if positions and len(positions) > 0:
                 # Has active positions, likely live mode
                 return "live"
@@ -310,14 +322,68 @@ class DashboardDataProvider:
         # Ensure directory exists
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
-        with open(output_path, "w") as f:
-            json.dump(data, f, indent=2)
+        with self._snapshot_lock:
+            temporary_path = output_path.with_suffix(output_path.suffix + ".tmp")
+            with temporary_path.open("w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+            os.replace(temporary_path, output_path)
+            _write_daily_pnl_snapshot(data, output_path.parent / "daily_pnl.json")
 
-        _write_daily_pnl_snapshot(data, output_path.parent / "daily_pnl.json")
         db_sync.sync_dashboard_snapshot(data)
 
         logger.info(f"Dashboard data written to {output_path}")
         return str(output_path)
+
+    def write_position_tick(
+        self,
+        symbol: str,
+        ltp: float,
+        output_path: Optional[str] = None,
+        exchange: Optional[str] = None,
+    ) -> bool:
+        """Apply a websocket price update to an already-known open position."""
+        path = Path(output_path) if output_path else Path(__file__).parent.parent / "logs" / "dashboard_data.json"
+        changed = False
+        with self._snapshot_lock:
+            try:
+                with path.open("r", encoding="utf-8") as handle:
+                    data = json.load(handle)
+            except (OSError, json.JSONDecodeError):
+                return False
+
+            positions = data.get("positions") or []
+            for position in positions:
+                if not isinstance(position, dict) or str(position.get("symbol") or "") != symbol:
+                    continue
+                if exchange and str(position.get("exchange") or "").upper() != exchange.upper():
+                    continue
+                quantity = self._safe_float(
+                    self._first_value(position, "quantity", "qty", "netqty", "net_qty")
+                )
+                if quantity == 0:
+                    continue
+                previous_ltp = self._safe_float(position.get("ltp"))
+                if previous_ltp > 0:
+                    pnl_delta = (float(ltp) - previous_ltp) * quantity
+                    position["pnl"] = self._safe_float(position.get("pnl")) + pnl_delta
+                    account = data.setdefault("account", {})
+                    for key in ("mtm", "m2munrealized", "pnl"):
+                        if account.get(key) is not None:
+                            account[key] = self._safe_float(account[key]) + pnl_delta
+                position["ltp"] = float(ltp)
+                changed = True
+
+            if not changed:
+                return False
+
+            captured_at = datetime.now()
+            data["timestamp"] = captured_at.isoformat()
+            temporary_path = path.with_suffix(path.suffix + ".tmp")
+            temporary_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            os.replace(temporary_path, path)
+            _write_daily_pnl_snapshot(data, path.parent / "daily_pnl.json", captured_at)
+
+        return True
 
 
 def export_dashboard_data(mode: str = "analyzer") -> dict:

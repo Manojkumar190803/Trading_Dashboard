@@ -64,7 +64,7 @@ class StrategyConfig:
     stop_buffer_points: float = 0.0
     entry_limit_buffer_points: float = 0.5
     option_tick_size: float = 0.05
-    max_trades_per_day: int = 3
+    max_losing_trades_per_day: int = 3
 
     # ── Targets (RR multiples) ───────────────────────────────────────
     t1_rr: float = 1.0
@@ -96,6 +96,7 @@ class Position:
     option_stop_level: float
     option_entry_trigger: float
     option_risk_points: float
+    realized_pnl: float = 0.0
     protective_stop_order_id: Optional[str] = None
     t1_done: bool = False
     t2_done: bool = False
@@ -154,5 +155,6 @@ class DayState:
     ce_symbol: Optional[str] = None
     pe_symbol: Optional[str] = None
     sl_hits_today: int = 0
+    losing_trades_today: int = 0
     ce: BaseSideState = field(default_factory=BaseSideState)
     pe: BaseSideState = field(default_factory=BaseSideState)

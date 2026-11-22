@@ -48,6 +48,8 @@ interface FormData {
   partialBookingRR: number
   partialBookingLots: number
   partialBookingIntervalRR: number
+  maxLosingTradesPerDay: number
+  executionMode: 'LIVE' | 'TEST'
 }
 
 const Instruments: React.FC = () => {
@@ -83,6 +85,8 @@ const Instruments: React.FC = () => {
     partialBookingRR: 2,
     partialBookingLots: 1,
     partialBookingIntervalRR: 0.5,
+    maxLosingTradesPerDay: 3,
+    executionMode: 'LIVE',
   })
 
   // Fetch symbol suggestions from API
@@ -218,6 +222,10 @@ const Instruments: React.FC = () => {
       alert('Partial booking lots must be a positive whole number')
       return
     }
+    if (!Number.isInteger(formData.maxLosingTradesPerDay) || formData.maxLosingTradesPerDay < 1) {
+      alert('Max losing trades per day must be a positive whole number')
+      return
+    }
 
     const baseLotSize = calculateLotSize(formData.name)
     const lotSize = baseLotSize * formData.lotSizeAdjustment  // Apply adjustment multiplier
@@ -239,6 +247,8 @@ const Instruments: React.FC = () => {
       partialBookingRR: formData.partialBookingRR,
       partialBookingLots: formData.partialBookingLots,
       partialBookingIntervalRR: formData.partialBookingIntervalRR,
+      maxLosingTradesPerDay: formData.maxLosingTradesPerDay,
+      executionMode: formData.executionMode,
     }
 
     if (editingId) {
@@ -277,6 +287,8 @@ const Instruments: React.FC = () => {
       partialBookingRR: inst.partialBookingRR ?? 2,
       partialBookingLots: inst.partialBookingLots ?? 1,
       partialBookingIntervalRR: inst.partialBookingIntervalRR ?? 0.5,
+      maxLosingTradesPerDay: inst.maxLosingTradesPerDay ?? 3,
+      executionMode: inst.executionMode ?? 'LIVE',
     })
     setEditingId(inst.id)
     setShowForm(true)
@@ -306,6 +318,8 @@ const Instruments: React.FC = () => {
       partialBookingRR: 2,
       partialBookingLots: 1,
       partialBookingIntervalRR: 0.5,
+      maxLosingTradesPerDay: 3,
+      executionMode: 'LIVE',
     })
     setSymbolValidation(null)
   }
@@ -508,6 +522,42 @@ const Instruments: React.FC = () => {
               </select>
             </div>
             <div>
+              <label className="block text-sm font-medium text-text-secondary mb-2">Execution Mode</label>
+              <div className="grid grid-cols-2 gap-2">
+                {(['LIVE', 'TEST'] as const).map((mode) => (
+                  <button
+                    key={mode}
+                    type="button"
+                    aria-pressed={formData.executionMode === mode}
+                    onClick={() => setFormData({ ...formData, executionMode: mode })}
+                    className={clsx(
+                      'rounded-md px-3 py-2 text-sm font-extrabold transition-colors ring-2',
+                      mode === 'LIVE'
+                        ? formData.executionMode === mode
+                          ? 'bg-emerald-400 text-black ring-emerald-200'
+                          : 'bg-emerald-950 text-emerald-300 ring-emerald-700 hover:bg-emerald-900'
+                        : formData.executionMode === mode
+                          ? 'bg-amber-300 text-black ring-amber-100'
+                          : 'bg-amber-950 text-amber-300 ring-amber-700 hover:bg-amber-900'
+                    )}
+                  >
+                    {mode}
+                  </button>
+                ))}
+              </div>
+            </div>
+            <div>
+              <label className="block text-sm font-medium text-text-secondary mb-2">Max Losing Trades per Day *</label>
+              <input
+                type="number"
+                min="1"
+                step="1"
+                value={formData.maxLosingTradesPerDay}
+                onChange={(e) => setFormData({ ...formData, maxLosingTradesPerDay: Number(e.target.value) || 1 })}
+                className="w-full px-3 py-2 bg-bg-primary border border-bg-tertiary rounded-lg text-text-primary focus:outline-none focus:border-accent-cyan focus:ring-1 focus:ring-accent-cyan"
+              />
+            </div>
+            <div>
               <label className="block text-sm font-medium text-text-secondary mb-2">Product Type</label>
               <div className="w-full px-3 py-2 bg-bg-primary border border-bg-tertiary rounded-lg text-text-primary font-semibold">
                 INTRADAY (Fixed)
@@ -610,6 +660,8 @@ const Instruments: React.FC = () => {
                   <th className="px-6 py-4 text-left text-sm font-semibold text-text-secondary">Name</th>
                   <th className="px-6 py-4 text-left text-sm font-semibold text-text-secondary">Broker Symbol</th>
                   <th className="px-6 py-4 text-left text-sm font-semibold text-text-secondary">Strategy</th>
+                  <th className="px-6 py-4 text-left text-sm font-semibold text-text-secondary">Mode</th>
+                  <th className="px-6 py-4 text-left text-sm font-semibold text-text-secondary">Max Losing Trades / Day</th>
                   <th className="px-6 py-4 text-left text-sm font-semibold text-text-secondary">Lot Size</th>
                   <th className="px-6 py-4 text-left text-sm font-semibold text-text-secondary">Monitoring</th>
                   <th className="px-6 py-4 text-left text-sm font-semibold text-text-secondary">Status</th>
@@ -628,6 +680,19 @@ const Instruments: React.FC = () => {
                     <td className="px-6 py-4 text-text-secondary font-mono text-sm">{inst.brokerSymbol}</td>
                     <td className="px-6 py-4">
                       <span className={strategyBadgeClass(inst.strategy)}>{inst.strategy}</span>
+                    </td>
+                    <td className="px-6 py-4">
+                      <span className={clsx(
+                        'inline-flex min-w-20 justify-center rounded px-3 py-1 text-xs font-black ring-2',
+                        inst.executionMode === 'TEST'
+                          ? 'bg-amber-300 text-black ring-amber-100'
+                          : 'bg-emerald-400 text-black ring-emerald-200'
+                      )}>
+                        {inst.executionMode}
+                      </span>
+                    </td>
+                    <td className="px-6 py-4 text-text-secondary font-mono">
+                      {inst.maxLosingTradesPerDay}
                     </td>
                     <td className="px-6 py-4 text-text-secondary font-mono">{inst.lotSize || calculateLotSize(inst.name)}</td>
                     <td className="px-6 py-4 text-text-secondary text-sm">

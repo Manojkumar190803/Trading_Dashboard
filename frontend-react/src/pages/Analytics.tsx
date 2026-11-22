@@ -25,13 +25,15 @@ import {
 } from '@/components/UI'
 import DailyPnLCalendar from '@/components/DailyPnLCalendar'
 import MonthlySummary from '@/components/MonthlySummary'
-import { useAnalyticsTrades, useAnalyticsSummary, useAnalyticsSummaryFromAPI, useDailyPnL } from '@/hooks'
+import ExecutionModeBadge from '@/components/ExecutionModeBadge'
+import { useAnalyticsTrades, useAnalyticsSummary, useAnalyticsSummaryFromAPI, useDailyPnL, useTestTradingActivity } from '@/hooks'
 import { formatCurrency, formatPercent, getValueColor, formatNumber } from '@/utils/format'
 import { exportAnalyticsCSV, resetAnalytics } from '@/utils/csv-export'
 import { clsx } from 'clsx'
 
 const Analytics: React.FC = () => {
   const { trades, refetch } = useAnalyticsTrades()
+  const { data: testActivity } = useTestTradingActivity()
   const tradesSummary = useAnalyticsSummary(trades)
   const { summary: apiSummary } = useAnalyticsSummaryFromAPI()
   const [selectedPeriod, setSelectedPeriod] = useState(() => {
@@ -176,6 +178,77 @@ const Analytics: React.FC = () => {
           </button>
         </div>
       </div>
+
+      <section className="space-y-4 border-t border-bg-tertiary pt-6">
+        <div className="flex items-center gap-3">
+          <ExecutionModeBadge mode="TEST" />
+          <h2 className="text-lg font-semibold text-text-primary">Test Performance</h2>
+        </div>
+        <div className="grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-4">
+          <MetricCard
+            label="Test Net P&L"
+            value={formatCurrency(testActivity.summary.net_pnl)}
+            sublabel="Realized + unrealized"
+            icon={<TrendingUp size={16} />}
+            color={testActivity.summary.net_pnl >= 0 ? 'green' : 'red'}
+          />
+          <MetricCard
+            label="Test Open P&L"
+            value={formatCurrency(testActivity.summary.open_pnl)}
+            sublabel="Open virtual positions"
+            icon={<Activity size={16} />}
+            color={testActivity.summary.open_pnl >= 0 ? 'green' : 'red'}
+          />
+          <MetricCard
+            label="Test Realized P&L"
+            value={formatCurrency(testActivity.summary.realized_pnl)}
+            sublabel="Closed virtual positions"
+            icon={<BarChart3 size={16} />}
+            color={testActivity.summary.realized_pnl >= 0 ? 'green' : 'red'}
+          />
+          <MetricCard
+            label="Test Trades"
+            value={testActivity.summary.completed_trades}
+            sublabel="Virtual exits"
+            icon={<Target size={16} />}
+            color="yellow"
+          />
+        </div>
+        {testActivity.trades.length > 0 && (
+          <div className="overflow-x-auto rounded-lg border border-amber-500/40">
+            <table className="w-full">
+              <thead>
+                <tr className="border-b border-amber-500/30 bg-amber-500/10">
+                  <th className="px-4 py-3 text-left text-xs font-semibold text-amber-200">Exit Time</th>
+                  <th className="px-4 py-3 text-left text-xs font-semibold text-amber-200">Instrument / Symbol</th>
+                  <th className="px-4 py-3 text-right text-xs font-semibold text-amber-200">Qty</th>
+                  <th className="px-4 py-3 text-right text-xs font-semibold text-amber-200">Entry</th>
+                  <th className="px-4 py-3 text-right text-xs font-semibold text-amber-200">Exit</th>
+                  <th className="px-4 py-3 text-right text-xs font-semibold text-amber-200">P&amp;L</th>
+                </tr>
+              </thead>
+              <tbody>
+                {testActivity.trades.slice(0, 20).map((trade) => (
+                  <tr key={trade.id} className="border-b border-bg-tertiary">
+                    <td className="px-4 py-3 font-mono text-xs text-text-secondary">{new Date(trade.exit_time).toLocaleString()}</td>
+                    <td className="px-4 py-3 text-sm text-text-primary">{trade.instrument_name}<span className="ml-2 font-mono text-xs text-text-secondary">{trade.symbol}</span></td>
+                    <td className="px-4 py-3 text-right font-mono text-sm text-text-primary">{trade.quantity}</td>
+                    <td className="px-4 py-3 text-right font-mono text-sm text-text-primary">{formatCurrency(trade.entry_price)}</td>
+                    <td className="px-4 py-3 text-right font-mono text-sm text-text-primary">{formatCurrency(trade.exit_price)}</td>
+                    <td className={clsx('px-4 py-3 text-right font-mono text-sm font-bold', getValueColor(trade.pnl))}>{formatCurrency(trade.pnl)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </section>
+
+      <section className="space-y-6 border-t border-bg-tertiary pt-6">
+        <div className="flex items-center gap-3">
+          <ExecutionModeBadge mode="LIVE" />
+          <h2 className="text-lg font-semibold text-text-primary">Live Performance</h2>
+        </div>
 
       {/* Key Metrics */}
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
@@ -592,6 +665,7 @@ const Analytics: React.FC = () => {
           monthSummary={selectedDailyData?.month_summary || null}
         />
       </div>
+      </section>
     </div>
   )
 }

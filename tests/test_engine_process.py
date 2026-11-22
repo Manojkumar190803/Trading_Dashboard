@@ -875,6 +875,138 @@ def test_strategy_daemon_exports_partial_booking_settings():
     assert environment["PARTIAL_BOOKING_INTERVAL_RR"] == "0.75"
 
 
+def test_strategy_daemon_exports_test_mode_identity():
+    environment = strategy_daemon._strategy_environment({
+        "id": 17,
+        "name": "NIFTY Test",
+        "brokerSymbol": "NIFTY",
+        "strategy": "21EMA",
+        "executionMode": "TEST",
+    })
+
+    assert environment["INSTRUMENT_EXECUTION_MODE"] == "TEST"
+    assert environment["INSTRUMENT_ID"] == "17"
+    assert environment["INSTRUMENT_NAME"] == "NIFTY Test"
+
+
+def test_execution_mode_change_restarts_only_the_instrument():
+    instrument = {"strategy": "21EMA", "brokerSymbol": "NIFTY", "executionMode": "LIVE"}
+    changed = {**instrument, "executionMode": "TEST"}
+
+    assert strategy_daemon._runtime_signature(instrument, {}) != (
+        strategy_daemon._runtime_signature(changed, {})
+    )
+
+
+def test_test_alerts_are_not_written_to_live_trade_logs(monkeypatch, tmp_path):
+    class TestAlertBroker(ConsoleBroker):
+        def __init__(self):
+            super().__init__()
+            self.test_alerts = []
+
+        def record_alert(self, timestamp, category, message):
+            self.test_alerts.append((timestamp, category, message))
+
+    engine = _make_engine()
+    broker = TestAlertBroker()
+    engine.broker = broker
+    engine.persist_alerts = True
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        "core.engine.db_sync.save_strategy_config",
+        lambda *args, **kwargs: pytest.fail("Test alert reached Live database config"),
+    )
+    monkeypatch.setattr(
+        "core.engine.db_sync.save_alert",
+        lambda *args, **kwargs: pytest.fail("Test alert reached Live database logs"),
+    )
+
+    timestamp = datetime(2026, 11, 22, 10, 0)
+    engine._record_alert(timestamp, "SIGNAL", "Test signal")
+
+    assert broker.test_alerts == [(timestamp, "SIGNAL", "Test signal")]
+    assert not (tmp_path / "logs").exists()
+
+
+def test_test_runner_does_not_write_to_live_monitoring_file(monkeypatch, tmp_path):
+    from core.runner import _persist_monitoring_row
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("INSTRUMENT_EXECUTION_MODE", "TEST")
+    timestamp = datetime(2026, 11, 22, 10, 0)
+
+    _persist_monitoring_row({
+        "timestamp": timestamp.isoformat(),
+        "category": "SETUP_STATUS",
+        "symbol": "NIFTYTESTCE",
+        "message": "Test setup",
+    })
+
+    assert not (tmp_path / "logs" / "monitoring_20261122.csv").exists()
+
+
+def test_ema21_dashboard_settings_override_env_defaults(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    preferences_path = tmp_path / "logs" / "dashboard_preferences.json"
+    preferences_path.parent.mkdir()
+    preferences_path.write_text('{"lots": 5}', encoding="utf-8")
+    monkeypatch.setenv("EMA21_FULL_SIZE_LOTS", "4")
+    monkeypatch.setenv("NIFTY_MAX_OPTION_RISK_POINTS", "30")
+    monkeypatch.setenv("EMA21_MARKET_OPEN", "09:00")
+    monkeypatch.setenv("EMA21_ATM_LOCK_TIME", "09:20")
+    monkeypatch.setenv("EMA21_ENTRY_START", "09:20")
+    monkeypatch.setenv("EMA21_ENTRY_CUTOFF", "14:40")
+    monkeypatch.setenv("EMA21_SIGNAL_CUTOFF", "14:40")
+    monkeypatch.setenv("EMA21_MARKET_CLOSE", "15:10")
+    monkeypatch.setenv("EMA21_FORCE_SQUARE_OFF", "15:10")
+
+    environment = strategy_daemon._strategy_environment({
+        "id": 9,
+        "strategy": "21EMA",
+        "brokerSymbol": "NIFTY",
+        "lotSizeAdjustment": 2,
+        "monitoringStartTime": "09:30",
+        "monitoringEndTime": "15:00",
+        "entryCutoffTime": "14:45",
+        "maxInitialRiskPoints": 18,
+        "maxLosingTradesPerDay": 2,
+        "partialBookingEnabled": False,
+        "partialBookingRR": 2.5,
+        "partialBookingLots": 2,
+        "partialBookingIntervalRR": 0.75,
+    })
+    for name, value in environment.items():
+        monkeypatch.setenv(name, value)
+
+    cfg = StrategyConfig()
+    run_strategy._apply_ema21_policy(cfg, "NIFTY")
+    run_strategy._apply_partial_booking_policy(cfg)
+
+    assert cfg.full_size_lots == 2
+    assert cfg.market_open == time(9, 30)
+    assert cfg.entry_start == time(9, 30)
+    assert cfg.atm_lock_time == time(9, 30)
+    assert cfg.market_close == time(15, 0)
+    assert cfg.force_square_off == time(15, 0)
+    assert cfg.entry_cutoff == time(14, 45)
+    assert cfg.signal_cutoff == time(14, 45)
+    assert cfg.max_option_risk_points == 18
+    assert cfg.max_losing_trades_per_day == 2
+    assert cfg.partial_booking_enabled is False
+    assert cfg.t2_rr == 2.5
+    assert cfg.partial_booking_lots == 2
+    assert cfg.partial_booking_interval_rr == 0.75
+
+
+def test_ema21_dashboard_window_must_be_valid(monkeypatch):
+    monkeypatch.setenv("DASHBOARD_EMA21_MONITORING_START_TIME", "10:00")
+    monkeypatch.setenv("DASHBOARD_EMA21_MONITORING_END_TIME", "09:00")
+    monkeypatch.setenv("DASHBOARD_EMA21_ENTRY_CUTOFF", "09:30")
+
+    with pytest.raises(ValueError, match="monitoring start must be earlier"):
+        run_strategy._apply_dashboard_ema21_overrides(StrategyConfig())
+
+
 def test_process_tick_modifies_sl_once_for_high_rr_tick():
     broker = RecordingBroker()
     engine = BaseStrategyEngine(
