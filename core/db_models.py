@@ -8,7 +8,7 @@ from decimal import Decimal
 from typing import Optional
 from sqlalchemy import (
     Column, Integer, String, Float, DateTime, Text, Boolean, 
-    DECIMAL, ForeignKey, Index, Enum, UniqueConstraint, inspect, text
+    DECIMAL, ForeignKey, Index, Enum, MetaData, Table, UniqueConstraint, inspect, select, text
 )
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import relationship
@@ -303,13 +303,13 @@ class Instrument(Base):
     """Trading instruments configured for monitoring and strategies"""
     __tablename__ = "instruments"
     __table_args__ = (
-        UniqueConstraint("name", name="uq_instrument_name"),
+        UniqueConstraint("name", "strategy", name="uq_instrument_name_strategy"),
         Index("idx_instrument_status", "status"),
         Index("idx_instrument_strategy", "strategy"),
     )
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    name = Column(String(100), nullable=False, unique=True, index=True)
+    name = Column(String(100), nullable=False)
     broker_symbol = Column(String(100), nullable=False)
     strategy = Column(String(50), nullable=False, index=True)
     
@@ -349,6 +349,87 @@ class Instrument(Base):
 
 
 # Utility function to create all tables
+def _migrate_instrument_identity(engine) -> None:
+    inspector = inspect(engine)
+    constraints = inspector.get_unique_constraints("instruments")
+    indexes = inspector.get_indexes("instruments")
+    legacy_constraints = [
+        constraint for constraint in constraints
+        if constraint.get("column_names") == ["name"]
+    ]
+    legacy_constraint_names = {constraint.get("name") for constraint in legacy_constraints}
+    legacy_indexes = [
+        index for index in indexes
+        if index.get("unique")
+        and index.get("column_names") == ["name"]
+        and index.get("name") not in legacy_constraint_names
+    ]
+    has_composite_constraint = any(
+        constraint.get("column_names") == ["name", "strategy"]
+        for constraint in constraints
+    )
+
+    if not legacy_constraints and not legacy_indexes and has_composite_constraint:
+        return
+
+    if engine.dialect.name == "postgresql":
+        preparer = engine.dialect.identifier_preparer
+        with engine.begin() as connection:
+            for constraint in legacy_constraints:
+                name = constraint.get("name")
+                if name:
+                    connection.execute(text(
+                        f"ALTER TABLE instruments DROP CONSTRAINT {preparer.quote(name)}"
+                    ))
+            for index in legacy_indexes:
+                name = index.get("name")
+                if name:
+                    connection.execute(text(f"DROP INDEX IF EXISTS {preparer.quote(name)}"))
+            if not has_composite_constraint:
+                connection.execute(text(
+                    "ALTER TABLE instruments ADD CONSTRAINT "
+                    "uq_instrument_name_strategy UNIQUE (name, strategy)"
+                ))
+        return
+
+    if engine.dialect.name == "sqlite" and (
+        legacy_constraints or legacy_indexes or not has_composite_constraint
+    ):
+        instrument_table = Base.metadata.tables["instruments"]
+        temporary_table = instrument_table.to_metadata(
+            MetaData(),
+            name="instruments_identity_migration",
+        )
+        for index in list(temporary_table.indexes):
+            temporary_table.indexes.remove(index)
+
+        with engine.begin() as connection:
+            existing_table = Table("instruments", MetaData(), autoload_with=connection)
+            temporary_table.create(connection)
+            columns = [
+                column.name for column in instrument_table.columns
+                if column.name in existing_table.c
+            ]
+            connection.execute(
+                temporary_table.insert().from_select(
+                    columns,
+                    select(*(existing_table.c[name] for name in columns)),
+                )
+            )
+            existing_table.drop(connection)
+            connection.execute(text(
+                "ALTER TABLE instruments_identity_migration RENAME TO instruments"
+            ))
+            for index in instrument_table.indexes:
+                index.create(connection, checkfirst=True)
+        return
+
+    if legacy_constraints or legacy_indexes:
+        raise RuntimeError(
+            f"Cannot migrate instrument name uniqueness for {engine.dialect.name}"
+        )
+
+
 def create_all_tables(engine):
     """Create tables and add supported columns to existing instrument tables."""
     Base.metadata.create_all(engine)
@@ -372,5 +453,6 @@ def create_all_tables(engine):
                     connection.execute(
                         text(f"ALTER TABLE instruments ADD COLUMN {column_name} {definition}")
                     )
+        _migrate_instrument_identity(engine)
 
     print("✅ Database schema created successfully!")

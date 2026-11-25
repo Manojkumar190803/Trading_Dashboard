@@ -204,13 +204,30 @@ def get_test_trading_data():
 
     open_pnl = sum(float(position.get("unrealized_pnl", 0) or 0) for position in positions)
     realized_pnl = sum(float(trade.get("pnl", 0) or 0) for trade in trades)
+    unique_alerts = []
+    seen_alerts = set()
+    for alert in alerts:
+        category = str(alert.get("category") or "")
+        timestamp = str(alert.get("timestamp") or "")
+        if category == "ATM_LOCK":
+            timestamp = timestamp[:10]
+        key = (
+            str(alert.get("instrument_id") or ""),
+            timestamp,
+            category,
+            str(alert.get("message") or ""),
+        )
+        if key in seen_alerts:
+            continue
+        seen_alerts.add(key)
+        unique_alerts.append(alert)
     return jsonify({
         "execution_mode": "TEST",
         "instruments": instruments,
         "positions": positions,
         "orders": sorted(orders, key=lambda row: str(row.get("timestamp") or ""), reverse=True),
         "trades": sorted(trades, key=lambda row: str(row.get("exit_time") or ""), reverse=True),
-        "alerts": sorted(alerts, key=lambda row: str(row.get("timestamp") or ""), reverse=True),
+        "alerts": sorted(unique_alerts, key=lambda row: str(row.get("timestamp") or ""), reverse=True),
         "summary": {
             "open_positions": len(positions),
             "open_pnl": round(open_pnl, 2),
@@ -769,15 +786,18 @@ def create_instrument():
         data = request.json
         session = DatabaseConnection.get_session()
         name = str(data.get("name") or "").strip()
-        existing = session.query(Instrument).filter_by(name=name).first()
+        strategy = str(data.get("strategy") or "").strip().upper()
+        existing = session.query(Instrument).filter_by(name=name, strategy=strategy).first()
 
         if existing and existing.status == "ACTIVE":
-            return jsonify({"error": f"Instrument '{name}' is already active"}), 409
+            return jsonify({
+                "error": f"Instrument '{name}' for strategy '{strategy}' is already active"
+            }), 409
         
         instrument = existing or Instrument(name=name)
         instrument.name = name
         instrument.broker_symbol = data.get("brokerSymbol")
-        instrument.strategy = data.get("strategy")
+        instrument.strategy = strategy
         instrument.monitoring_start_time = data.get("monitoringStartTime")
         instrument.monitoring_end_time = data.get("monitoringEndTime")
         instrument.entry_cutoff_time = data.get("entryCutoffTime", "14:40")
@@ -826,8 +846,11 @@ def create_instrument():
         if session is not None:
             session.rollback()
         error_message = str(e)
-        if "uq_instrument_name" in error_message:
-            return jsonify({"error": "An instrument with this name already exists"}), 409
+        if (
+            "uq_instrument_name_strategy" in error_message
+            or "instruments.name, instruments.strategy" in error_message
+        ):
+            return jsonify({"error": "An instrument with this name and strategy already exists"}), 409
         logger.error(f"Error creating instrument: {e}")
         return jsonify({"error": error_message}), 500
     finally:
@@ -856,7 +879,7 @@ def update_instrument(instrument_id):
         if "brokerSymbol" in data:
             instrument.broker_symbol = data["brokerSymbol"]
         if "strategy" in data:
-            instrument.strategy = data["strategy"]
+            instrument.strategy = str(data["strategy"]).strip().upper()
         if "monitoringStartTime" in data:
             instrument.monitoring_start_time = data["monitoringStartTime"]
         if "monitoringEndTime" in data:
@@ -900,6 +923,17 @@ def update_instrument(instrument_id):
             instrument.premium_option_strike = int(data["premiumOptionStrike"]) if data["premiumOptionStrike"] else None
         if "status" in data:
             instrument.status = data["status"]
+
+        duplicate = session.query(Instrument).filter(
+            Instrument.id != instrument.id,
+            Instrument.name == instrument.name,
+            Instrument.strategy == instrument.strategy,
+        ).first()
+        if duplicate:
+            return jsonify({
+                "error": f"Instrument '{instrument.name}' for strategy "
+                f"'{instrument.strategy}' already exists"
+            }), 409
         
         session.commit()
         

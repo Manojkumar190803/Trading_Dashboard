@@ -1,7 +1,7 @@
-This revised Functional Requirements Document (FRD) V3.3 defines the HD trend,
+This revised Functional Requirements Document (FRD) V3.4 defines the HD trend,
 instrument selection, entry, risk, order, and dashboard-controlled trailing rules.
 
-Functional Requirements Document (FRD): HD Option Strategy (V3.3)
+Functional Requirements Document (FRD): HD Option Strategy (V3.4)
 
 1. Project Overview
 
@@ -9,31 +9,37 @@ The HD Strategy is an automated system for Nifty weekly options. It uses
 3-minute NIFTY spot candles to determine direction and 3-minute candles from a
 selected CE or PE contract to identify the RSI pullback and alert candle. The
 React dashboard is the source of truth for per-instrument monitoring start/end,
-entry cutoff, premium range, lot-size adjustment, and maximum initial risk.
+entry cutoff, lot-size adjustment, and maximum initial risk. HD contract selection
+uses a fixed premium floor of ₹150 rather than the dashboard's legacy premium-range
+fields.
 Changes to an active instrument's settings restart its strategy process so the
 new values take effect. Global dashboard trailing settings control breakeven
 and trailing steps. Stop and milestone monitoring uses live option ticks.
 
 The configured monitoring start/end times define the runner's active window.
 HD locks contracts no earlier than 09:20; if monitoring starts later, contract
-selection happens at the configured start. Monitoring end also triggers
-square-off. Entry cutoff must fall within the monitoring window.
+selection happens at the configured start. It then rechecks selection every hour
+from the initial lock time. Monitoring end also triggers square-off. Entry cutoff
+must fall within the monitoring window.
 
 2. Instrument Selection & Initialization
 
   - Base Index: NIFTY (NSE_INDEX).
   - At the later of 09:20 IST or the instrument's configured monitoring start,
-    inspect current-weekly-expiry CE and PE contracts.
-  - Derive the ATM reference strike from the spot price using the configured
-    strike step. Select the CE exactly one strike step below ATM and the PE
-    exactly one strike step above ATM (one strike ITM for each side).
-  - For each one-step ITM contract, require premium to be within that
-    instrument's configured React dashboard range. If multiple chain rows
-    exist for the target strike, select the premium closest to the range
-    midpoint. Lock the selected symbols for the session.
-  - Do not fall back to ATM, farther ITM, or OTM contracts if a one-step ITM
-    contract is missing or outside the premium range; leave that side disabled
-    and record the reason.
+    lock contracts and prefer a CE/PE pair expiring on the current trading day
+    when one is available. If no complete same-day pair is available, use the
+    next eligible expiry according to the configured expiry policy.
+  - Recheck and refresh the contract selection every hour from the initial lock
+    time. Existing open or pending positions remain on their original contracts;
+    refreshed contracts apply to future signals.
+  - Derive the ATM reference strike from spot using the configured strike step.
+    Search from one strike ITM (CE below ATM and PE above ATM), then
+    progressively deeper ITM strikes until each side has an available premium
+    at or above ₹150. Select the first eligible ITM contract; never select a
+    premium below ₹150. There is no upper premium limit. Search is bounded to
+    50 strike steps.
+  - If no eligible contract is found for a side, record a risk alert and leave
+    that side unlocked.
 
 3. Technical Indicators (Calculated on 3-Min Candles)
 
@@ -144,7 +150,7 @@ Detailed logs required for:
   - WebSocket "Price Hit" events for every 0.5 RR milestone.
   - Order fill prices vs. requested prices (Slippage tracking).
 
-END OF FRD V3.3
+END OF FRD V3.4
 
 9. Runtime Deployment and Strategy Isolation
 

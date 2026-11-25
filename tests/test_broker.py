@@ -117,6 +117,105 @@ def test_openalgo_broker_init_and_dry_run_order_paths(fake_openalgo):
     assert broker.place_market_order("NIFTYCE", OrderSide.SELL, 2).startswith("DRY-MKT-")
 
 
+def test_openalgo_modify_does_not_confirm_unchanged_broker_order(fake_openalgo):
+    broker = OpenAlgoBroker(api_key="k", host="h", dry_run=False)
+    broker.client.modifyorder = lambda **kwargs: {"status": "success"}
+    broker.client.orderbook = lambda: {
+        "status": "success",
+        "data": {"orders": [{
+            "orderid": "SL-1",
+            "symbol": "NIFTY01DEC2625700PE",
+            "action": "SELL",
+            "order_status": "trigger pending",
+            "quantity": "65",
+            "trigger_price": 132.85,
+            "price": 131.85,
+        }]},
+    }
+
+    assert not broker.modify_stop_limit_order(
+        "SL-1", "NIFTY01DEC2625700PE", OrderSide.SELL, 65, 161.80, 160.80
+    )
+
+
+def test_openalgo_modify_confirms_matching_broker_order(fake_openalgo):
+    broker = OpenAlgoBroker(api_key="k", host="h", dry_run=False)
+    broker.client.modifyorder = lambda **kwargs: {"status": "success"}
+    broker.client.orderbook = lambda: {
+        "status": "success",
+        "data": {"orders": [{
+            "orderid": "SL-1",
+            "symbol": "NIFTY01DEC2625700PE",
+            "action": "SELL",
+            "order_status": "trigger pending",
+            "quantity": "65",
+            "trigger_price": 161.80,
+            "price": 160.80,
+        }]},
+    }
+
+    assert broker.modify_stop_limit_order(
+        "SL-1", "NIFTY01DEC2625700PE", OrderSide.SELL, 65, 161.80, 160.80
+    )
+
+
+def test_openalgo_modify_does_not_confirm_unavailable_orderbook(fake_openalgo):
+    broker = OpenAlgoBroker(api_key="k", host="h", dry_run=False)
+    requests = []
+    broker.client.modifyorder = lambda **kwargs: requests.append(kwargs) or {"status": "success"}
+    broker.client.orderbook = lambda: {"status": "error"}
+
+    assert not broker.modify_stop_limit_order(
+        "SL-1", "NIFTY01DEC2625700PE", OrderSide.SELL, 65, 161.80, 160.80
+    )
+    assert requests == []
+
+
+def test_openalgo_modify_does_not_confirm_mismatched_quantity(fake_openalgo):
+    broker = OpenAlgoBroker(api_key="k", host="h", dry_run=False)
+    broker.client.modifyorder = lambda **kwargs: {"status": "success"}
+    broker.client.orderbook = lambda: {
+        "status": "success",
+        "data": {"orders": [{
+            "orderid": "SL-1",
+            "symbol": "NIFTY01DEC2625700PE",
+            "action": "SELL",
+            "order_status": "trigger pending",
+            "quantity": "65.5",
+            "trigger_price": 161.80,
+            "price": 160.80,
+        }]},
+    }
+
+    assert not broker.modify_stop_limit_order(
+        "SL-1", "NIFTY01DEC2625700PE", OrderSide.SELL, 65, 161.80, 160.80
+    )
+
+
+def test_openalgo_modify_does_not_lower_manually_raised_sell_stop(fake_openalgo):
+    broker = OpenAlgoBroker(api_key="k", host="h", dry_run=False)
+    requests = []
+    broker.client.modifyorder = lambda **kwargs: requests.append(kwargs) or {"status": "success"}
+    broker.client.orderbook = lambda: {
+        "status": "success",
+        "data": {"orders": [{
+            "orderid": "SL-1",
+            "symbol": "NIFTY01DEC2625700PE",
+            "action": "SELL",
+            "order_status": "trigger pending",
+            "quantity": "65",
+            "trigger_price": 230.0,
+            "price": 229.0,
+        }]},
+    }
+
+    broker.modify_stop_limit_order(
+        "SL-1", "NIFTY01DEC2625700PE", OrderSide.SELL, 65, 228.10, 227.10
+    )
+
+    assert requests == []
+
+
 def test_test_trading_broker_simulates_and_persists_without_openalgo_orders(
     fake_openalgo,
     monkeypatch,
@@ -158,6 +257,42 @@ def test_test_trading_broker_simulates_and_persists_without_openalgo_orders(
     )
     assert restored.get_position_book() == []
     assert len(restored._trades) == 1
+
+
+def test_test_trading_broker_deduplicates_repeated_alerts_across_restarts(
+    fake_openalgo,
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setenv("LOGS_DIR", str(tmp_path))
+    broker = TestTradingBroker(
+        api_key="k",
+        host="h",
+        instrument_id="instrument-7",
+        instrument_name="NIFTY Test",
+    )
+    timestamp = pd.Timestamp("2026-11-23 09:20:00").to_pydatetime()
+
+    broker.record_alert(timestamp, "RISK", "HD contracts not locked")
+    broker.record_alert(timestamp, "RISK", "HD contracts not locked")
+    broker.record_alert(timestamp, "ATM_LOCK", "Contracts locked")
+    broker.record_alert(timestamp.replace(hour=13, minute=42), "ATM_LOCK", "Contracts locked")
+
+    state_path = tmp_path / "test_trading_instrument-7.json"
+    payload = json.loads(state_path.read_text())
+    payload["alerts"].append({**payload["alerts"][0], "id": "instrument-7-duplicate"})
+    state_path.write_text(json.dumps(payload))
+
+    restored = TestTradingBroker(
+        api_key="k",
+        host="h",
+        instrument_id="instrument-7",
+        instrument_name="NIFTY Test",
+    )
+    restored.record_alert(timestamp, "RISK", "HD contracts not locked")
+
+    payload = json.loads(state_path.read_text())
+    assert len(payload["alerts"]) == 2
 
 
 def test_openalgo_broker_fetches_chain_for_selected_expiry(fake_openalgo):
@@ -215,6 +350,52 @@ def test_openalgo_broker_fetches_chain_through_rest_when_sdk_lacks_method(fake_o
     }
 
 
+def test_openalgo_broker_searches_symbols_through_rest_when_sdk_lacks_method(
+    fake_openalgo,
+    monkeypatch,
+):
+    broker = OpenAlgoBroker(api_key="k", host="h", dry_run=True)
+    client = fake_openalgo["client"]
+    client.base_url = "http://openalgo:5000/api/v1/"
+    client.api_key = "test-key"
+    expected_data = [
+        {
+            "symbol": "NIFTY24NOV2625300CE",
+            "name": "NIFTY",
+            "strike": 25300,
+            "instrumenttype": "CE",
+            "expiry": "24-NOV-26",
+        }
+    ]
+    request = {}
+
+    class _Response:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"status": "success", "data": expected_data}
+
+    def _post(url, *, json, timeout):
+        request.update(url=url, json=json, timeout=timeout)
+        return _Response()
+
+    monkeypatch.setattr("core.broker.requests.post", _post)
+
+    data = broker.search_symbols("NIFTY 25300 CE", "NFO")
+
+    assert data == expected_data
+    assert request == {
+        "url": "http://openalgo:5000/api/v1/search",
+        "json": {
+            "apikey": "test-key",
+            "query": "NIFTY 25300 CE",
+            "exchange": "NFO",
+        },
+        "timeout": 15,
+    }
+
+
 def test_openalgo_broker_option_chain_failure_is_reported(fake_openalgo):
     broker = OpenAlgoBroker(api_key="k", host="h", dry_run=True)
     fake_openalgo["client"].optionchain_response = {
@@ -224,6 +405,25 @@ def test_openalgo_broker_option_chain_failure_is_reported(fake_openalgo):
 
     with pytest.raises(RuntimeError, match="option chain request failed"):
         broker.fetch_option_chain("NIFTY", "NSE_INDEX", "22OCT26")
+
+
+def test_openalgo_broker_explains_missing_option_chain_endpoint(fake_openalgo, monkeypatch):
+    broker = OpenAlgoBroker(api_key="k", host="h", dry_run=True)
+    client = fake_openalgo["client"]
+    client.optionchain = None
+    client.base_url = "http://openalgo:5000/api/v1/"
+    client.api_key = "test-key"
+
+    class _Response:
+        def raise_for_status(self):
+            response = requests.Response()
+            response.status_code = 404
+            raise requests.HTTPError("404 Client Error", response=response)
+
+    monkeypatch.setattr("core.broker.requests.post", lambda *_args, **_kwargs: _Response())
+
+    with pytest.raises(RuntimeError, match="does not expose the option-chain API"):
+        broker.fetch_option_chain("NIFTY", "NSE_INDEX", "24NOV26")
 
 
 def test_openalgo_broker_get_ltp_paths(fake_openalgo):

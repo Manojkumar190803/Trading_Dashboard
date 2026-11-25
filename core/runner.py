@@ -114,17 +114,25 @@ def _save_runner_checkpoint(
         )
 
 
-def _persist_monitoring_row(row: dict[str, object]) -> None:
-    if os.getenv("INSTRUMENT_EXECUTION_MODE", "LIVE").strip().upper() == "TEST":
-        return
+def _monitoring_csv_path(timestamp: datetime) -> Optional[Path]:
     logs_dir = Path("logs")
-    logs_dir.mkdir(parents=True, exist_ok=True)
+    if os.getenv("INSTRUMENT_EXECUTION_MODE", "LIVE").strip().upper() == "TEST":
+        instrument_id = os.getenv("INSTRUMENT_ID", "").strip()
+        if not instrument_id:
+            return None
+        return logs_dir / f"monitoring_test_{instrument_id}_{timestamp:%Y%m%d}.csv"
+    return logs_dir / f"monitoring_{timestamp:%Y%m%d}.csv"
+
+
+def _persist_monitoring_row(row: dict[str, object]) -> None:
     timestamp = pd.to_datetime(row.get("timestamp"), errors="coerce")
     if pd.isna(timestamp):
         return
-    date_key = timestamp.strftime("%Y%m%d")
-    csv_path = logs_dir / f"monitoring_{date_key}.csv"
-    txt_path = logs_dir / f"monitoring_{date_key}.txt"
+    csv_path = _monitoring_csv_path(timestamp.to_pydatetime())
+    if csv_path is None:
+        return
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    txt_path = csv_path.with_suffix(".txt")
 
     with csv_path.open("a", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=list(row))
@@ -179,7 +187,9 @@ def _persist_candle_monitoring(
             f"EMA21={ema_text}"
         ),
     }
-    csv_path = Path("logs") / f"monitoring_{timestamp:%Y%m%d}.csv"
+    csv_path = _monitoring_csv_path(timestamp)
+    if csv_path is None:
+        return
     candle_key = f"{timeframe_minutes}m candle {timestamp.strftime('%H:%M:%S')}"
     if csv_path.exists():
         try:
@@ -229,7 +239,9 @@ def _persist_setup_status_monitoring(
         "trade_pnl": None,
         "message": message,
     }
-    csv_path = Path("logs") / f"monitoring_{candle_time:%Y%m%d}.csv"
+    csv_path = _monitoring_csv_path(candle_time.to_pydatetime())
+    if csv_path is None:
+        return
     if csv_path.exists():
         try:
             with csv_path.open(newline="", encoding="utf-8") as handle:
@@ -322,10 +334,58 @@ def _persist_atm_lock(engine: BaseStrategyEngine, spot_price: float) -> None:
         "spot_price": spot_price,
         "ce_symbol": engine.state.ce_symbol,
         "pe_symbol": engine.state.pe_symbol,
+        "locked_at": (
+            engine.state.atm_locked_at.isoformat()
+            if engine.state.atm_locked_at is not None
+            else None
+        ),
     }
     temporary = path.with_suffix(".tmp")
     temporary.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
     temporary.replace(path)
+
+
+def _scheduled_hd_lock_time(now: datetime, lock_time: time) -> Optional[datetime]:
+    initial_lock = datetime.combine(now.date(), lock_time)
+    if now < initial_lock:
+        return None
+    elapsed_hours = int((now - initial_lock).total_seconds() // 3600)
+    return initial_lock + timedelta(hours=elapsed_hours)
+
+
+def _copy_contract_lock(source: BaseStrategyEngine, target: BaseStrategyEngine) -> None:
+    lock_time = source.state.atm_locked_at or datetime.combine(
+        source.state.trading_day or datetime.now().date(),
+        source.cfg.atm_lock_time,
+    )
+    target.on_day_transition_if_needed(lock_time)
+    for side in ("CE", "PE"):
+        source_symbol = (
+            source.state.ce_symbol if side == "CE" else source.state.pe_symbol
+        )
+        side_state = target._side_state(side)
+        active_symbol = None
+        if side_state.position is not None:
+            active_symbol = side_state.position.option_symbol
+        elif side_state.pending_entry is not None:
+            active_symbol = side_state.pending_entry.option_symbol
+        assigned_symbol = active_symbol or source_symbol
+        if active_symbol is None and side_state.option_symbol != assigned_symbol:
+            replacement = target.signal_provider.create_side_state()
+            replacement.option_symbol = assigned_symbol
+            if side == "CE":
+                target.state.ce = replacement
+            else:
+                target.state.pe = replacement
+        if side == "CE":
+            target.state.ce_symbol = assigned_symbol
+            target.state.ce.option_symbol = assigned_symbol
+        else:
+            target.state.pe_symbol = assigned_symbol
+            target.state.pe.option_symbol = assigned_symbol
+    target.state.atm_strike = source.state.atm_strike
+    target.state.atm_locked = bool(target.state.ce_symbol or target.state.pe_symbol)
+    target.state.atm_locked_at = source.state.atm_locked_at
 
 
 def _restore_atm_lock(engine: BaseStrategyEngine, trading_day: date) -> bool:
@@ -352,7 +412,20 @@ def _restore_atm_lock(engine: BaseStrategyEngine, trading_day: date) -> bool:
     engine.state.ce.option_symbol = ce_symbol
     engine.state.pe.option_symbol = pe_symbol
     engine.state.atm_locked = True
+    lock_time = datetime.combine(trading_day, engine.cfg.atm_lock_time)
+    locked_at_value = payload.get("locked_at")
+    if isinstance(locked_at_value, str):
+        try:
+            lock_time = datetime.fromisoformat(locked_at_value).replace(tzinfo=None)
+        except ValueError:
+            logger.warning("invalid locked_at value in %s", path)
+    engine.state.atm_locked_at = lock_time
     logger.info("restored ATM lock for %s: CE=%s PE=%s", trading_day, ce_symbol, pe_symbol)
+    engine._record_alert(
+        _now_ist_naive(),
+        "ATM_LOCK",
+        f"Restored ATM lock for {trading_day}: CE={ce_symbol or '-'} PE={pe_symbol or '-'}",
+    )
     return True
 
 
@@ -406,6 +479,10 @@ def _restore_atm_lock_from_positions(
         engine.state.ce.option_symbol = ce_symbol
         engine.state.pe.option_symbol = pe_symbol
         engine.state.atm_locked = True
+        engine.state.atm_locked_at = datetime.combine(
+            trading_day,
+            engine.cfg.atm_lock_time,
+        )
         logger.warning(
             "restored ATM lock for %s from held broker position: CE=%s PE=%s",
             trading_day, ce_symbol, pe_symbol,
@@ -447,6 +524,10 @@ def _restore_atm_lock_from_alerts(engine: BaseStrategyEngine, trading_day: date)
     engine.state.ce.option_symbol = engine.state.ce_symbol
     engine.state.pe.option_symbol = engine.state.pe_symbol
     engine.state.atm_locked = True
+    engine.state.atm_locked_at = datetime.combine(
+        trading_day,
+        engine.cfg.atm_lock_time,
+    )
     logger.info(
         "replay restored ATM lock for %s from alerts: CE=%s PE=%s",
         trading_day, engine.state.ce_symbol, engine.state.pe_symbol,
@@ -732,13 +813,26 @@ def _restore_open_positions(engine: BaseStrategyEngine, broker: OpenAlgoBroker, 
             if engine._is_hd_strategy():
                 quantity = min(quantity, live_pending.quantity)
             avg_price_raw = position.get("average_price")
-            if engine._is_hd_strategy() and live_pending.order_id:
+            if engine._is_ema21_strategy():
+                try:
+                    order_status = broker.get_order_status(live_pending.order_id) if live_pending.order_id else {}
+                except Exception as exc:
+                    logger.warning("cannot confirm entry fill for %s: %s", symbol, exc)
+                    continue
+                avg_price_raw = order_status.get("average_price")
+                if str(order_status.get("order_status") or order_status.get("status") or "").lower() not in {"complete", "filled", "executed"}:
+                    logger.warning("cannot restore %s without a completed entry order", symbol)
+                    continue
+            elif engine._is_hd_strategy() and live_pending.order_id:
                 order_status = broker.get_order_status(live_pending.order_id)
                 avg_price_raw = order_status.get("average_price") or avg_price_raw
             try:
                 avg_price = float(avg_price_raw) if avg_price_raw else None
             except (ValueError, TypeError):
                 avg_price = None
+            if engine._is_ema21_strategy() and (avg_price is None or not np.isfinite(avg_price) or avg_price <= 0):
+                logger.warning("cannot restore %s without its confirmed entry fill price", symbol)
+                continue
             if avg_price is None or avg_price <= 0:
                 logger.warning(
                     "position restore: broker missing/invalid average_price for %s; "
@@ -766,14 +860,14 @@ def _restore_open_positions(engine: BaseStrategyEngine, broker: OpenAlgoBroker, 
             side, _, parsed_entry, _, trigger, stop, risk = match.groups()
             entry_alert = matching[-1]
             avg_price_raw = position.get("average_price")
+            if parsed_entry:
+                avg_price_raw = parsed_entry
             if engine._is_hd_strategy():
                 try:
                     quantity = min(quantity, int(match.group(4)))
                 except (TypeError, ValueError):
                     logger.warning("could not parse HD entry quantity for %s", symbol)
                     continue
-                if parsed_entry:
-                    avg_price_raw = parsed_entry
             try:
                 avg_price = float(avg_price_raw) if avg_price_raw else None
             except (ValueError, TypeError):
@@ -1144,12 +1238,15 @@ def _reconcile_pending_entry_fills(
             # Reuse broker position reconciliation so the local Position and
             # protective stop are established before the first live tick.
             _restore_open_positions(engine, broker, trading_day)
-            if engine._side_state(side).position is not None:
+            position = engine._side_state(side).position
+            if position is not None:
                 engine._side_state(side).pending_entry = None
                 engine._record_alert(
                     datetime.now(), "ENTRY",
-                    f"{side} entry fill confirmed; tick monitoring activated for "
-                    f"{pending.option_symbol}",
+                    f"Entered {side} {pending.option_symbol} @ {position.entry_price:.2f}, "
+                    f"qty={position.quantity}, trigger={pending.option_trigger_level:.2f}, "
+                    f"SL={pending.option_stop_level:.2f}, option_risk={position.option_risk_points:.2f}, "
+                    f"order_id={order_id}; tick monitoring activated",
                 )
 
 
@@ -1482,16 +1579,36 @@ class LiveFeedRunner(_LivePositionCandleSupport):
         self._stop.set()
 
     def _try_lock_atm(self, now: datetime) -> None:
-        if self.engine.state.atm_locked:
-            return
-        if _restore_atm_lock(self.engine, now.date()):
-            _restore_open_positions(self.engine, self.broker, now.date())
-            return
-        if _restore_atm_lock_from_positions(self.engine, self.broker, now.date()):
-            _restore_open_positions(self.engine, self.broker, now.date())
-            return
-        if now.time() < self.cfg.atm_lock_time:
-            return
+        engine = self.engine
+        was_locked = engine.state.atm_locked
+        if not was_locked:
+            if _restore_atm_lock(engine, now.date()):
+                was_locked = True
+                _restore_open_positions(engine, self.broker, now.date())
+            elif _restore_atm_lock_from_positions(engine, self.broker, now.date()):
+                was_locked = True
+                _restore_open_positions(engine, self.broker, now.date())
+
+        if engine._is_hd_strategy():
+            lock_ts = _scheduled_hd_lock_time(now, self.cfg.atm_lock_time)
+            if lock_ts is None:
+                return
+            if was_locked:
+                last_lock = engine.state.atm_locked_at or datetime.combine(
+                    now.date(),
+                    self.cfg.atm_lock_time,
+                )
+                if lock_ts <= last_lock:
+                    return
+                _restore_open_positions(engine, self.broker, now.date())
+            force_refresh = was_locked
+        else:
+            if was_locked or now.time() < self.cfg.atm_lock_time:
+                return
+            lock_ts = datetime.combine(now.date(), self.cfg.atm_lock_time)
+            force_refresh = False
+
+        previous_symbols = (engine.state.ce_symbol, engine.state.pe_symbol)
         try:
             spot_ltp = self.broker.get_ltp(self.cfg.spot_symbol)
         except Exception as exc:
@@ -1500,11 +1617,24 @@ class LiveFeedRunner(_LivePositionCandleSupport):
         if not spot_ltp:
             logger.warning("spot LTP came back 0/None — will retry next poll")
             return
-        lock_ts = datetime.combine(now.date(), self.cfg.atm_lock_time)
-        self.engine.on_day_transition_if_needed(lock_ts)
-        self.engine.lock_atm_for_day(lock_ts, float(spot_ltp))
-        _persist_atm_lock(self.engine, float(spot_ltp))
-        _restore_open_positions(self.engine, self.broker, now.date())
+        engine.on_day_transition_if_needed(lock_ts)
+        engine.lock_atm_for_day(
+            lock_ts,
+            float(spot_ltp),
+            force_refresh=force_refresh,
+        )
+        if engine.state.atm_locked and engine.state.atm_locked_at == lock_ts:
+            _persist_atm_lock(engine, float(spot_ltp))
+            _restore_open_positions(engine, self.broker, now.date())
+            current_symbols = (engine.state.ce_symbol, engine.state.pe_symbol)
+            for side, old_symbol, new_symbol in zip(
+                ("CE", "PE"),
+                previous_symbols,
+                current_symbols,
+            ):
+                if old_symbol != new_symbol:
+                    self._last_bar_time[side] = None
+                    self._startup_baselined.discard(side)
 
     def _fetch_option_history(self, option_symbol: str) -> pd.DataFrame:
         today = datetime.now().date()
@@ -1992,6 +2122,78 @@ class MultiEngineLiveFeedRunner(_LivePositionCandleSupport):
 
     def _try_lock_atm(self, now: datetime) -> None:
         first_engine = self.engines[0][1]
+        hd_engine = next(
+            (engine for _, engine in self.engines if engine._is_hd_strategy()),
+            None,
+        )
+        if hd_engine is not None:
+            previous_symbols = (first_engine.state.ce_symbol, first_engine.state.pe_symbol)
+            if not hd_engine.state.atm_locked:
+                restored = _restore_atm_lock(hd_engine, now.date())
+                if not restored:
+                    restored = _restore_atm_lock_from_positions(
+                        hd_engine,
+                        self.broker,
+                        now.date(),
+                    )
+                if restored:
+                    for _, engine in self.engines:
+                        _restore_open_positions(engine, self.broker, now.date())
+                        if engine is not hd_engine:
+                            _copy_contract_lock(hd_engine, engine)
+
+            lock_ts = _scheduled_hd_lock_time(now, self.cfg.atm_lock_time)
+            if lock_ts is None:
+                return
+            was_locked = hd_engine.state.atm_locked
+            if was_locked:
+                last_lock = hd_engine.state.atm_locked_at or datetime.combine(
+                    now.date(),
+                    self.cfg.atm_lock_time,
+                )
+                if lock_ts <= last_lock:
+                    for _, engine in self.engines:
+                        if engine is not hd_engine:
+                            _copy_contract_lock(hd_engine, engine)
+                    return
+                for _, engine in self.engines:
+                    _restore_open_positions(engine, self.broker, now.date())
+
+            try:
+                spot_ltp = self.broker.get_ltp(self.cfg.spot_symbol)
+            except Exception as exc:
+                logger.warning("spot LTP fetch failed while locking HD contracts: %s", exc)
+                return
+            if not spot_ltp:
+                logger.warning("spot LTP came back 0/None — will retry next poll")
+                return
+
+            hd_engine.on_day_transition_if_needed(lock_ts)
+            hd_engine.lock_atm_for_day(
+                lock_ts,
+                float(spot_ltp),
+                force_refresh=was_locked,
+            )
+            if hd_engine.state.atm_locked and hd_engine.state.atm_locked_at == lock_ts:
+                for _, engine in self.engines:
+                    if engine is not hd_engine:
+                        _copy_contract_lock(hd_engine, engine)
+                    _restore_open_positions(engine, self.broker, now.date())
+                _persist_atm_lock(hd_engine, float(spot_ltp))
+                current_symbols = (
+                    first_engine.state.ce_symbol,
+                    first_engine.state.pe_symbol,
+                )
+                for side, old_symbol, new_symbol in zip(
+                    ("CE", "PE"),
+                    previous_symbols,
+                    current_symbols,
+                ):
+                    if old_symbol != new_symbol:
+                        self._last_bar_time[side] = None
+                        self._startup_baselined.discard(side)
+            return
+
         if first_engine.state.atm_locked:
             return
         if _restore_atm_lock(first_engine, now.date()):

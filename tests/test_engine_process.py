@@ -1,7 +1,7 @@
 """Focused tests for BaseStrategyEngine tick and square-off behavior."""
 
 import os
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -306,7 +306,51 @@ def test_trailing_keeps_existing_order_id_when_modify_fails():
 
     assert position.protective_stop_order_id == "OPEN-SL-1"
     assert broker.stop_orders == []
-    assert any("existing SL was not replaced" in alert.message for alert in engine.alerts)
+    assert any("update unconfirmed" in alert.message for alert in engine.alerts)
+
+
+def test_unconfirmed_trailing_update_is_labeled_local():
+    engine = BaseStrategyEngine(
+        cfg=StrategyConfig(option_lot_size=65),
+        risk=RiskConfig(),
+        broker=FailedModifyBroker(),
+        signal_provider=EMA21StubSignalProvider(),
+    )
+    _attach_position(engine, "CE")
+    engine.state.ce.position.protective_stop_order_id = "OPEN-SL-1"
+
+    engine.process_tick("CE", 115.0, datetime(2026, 8, 8, 10, 3))
+
+    assert any("update unconfirmed" in alert.message for alert in engine.alerts)
+    assert any(alert.category == "TSL" and "local SL" in alert.message for alert in engine.alerts)
+    assert not any(alert.category == "PROTECTIVE_SL" for alert in engine.alerts)
+
+
+def test_unconfirmed_stop_is_retried_without_a_new_milestone():
+    class RetryBroker(RecordingBroker):
+        def modify_stop_limit_order(self, *args, **kwargs):
+            self.modified_stop_orders.append((args, kwargs))
+            return len(self.modified_stop_orders) > 1
+
+    broker = RetryBroker()
+    engine = BaseStrategyEngine(
+        cfg=StrategyConfig(option_lot_size=65),
+        risk=RiskConfig(),
+        broker=broker,
+        signal_provider=EMA21StubSignalProvider(),
+    )
+    _attach_position(engine, "CE")
+    position = engine.state.ce.position
+    position.protective_stop_order_id = "OPEN-SL-1"
+    first_tick = datetime(2026, 8, 8, 10, 3)
+
+    engine.process_tick("CE", 110.0, first_tick)
+    engine.process_tick("CE", 110.0, first_tick + timedelta(seconds=14))
+    assert len(broker.modified_stop_orders) == 1
+    engine.process_tick("CE", 110.0, first_tick + timedelta(seconds=15))
+
+    assert len(broker.modified_stop_orders) == 2
+    assert position.protective_stop_retry_at is None
 
 
 def test_trailing_status_reports_next_target_after_partial_booking():
@@ -743,6 +787,28 @@ def test_process_tick_arms_tsl_and_partial_exit_for_two_lot_position():
     assert pos is not None and pos.quantity == 65
 
 
+def test_hd_partial_booking_exits_configured_lot_and_keeps_trailing():
+    engine = BaseStrategyEngine(
+        cfg=StrategyConfig(
+            option_lot_size=65,
+            partial_booking_enabled=True,
+            partial_booking_lots=1,
+        ),
+        risk=RiskConfig(max_sl_per_day=3),
+        broker=ConsoleBroker(ltp_fallback=100.0),
+        signal_provider=HDSignalProvider(),
+    )
+    _attach_position(engine, "CE")
+
+    engine.process_tick("CE", 120.0, datetime(2026, 8, 8, 10, 4))
+
+    position = engine.state.ce.position
+    assert position is not None and position.quantity == 65
+    assert position.t2_done is True
+    assert position.breakeven_armed is True
+    assert any("booked 1 lot(s)" in alert.message for alert in engine.alerts)
+
+
 def test_ema21_partial_booking_exits_configured_lot_at_two_rr():
     engine = BaseStrategyEngine(
         cfg=StrategyConfig(option_lot_size=65, partial_booking_enabled=True, partial_booking_lots=1),
@@ -860,16 +926,25 @@ def test_partial_booking_settings_reach_runner_environment(monkeypatch):
     assert cfg.partial_booking_interval_rr == 0.75
 
 
-def test_strategy_daemon_exports_partial_booking_settings():
-    environment = strategy_daemon._strategy_environment({
-        "strategy": "21EMA",
-        "partialBookingEnabled": False,
-        "partialBookingRR": 2.5,
-        "partialBookingLots": 2,
-        "partialBookingIntervalRR": 0.75,
-    })
+@pytest.mark.parametrize("strategy", ["21EMA", "HD"])
+def test_strategy_daemon_exports_global_partial_booking_settings(strategy):
+    environment = strategy_daemon._strategy_environment(
+        {
+            "strategy": strategy,
+            "partialBookingEnabled": False,
+            "partialBookingRR": 3.0,
+            "partialBookingLots": 3,
+            "partialBookingIntervalRR": 1.0,
+        },
+        {
+            "partialBookingEnabled": True,
+            "partialBookingRR": 2.5,
+            "partialBookingLots": 2,
+            "partialBookingIntervalRR": 0.75,
+        },
+    )
 
-    assert environment["PARTIAL_BOOKING_ENABLED"] == "false"
+    assert environment["PARTIAL_BOOKING_ENABLED"] == "true"
     assert environment["PARTIAL_BOOKING_RR"] == "2.5"
     assert environment["PARTIAL_BOOKING_LOTS"] == "2"
     assert environment["PARTIAL_BOOKING_INTERVAL_RR"] == "0.75"
@@ -923,9 +998,52 @@ def test_test_alerts_are_not_written_to_live_trade_logs(monkeypatch, tmp_path):
 
     timestamp = datetime(2026, 11, 22, 10, 0)
     engine._record_alert(timestamp, "SIGNAL", "Test signal")
+    engine._record_alert(timestamp, "ATM_LOCK", "Strike 25000 | CE=CE-24950 | PE=PE-25050")
 
-    assert broker.test_alerts == [(timestamp, "SIGNAL", "Test signal")]
+    assert broker.test_alerts == [
+        (timestamp, "SIGNAL", "Test signal"),
+        (timestamp, "ATM_LOCK", "Strike 25000 | CE=CE-24950 | PE=PE-25050"),
+    ]
     assert not (tmp_path / "logs").exists()
+
+
+def test_hd_rsi_dip_is_recorded_as_a_setup_event():
+    class TestAlertBroker(ConsoleBroker):
+        def __init__(self):
+            super().__init__()
+            self.test_alerts = []
+
+        def record_alert(self, timestamp, category, message):
+            self.test_alerts.append((timestamp, category, message))
+
+    broker = TestAlertBroker()
+    engine = BaseStrategyEngine(
+        cfg=StrategyConfig(),
+        risk=RiskConfig(),
+        broker=broker,
+        signal_provider=HDSignalProvider(),
+    )
+    engine.persist_alerts = True
+    engine.state.trading_day = datetime(2026, 11, 25).date()
+    engine.state.atm_locked = True
+    engine.state.ce = engine.signal_provider.create_side_state()
+    engine.state.ce.option_symbol = "NIFTY25NOV2624950CE"
+    previous = _row(datetime(2026, 11, 25, 9, 57))
+    previous["rsi3"] = 25.0
+    current = _row(datetime(2026, 11, 25, 10, 0))
+    current["rsi3"] = 19.0
+
+    engine.process_option_candle("CE", current, previous)
+
+    setup_alerts = [alert for alert in broker.test_alerts if alert[1] == "SETUP"]
+    assert setup_alerts == [
+        (
+            current["datetime"],
+            "SETUP",
+            "CE RSI dipped below 20; looking for a strong candle or hammer "
+            "on NIFTY25NOV2624950CE at 10:00",
+        )
+    ]
 
 
 def test_test_runner_does_not_write_to_live_monitoring_file(monkeypatch, tmp_path):
@@ -943,6 +1061,35 @@ def test_test_runner_does_not_write_to_live_monitoring_file(monkeypatch, tmp_pat
     })
 
     assert not (tmp_path / "logs" / "monitoring_20261122.csv").exists()
+
+
+def test_test_runner_writes_monitoring_to_instrument_specific_file(monkeypatch, tmp_path):
+    from core.runner import _persist_monitoring_row
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("INSTRUMENT_EXECUTION_MODE", "TEST")
+    monkeypatch.setenv("INSTRUMENT_ID", "23")
+    timestamp = datetime(2026, 11, 22, 10, 0)
+
+    _persist_monitoring_row({
+        "timestamp": timestamp.isoformat(),
+        "category": "DATA",
+        "symbol": "NIFTYTESTCE",
+        "message": "3m candle 10:00:00 O=150 H=155 L=149 C=153",
+    })
+
+    test_file = tmp_path / "logs" / "monitoring_test_23_20261122.csv"
+    assert test_file.exists()
+    assert "NIFTYTESTCE" in test_file.read_text(encoding="utf-8")
+    assert not (tmp_path / "logs" / "monitoring_20261122.csv").exists()
+
+
+def test_ema21_dashboard_rejects_fractional_lot_adjustment():
+    with pytest.raises(ValueError, match="EMA21 lotSizeAdjustment must be a positive integer"):
+        strategy_daemon._strategy_environment({
+            "strategy": "21EMA",
+            "lotSizeAdjustment": 2.5,
+        })
 
 
 def test_ema21_dashboard_settings_override_env_defaults(monkeypatch, tmp_path):
@@ -964,17 +1111,23 @@ def test_ema21_dashboard_settings_override_env_defaults(monkeypatch, tmp_path):
         "id": 9,
         "strategy": "21EMA",
         "brokerSymbol": "NIFTY",
-        "lotSizeAdjustment": 2,
+        "lotSizeAdjustment": 2.0,
         "monitoringStartTime": "09:30",
         "monitoringEndTime": "15:00",
         "entryCutoffTime": "14:45",
         "maxInitialRiskPoints": 18,
         "maxLosingTradesPerDay": 2,
+        "partialBookingEnabled": True,
+        "partialBookingRR": 3.0,
+        "partialBookingLots": 3,
+        "partialBookingIntervalRR": 1.0,
+    }, {
         "partialBookingEnabled": False,
         "partialBookingRR": 2.5,
         "partialBookingLots": 2,
         "partialBookingIntervalRR": 0.75,
     })
+    assert environment["DASHBOARD_EMA21_FULL_SIZE_LOTS"] == "2"
     for name, value in environment.items():
         monkeypatch.setenv(name, value)
 
@@ -1155,20 +1308,64 @@ def test_lock_atm_uses_expiry_override_date():
     assert "25AUG26" in engine.state.pe_symbol
 
 
-def test_hd_contract_lock_selects_exactly_one_strike_itm_per_side():
+def test_hd_contract_lock_selects_the_closest_premium_across_otm_strikes():
     class ChainBroker(ConsoleBroker):
-        def fetch_option_chain(self, underlying, exchange, expiry_date):
-            assert (underlying, exchange, expiry_date) == ("NIFTY", "NSE_INDEX", "25AUG26")
+        searches = []
+
+        def search_symbols(self, query, exchange):
+            self.searches.append(query)
+            root, strike, option_type = query.split()
+            return [{
+                "symbol": f"{option_type}-{strike}",
+                "name": root,
+                "strike": int(strike),
+                "instrumenttype": option_type,
+                "expiry": "25-AUG-26",
+            }]
+
+        def get_ltp(self, symbol):
             return {
-                "status": "success",
-                "chain": [
-                    {"strike": 24900, "ce": {"symbol": "CE-24900", "ltp": 150}},
-                    {"strike": 24950, "ce": {"symbol": "CE-24950", "ltp": 145}},
-                    {"strike": 25000, "ce": {"symbol": "CE-25000", "ltp": 150}, "pe": {"symbol": "PE-25000", "ltp": 150}},
-                    {"strike": 25050, "ce": {"symbol": "CE-25050", "ltp": 150}, "pe": {"symbol": "PE-25050", "ltp": 155}},
-                    {"strike": 25100, "pe": {"symbol": "PE-25100", "ltp": 150}},
-                ],
-            }
+                "CE-25000": 190.0,
+                "CE-25050": 151.25,
+                "CE-25100": 149.0,
+                "PE-25000": 190.0,
+                "PE-24950": 150.75,
+                "PE-24900": 149.0,
+            }.get(symbol, 0.0)
+
+    broker = ChainBroker()
+    engine = BaseStrategyEngine(
+        cfg=StrategyConfig(premium_min_price=120, premium_max_price=180),
+        risk=RiskConfig(),
+        broker=broker,
+        signal_provider=HDSignalProvider(),
+    )
+
+    engine.lock_atm_for_day(
+        datetime(2026, 8, 8, 9, 20),
+        spot_price=25020,
+        expiry_day_override=date(2026, 8, 25),
+    )
+
+    assert engine.state.ce_symbol == "CE-25050"
+    assert engine.state.pe_symbol == "PE-24950"
+    assert engine.state.atm_locked is True
+
+
+def test_hd_contract_lock_does_not_apply_a_premium_ceiling():
+    class ChainBroker(ConsoleBroker):
+        def search_symbols(self, query, exchange):
+            root, strike, option_type = query.split()
+            return [{
+                "symbol": f"{option_type}-{strike}",
+                "name": root,
+                "strike": int(strike),
+                "instrumenttype": option_type,
+                "expiry": "25-AUG-26",
+            }]
+
+        def get_ltp(self, symbol):
+            return 200.0
 
     engine = BaseStrategyEngine(
         cfg=StrategyConfig(premium_min_price=120, premium_max_price=180),
@@ -1183,21 +1380,29 @@ def test_hd_contract_lock_selects_exactly_one_strike_itm_per_side():
         expiry_day_override=date(2026, 8, 25),
     )
 
+    assert engine.state.atm_locked is True
     assert engine.state.ce_symbol == "CE-24950"
     assert engine.state.pe_symbol == "PE-25050"
-    assert engine.state.atm_locked is True
+    assert engine.alerts[-1].category == "ATM_LOCK"
 
 
-def test_hd_contract_lock_rejects_chain_without_in_range_contracts():
+def test_hd_contract_lock_ignores_legacy_premium_range_settings():
     class ChainBroker(ConsoleBroker):
-        def fetch_option_chain(self, underlying, exchange, expiry_date):
-            return {
-                "status": "success",
-                "data": {"chain": [{"strike": 25000, "ce": {"symbol": "CE", "ltp": 200}}]},
-            }
+        def search_symbols(self, query, exchange):
+            root, strike, option_type = query.split()
+            return [{
+                "symbol": f"{option_type}-{strike}",
+                "name": root,
+                "strike": int(strike),
+                "instrumenttype": option_type,
+                "expiry": "25-AUG-26",
+            }]
+
+        def get_ltp(self, symbol):
+            return 150.0
 
     engine = BaseStrategyEngine(
-        cfg=StrategyConfig(premium_min_price=120, premium_max_price=180),
+        cfg=StrategyConfig(premium_min_price=180, premium_max_price=120),
         risk=RiskConfig(),
         broker=ChainBroker(),
         signal_provider=HDSignalProvider(),
@@ -1209,23 +1414,58 @@ def test_hd_contract_lock_rejects_chain_without_in_range_contracts():
         expiry_day_override=date(2026, 8, 25),
     )
 
-    assert engine.state.atm_locked is False
-    assert engine.state.ce_symbol is None
-    assert engine.state.pe_symbol is None
+    assert engine.state.atm_locked is True
+    assert engine.state.ce_symbol == "CE-24950"
+    assert engine.state.pe_symbol == "PE-25050"
 
 
-def test_hd_contract_lock_keeps_eligible_side_when_other_side_has_no_match():
+def test_hd_contract_lock_always_checks_premium_floor_even_if_legacy_range_disabled():
     class ChainBroker(ConsoleBroker):
-        def fetch_option_chain(self, underlying, exchange, expiry_date):
-            return {
-                "status": "success",
-                "data": {
-                    "chain": [
-                        {"strike": 24950, "ce": {"symbol": "CE-24950", "ltp": 150}},
-                        {"strike": 25050, "pe": {"symbol": "PE-25050", "ltp": 200}},
-                    ]
-                },
-            }
+        def search_symbols(self, query, exchange):
+            root, strike, option_type = query.split()
+            return [{
+                "symbol": f"{option_type}-{strike}",
+                "name": root,
+                "strike": int(strike),
+                "instrumenttype": option_type,
+                "expiry": "25-AUG-26",
+            }]
+
+        def get_ltp(self, symbol):
+                return 150.0
+
+    engine = BaseStrategyEngine(
+        cfg=StrategyConfig(premium_range_enabled=False),
+        risk=RiskConfig(),
+        broker=ChainBroker(),
+        signal_provider=HDSignalProvider(),
+    )
+
+    engine.lock_atm_for_day(
+        datetime(2026, 8, 8, 9, 20),
+        spot_price=25020,
+        expiry_day_override=date(2026, 8, 25),
+    )
+
+    assert engine.state.atm_locked is True
+    assert engine.state.ce_symbol == "CE-24950"
+    assert engine.state.pe_symbol == "PE-25050"
+
+
+def test_hd_contract_lock_accepts_premium_above_legacy_maximum_on_both_sides():
+    class ChainBroker(ConsoleBroker):
+        def search_symbols(self, query, exchange):
+            root, strike, option_type = query.split()
+            return [{
+                "symbol": f"{option_type}-{strike}",
+                "name": root,
+                "strike": int(strike),
+                "instrumenttype": option_type,
+                "expiry": "25-AUG-26",
+            }]
+
+        def get_ltp(self, symbol):
+            return 150.0 if symbol == "CE-24950" else 200.0
 
     engine = BaseStrategyEngine(
         cfg=StrategyConfig(premium_min_price=120, premium_max_price=180),
@@ -1242,22 +1482,92 @@ def test_hd_contract_lock_keeps_eligible_side_when_other_side_has_no_match():
 
     assert engine.state.atm_locked is True
     assert engine.state.ce_symbol == "CE-24950"
-    assert engine.state.pe_symbol is None
+    assert engine.state.pe_symbol == "PE-25050"
+
+
+def test_hd_contract_refresh_preserves_open_position_contract():
+    class ChainBroker(ConsoleBroker):
+        def search_symbols(self, query, exchange):
+            root, strike, option_type = query.split()
+            return [{
+                "symbol": f"{option_type}-{strike}",
+                "name": root,
+                "strike": int(strike),
+                "instrumenttype": option_type,
+                "expiry": "25-AUG-26",
+            }]
+
+        def get_ltp(self, symbol):
+            return 150.0
+
+    engine = BaseStrategyEngine(
+        cfg=StrategyConfig(),
+        risk=RiskConfig(),
+        broker=ChainBroker(),
+        signal_provider=HDSignalProvider(),
+    )
+    engine.lock_atm_for_day(
+        datetime(2026, 8, 8, 9, 20),
+        spot_price=25020,
+    )
+    held_contract = engine.state.ce_symbol
+    position = Position(
+        option_symbol=held_contract,
+        option_type="CE",
+        quantity=65,
+        initial_quantity=65,
+        entry_price=150.0,
+        entry_time=datetime(2026, 8, 8, 9, 30),
+        option_stop_level=140.0,
+        option_entry_trigger=151.0,
+        option_risk_points=10.0,
+    )
+    engine.state.ce.position = position
+
+    engine.lock_atm_for_day(
+        datetime(2026, 8, 8, 10, 20),
+        spot_price=25120,
+        force_refresh=True,
+    )
+
+    assert engine.state.ce.position is position
+    assert engine.state.ce_symbol == held_contract
+    assert engine.state.pe_symbol == "PE-25150"
+    assert engine.state.atm_locked_at == datetime(2026, 8, 8, 10, 20)
 
 
 def test_hd_contract_lock_does_not_fall_back_from_missing_one_step_itm_strike():
     class ChainBroker(ConsoleBroker):
-        def fetch_option_chain(self, underlying, exchange, expiry_date):
-            return {
-                "status": "success",
-                "data": {
-                    "chain": [
-                        {"strike": 25000, "ce": {"symbol": "ATM-CE", "ltp": 150}},
-                        {"strike": 25100, "ce": {"symbol": "OTM-CE", "ltp": 150}},
-                        {"strike": 25050, "pe": {"symbol": "ITM-PE", "ltp": 150}},
-                    ]
+        def search_symbols(self, query, exchange):
+            root, strike, option_type = query.split()
+            rows = [
+                {
+                    "symbol": f"ATM-{option_type}",
+                    "name": root,
+                    "strike": 25000,
+                    "instrumenttype": option_type,
+                    "expiry": "25-AUG-26",
                 },
-            }
+                {
+                    "symbol": f"OTM-{option_type}",
+                    "name": root,
+                    "strike": 25100,
+                    "instrumenttype": option_type,
+                    "expiry": "25-AUG-26",
+                },
+            ]
+            if option_type == "PE":
+                rows.append({
+                    "symbol": "ITM-PE",
+                    "name": root,
+                    "strike": int(strike),
+                    "instrumenttype": option_type,
+                    "expiry": "25-AUG-26",
+                })
+            return rows
+
+        def get_ltp(self, symbol):
+            return 150.0
 
     engine = BaseStrategyEngine(
         cfg=StrategyConfig(premium_min_price=120, premium_max_price=180),
@@ -1279,7 +1589,12 @@ def test_hd_contract_lock_does_not_fall_back_from_missing_one_step_itm_strike():
 
 def test_hd_trailing_uses_global_rr_steps_without_partial_exit():
     engine = BaseStrategyEngine(
-        cfg=StrategyConfig(option_lot_size=65, t1_rr=1.25, trailing_step_rr=0.5),
+        cfg=StrategyConfig(
+            option_lot_size=65,
+            t1_rr=1.25,
+            trailing_step_rr=0.5,
+            partial_booking_enabled=False,
+        ),
         risk=RiskConfig(),
         broker=RecordingBroker(),
         signal_provider=HDSignalProvider(),
@@ -1428,6 +1743,7 @@ def test_hd_dashboard_settings_reach_strategy_config(monkeypatch):
 
     assert cfg.premium_min_price == 125
     assert cfg.premium_max_price == 175
+    assert cfg.premium_range_enabled is True
     assert cfg.max_option_risk_points == 18
     assert cfg.full_size_lots == 3
     assert cfg.market_open.strftime("%H:%M") == "09:30"
@@ -1453,8 +1769,25 @@ def test_hd_dashboard_values_override_inherited_runtime_defaults(monkeypatch):
     assert environment["HD_ENTRY_CUTOFF"] == "14:40"
     assert environment["HD_MAX_OPTION_RISK_POINTS"] == "20"
     assert environment["HD_FULL_SIZE_LOTS"] == "1"
-    assert environment["HD_PREMIUM_MIN_PRICE"] == "120"
+    assert environment["HD_PREMIUM_RANGE_ENABLED"] == "False"
+    assert environment["HD_PREMIUM_MIN_PRICE"] == "150"
     assert environment["HD_PREMIUM_MAX_PRICE"] == "180"
+    for name, value in environment.items():
+        if name.startswith("HD_"):
+            monkeypatch.setenv(name, value)
+    cfg = StrategyConfig()
+    run_strategy._apply_hd_policy(cfg)
+    assert cfg.premium_range_enabled is False
+
+
+def test_hd_dashboard_accepts_minimum_without_premium_ceiling():
+    environment = strategy_daemon._strategy_environment({
+        "strategy": "HD",
+        "premiumMinPrice": 150,
+    })
+
+    assert environment["HD_PREMIUM_MIN_PRICE"] == "150"
+    assert environment["HD_PREMIUM_RANGE_ENABLED"] == "True"
 
 
 def test_hd_entry_order_uses_dashboard_risk_and_lot_settings():
@@ -1528,16 +1861,55 @@ def test_partial_booking_change_restarts_instrument():
     instrument = {
         "strategy": "21EMA",
         "brokerSymbol": "NIFTY",
+    }
+    trailing = {
         "partialBookingEnabled": True,
         "partialBookingRR": 2.0,
         "partialBookingLots": 1,
         "partialBookingIntervalRR": 0.5,
     }
-    changed = {**instrument, "partialBookingIntervalRR": 0.75}
+    changed_trailing = {**trailing, "partialBookingIntervalRR": 0.75}
 
-    assert strategy_daemon._runtime_signature(instrument, {}) != (
-        strategy_daemon._runtime_signature(changed, {})
+    assert strategy_daemon._runtime_signature(instrument, trailing) != (
+        strategy_daemon._runtime_signature(instrument, changed_trailing)
     )
+
+
+def test_ema21_pending_fill_waits_for_order_average():
+    class FilledBroker(RecordingBroker):
+        requires_position_reconciliation = True
+
+        def get_order_status(self, order_id):
+            return {"order_status": "complete", "average_price": 0, "price": 116.5}
+
+        def get_position_book(self):
+            return [{"symbol": "NIFTY-CE", "quantity": 65}]
+
+    broker = FilledBroker()
+    engine = BaseStrategyEngine(StrategyConfig(), RiskConfig(), broker, EMA21StubSignalProvider())
+    side_state = engine.state.ce
+    side_state.option_symbol = "NIFTY-CE"
+    side_state.pending_entry = PendingEntry(
+        signal=Signal.BUY_CE,
+        created_at=datetime(2026, 8, 8, 10, 0),
+        option_symbol="NIFTY-CE",
+        quantity=65,
+        option_trigger_level=116.0,
+        option_stop_level=106.0,
+        trigger_candle_high=116.0,
+        trigger_candle_low=110.0,
+        order_id="ENTRY-1",
+    )
+
+    engine.try_fill_pending_entry(
+        "CE", side_state, datetime(2026, 8, 8, 10, 3),
+        _row(datetime(2026, 8, 8, 10, 3), high=116.0, low=110.0),
+    )
+
+    assert side_state.position is None
+    assert side_state.pending_entry is not None
+    assert broker.stop_orders == []
+    assert any("entry fill price unavailable" in alert.message for alert in engine.alerts)
 
 
 def test_hd_broker_fill_sets_actual_entry_and_initial_risk():

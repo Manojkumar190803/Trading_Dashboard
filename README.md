@@ -36,8 +36,9 @@ cp .env.example .env  # Add your OpenAlgo credentials
 # Backtest
 python3 run_strategy.py --script NIFTY --strategy hd --mode backtest --start 2026-08-01 --end 2026-08-07
 
-# HD spot-signal report (tabular output only; no output files)
+# HD-style spot-proxy report (spot candles only; not option-candle HD signals)
 python3 demo_hd_signal_backtest.py --start-date 2026-08-01 --end-date 2026-08-07
+# Proxy entries/stops use a 1-point outward buffer; P&L is reported in spot points.
 
 # Paper trading (dry run, real data)
 python3 run_strategy.py --script BANKNIFTY --strategy cd --mode paper
@@ -65,6 +66,24 @@ at 09:25 and entry confirmation occurs at 09:30. The candidate CSV must contain
 contain `timestamp,side,price`, with ISO timestamps in IST. Defaults are a
 10-second sustained premium above 180, 130 units, a 20-point stop loss, and a
 40-point target. Use `--quantity` and `--sustain-seconds` for overrides.
+
+The HD strategy calculates RSI and evaluates alert candles from selected CE/PE
+option candles. NIFTY spot history is used for EMA trend context and the ATM
+strike reference. At 09:20, or the configured monitoring start if later, HD
+searches from ATM toward OTM when premiums are already at least ₹150, or toward
+ITM when ATM premium is below ₹150. It selects the premium closest to ₹150
+without going below it, within 50 strike steps; if the best match is ATM, HD
+uses the next ITM strike. The contract selection is rechecked hourly from the
+lock time.
+An open or pending position remains tied to its original contract; refreshed
+contracts apply to future signals. If no eligible contract is found within the
+50-step search, HD records a risk alert and does not lock that side.
+
+For forward testing, set an instrument's dashboard execution mode to
+**FORWARD TEST**. It uses live OpenAlgo market data but stores simulated orders,
+positions, alerts, and P&L separately; it does not send orders to the broker.
+The dashboard's Forward-Test Signals & Events and position views show that
+activity.
 
 ### EMA21 Profit Booking and Trailing Stop
 

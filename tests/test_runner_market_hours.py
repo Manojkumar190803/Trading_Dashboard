@@ -5,7 +5,11 @@ import pytest
 import pandas as pd
 
 import core.runner as runner
-from core.models import StrategyAlert, StrategyConfig
+from core.broker import ConsoleBroker
+from core.engine import BaseStrategyEngine
+from core.models import RiskConfig, StrategyAlert, StrategyConfig
+from strategies.ema21 import EMA21SignalProvider
+from strategies.hd import HDSignalProvider
 
 
 class _FixedDateTime(datetime):
@@ -65,6 +69,120 @@ def test_hd_dashboard_monitoring_window_controls_runner_hours(monkeypatch):
 
     _FixedDateTime._now_value = datetime(2026, 8, 10, 15, 0)
     assert runner_obj._is_market_open() is False
+
+
+def test_hd_lock_schedule_uses_hourly_boundaries_from_market_open():
+    lock_time = time(9, 20)
+    assert runner._scheduled_hd_lock_time(
+        datetime(2026, 8, 10, 9, 19),
+        lock_time,
+    ) is None
+    assert runner._scheduled_hd_lock_time(
+        datetime(2026, 8, 10, 9, 20),
+        lock_time,
+    ) == datetime(2026, 8, 10, 9, 20)
+    assert runner._scheduled_hd_lock_time(
+        datetime(2026, 8, 10, 10, 20),
+        lock_time,
+    ) == datetime(2026, 8, 10, 10, 20)
+    assert runner._scheduled_hd_lock_time(
+        datetime(2026, 8, 10, 10, 28),
+        lock_time,
+    ) == datetime(2026, 8, 10, 10, 20)
+
+
+def test_live_hd_runner_rechecks_contracts_hourly(monkeypatch, tmp_path):
+    class ChainBroker(ConsoleBroker):
+        spot_price = 25020.0
+
+        def get_ltp(self, symbol):
+            return self.spot_price if symbol == "NIFTY" else 150.0
+
+        def search_symbols(self, query, exchange):
+            root, strike, option_type = query.split()
+            return [{
+                "symbol": f"{option_type}-{strike}",
+                "name": root,
+                "strike": int(strike),
+                "instrumenttype": option_type,
+                "expiry": "25-AUG-26",
+            }]
+
+    monkeypatch.chdir(tmp_path)
+    cfg = StrategyConfig()
+    broker = ChainBroker()
+    engine = BaseStrategyEngine(cfg, RiskConfig(), broker, HDSignalProvider())
+    live_runner = runner.LiveFeedRunner(engine, broker, cfg)
+
+    live_runner._try_lock_atm(datetime(2026, 8, 10, 9, 20))
+    assert (engine.state.ce_symbol, engine.state.pe_symbol) == (
+        "CE-24950",
+        "PE-25050",
+    )
+
+    broker.spot_price = 25120.0
+    live_runner._try_lock_atm(datetime(2026, 8, 10, 10, 19))
+    assert (engine.state.ce_symbol, engine.state.pe_symbol) == (
+        "CE-24950",
+        "PE-25050",
+    )
+
+    live_runner._try_lock_atm(datetime(2026, 8, 10, 10, 20))
+    assert (engine.state.ce_symbol, engine.state.pe_symbol) == (
+        "CE-25050",
+        "PE-25150",
+    )
+    assert engine.state.atm_locked_at == datetime(2026, 8, 10, 10, 20)
+
+
+def test_multi_runner_uses_hd_contract_selection_when_hd_is_not_first(
+    monkeypatch,
+    tmp_path,
+):
+    class ChainBroker(ConsoleBroker):
+        spot_price = 25020.0
+
+        def get_ltp(self, symbol):
+            return self.spot_price if symbol == "NIFTY" else 150.0
+
+        def search_symbols(self, query, exchange):
+            root, strike, option_type = query.split()
+            return [{
+                "symbol": f"{option_type}-{strike}",
+                "name": root,
+                "strike": int(strike),
+                "instrumenttype": option_type,
+                "expiry": "25-AUG-26",
+            }]
+
+    monkeypatch.chdir(tmp_path)
+    cfg = StrategyConfig()
+    broker = ChainBroker()
+    other_engine = BaseStrategyEngine(
+        cfg,
+        RiskConfig(),
+        broker,
+        EMA21SignalProvider(),
+    )
+    hd_engine = BaseStrategyEngine(cfg, RiskConfig(), broker, HDSignalProvider())
+    live_runner = runner.MultiEngineLiveFeedRunner(
+        [("ema21", other_engine), ("hd", hd_engine)],
+        broker,
+        cfg,
+    )
+
+    live_runner._try_lock_atm(datetime(2026, 8, 10, 9, 20))
+    assert (other_engine.state.ce_symbol, other_engine.state.pe_symbol) == (
+        "CE-24950",
+        "PE-25050",
+    )
+
+    broker.spot_price = 25120.0
+    live_runner._try_lock_atm(datetime(2026, 8, 10, 10, 20))
+    assert (other_engine.state.ce_symbol, other_engine.state.pe_symbol) == (
+        "CE-25050",
+        "PE-25150",
+    )
 
 
 def test_attach_spot_ema_context_uses_latest_non_future_spot_candle():

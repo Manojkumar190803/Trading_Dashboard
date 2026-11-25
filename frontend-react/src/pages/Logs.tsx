@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react'
-import { collectUnseenAlerts } from '@/utils/alert-notifications.js'
+import { collectUnseenAlerts, getOrderEvent } from '@/utils/alert-notifications.js'
 import { AlertCircle, AlertTriangle, CheckCircle2, Info, Pause, TrendingUp, Clock, Download, RotateCcw, X } from 'lucide-react'
 import {
   Card,
@@ -49,6 +49,7 @@ interface ActiveSymbol {
   strike: string
   strikeLabel: string
   strategy: string
+  executionMode: 'LIVE' | 'TEST'
   ceStrike?: string
   peStrike?: string
   hasCE: boolean
@@ -78,11 +79,8 @@ const Logs: React.FC = () => {
   const [logs, setLogs] = useState<LogEntry[]>([])
   const [alerts, setAlerts] = useState<AlertEntry[]>([])
   const [dismissedAlertIds, setDismissedAlertIds] = useState<Set<string>>(new Set())
-  const [previousLogCount, setPreviousLogCount] = useState(0)
   const processedAlertIds = useRef(new Set<string>())
   const alertsInitialized = useRef(false)
-  const [isInitialLoad, setIsInitialLoad] = useState(true)
-  const [lastToastTime, setLastToastTime] = useState<number>(Date.now())
   const toast = useToast()
 
   // Sync API instruments to Zustand store for other components to use
@@ -155,153 +153,6 @@ const Logs: React.FC = () => {
     }
   }, [apiInstruments])
 
-  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  // TOAST NOTIFICATION SYSTEM FOR TRADING EVENTS
-  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-  // Detect and show toast for trading events
-  useEffect(() => {
-    // Skip toast triggers on initial load (when logs first sync from store)
-    if (isInitialLoad) {
-      setPreviousLogCount(logs.length)
-      setIsInitialLoad(false)
-      setLastToastTime(Date.now())
-      return
-    }
-
-    // Only show toasts for new logs
-    if (logs.length <= previousLogCount) return
-
-    // Get new logs since last check
-    const newLogs = logs.slice(previousLogCount)
-    setPreviousLogCount(logs.length)
-
-    // Only trigger toasts for logs that arrived within the last 60 seconds
-    // This prevents replaying old logs when the file is reloaded
-    const sixtySecondsAgo = Date.now() - 60000
-
-    newLogs.forEach((log) => {
-      // Skip logs that are older than 60 seconds (prevents replay of old logs)
-      const logTime = new Date(log.timestamp).getTime()
-      if (logTime < sixtySecondsAgo) return
-
-      const messageUpper = log.message.toUpperCase()
-      const timeStr = new Date(log.timestamp).toLocaleTimeString('en-IN')
-
-      // 🚨 ALERT TRIGGERED
-      if (messageUpper.includes('ALERT') || messageUpper.includes('TRIGGERED')) {
-        const symbolMatch = log.message.match(/([A-Z]+\d+[A-Z]+\d+[CE|PE]{2})/)?.[0]
-        const symbol = symbolMatch || 'Unknown'
-        toast.addToast({
-          type: 'warning',
-          title: '🚨 Alert Triggered',
-          message: `Alert for ${symbol} triggered at ${timeStr}`,
-          duration: 8000,
-        })
-      }
-
-      // 📍 ENTRY TRIGGERED / ENTRY FILLED
-      if (messageUpper.includes('ENTRY') && (messageUpper.includes('FILLED') || messageUpper.includes('TRIGGERED'))) {
-        const symbolMatch = log.message.match(/([A-Z]+\d+[A-Z]+\d+[CE|PE]{2})/)?.[0]
-        const priceMatch = log.message.match(/@\s*₹?\s*(\d+(?:\.\d+)?)/)
-          ?? log.message.match(/\b(?:average|avg|fill)[_\s-]*price\s*[=:]\s*₹?\s*(\d+(?:\.\d+)?)/i)
-        const quantityMessage = priceMatch
-          ? log.message.replace(priceMatch[0], '')
-          : log.message
-        const qtyMatch = quantityMessage.match(/\b(?:qty|quantity)\s*[=:]\s*(\d+)\b|\b(\d+)\s*(?:contracts|qty|quantity)\b/i)
-        
-        const symbol = symbolMatch || 'Unknown'
-        const priceDetail = priceMatch ? ` at ₹${priceMatch[1]}` : ' (fill price unavailable)'
-        const quantity = qtyMatch?.[1] || qtyMatch?.[2]
-        const quantityDetail = quantity ? ` (${quantity} contracts)` : ''
-        
-        toast.addToast({
-          type: 'success',
-          title: '📍 Entry Filled',
-          message: `Entry for ${symbol}${priceDetail}${quantityDetail}`,
-          duration: 6000,
-        })
-      }
-
-      // 🛑 STOP LOSS PLACED / SET
-      if (messageUpper.includes('STOP') || messageUpper.includes('SL')) {
-        if (!messageUpper.includes('TRAILING')) {
-          const symbolMatch = log.message.match(/([A-Z]+\d+[A-Z]+\d+[CE|PE]{2})/)?.[0]
-          const priceMatch = log.message.match(/(?:at|@)\s*₹?(\d+\.?\d*)/)?.[1]
-          
-          const symbol = symbolMatch || 'Unknown'
-          const price = priceMatch ? `₹${priceMatch}` : 'Value'
-          
-          toast.addToast({
-            type: 'info',
-            title: '🛑 Stop Loss Placed',
-            message: `SL placed at ${price} for ${symbol}`,
-            duration: 5000,
-          })
-        }
-      }
-
-      // 📉 TRAILING STOP LOSS
-      if (messageUpper.includes('TRAILING') && messageUpper.includes('SL')) {
-        const oldPriceMatch = log.message.match(/from\s*₹?(\d+\.?\d*)/)?.[1]
-        const newPriceMatch = log.message.match(/to\s*₹?(\d+\.?\d*)/)?.[1]
-        
-        const oldPrice = oldPriceMatch ? `₹${oldPriceMatch}` : 'Previous'
-        const newPrice = newPriceMatch ? `₹${newPriceMatch}` : 'Updated'
-        
-        toast.addToast({
-          type: 'info',
-          title: '📉 Trailing SL Updated',
-          message: `Trailing SL moved from ${oldPrice} to ${newPrice}`,
-          duration: 4000,
-        })
-      }
-
-      // ✅ POSITION CLOSED / TRADE CLOSED
-      if ((messageUpper.includes('CLOSED') || messageUpper.includes('EXIT')) && 
-          (messageUpper.includes('POSITION') || messageUpper.includes('TRADE'))) {
-        const pnlMatch = log.message.match(/(?:P&L|PNL|P\&L)\s*[:-]?\s*₹?(-?\d+\.?\d*)/i)?.[1]
-        const pnlNum = pnlMatch ? parseFloat(pnlMatch) : null
-        
-        const pnlStr = pnlNum !== null 
-          ? (pnlNum >= 0 ? `✅ +₹${pnlNum}` : `❌ -₹${Math.abs(pnlNum)}`)
-          : 'Closed'
-        
-        const toastType = pnlNum !== null && pnlNum >= 0 ? 'success' : 'error'
-        
-        toast.addToast({
-          type: toastType,
-          title: '✅ Position Closed',
-          message: `Trade closed with P&L: ${pnlStr}`,
-          duration: 7000,
-        })
-      }
-
-      // 🔄 BREAKEVEN HIT
-      if (messageUpper.includes('BREAKEVEN')) {
-        const symbolMatch = log.message.match(/([A-Z]+\d+[A-Z]+\d+[CE|PE]{2})/)?.[0]
-        const symbol = symbolMatch || 'Unknown'
-        
-        toast.addToast({
-          type: 'success',
-          title: '🔄 Breakeven Hit',
-          message: `Position ${symbol} reached breakeven`,
-          duration: 5000,
-        })
-      }
-
-      // ⚠️ ERROR / EXECUTION ISSUES
-      if (log.level === 'ERROR' || messageUpper.includes('FAILED') || messageUpper.includes('ERROR')) {
-        toast.addToast({
-          type: 'error',
-          title: '⚠️ Execution Error',
-          message: log.message,
-          duration: 8000,
-        })
-      }
-    })
-  }, [logs, previousLogCount, isInitialLoad, toast])
-
   // Detect and show toast for alert events
   useEffect(() => {
     const sixtySecondsAgo = Date.now() - 60000
@@ -311,30 +162,13 @@ const Logs: React.FC = () => {
     collectUnseenAlerts(alerts, processedAlertIds.current).forEach((alert) => {
       const alertTime = new Date(alert.timestamp).getTime()
       if (alertTime < sixtySecondsAgo) return
+      const event = getOrderEvent(alert)
+      if (!event) return
       const timeStr = new Date(alert.timestamp).toLocaleTimeString('en-IN')
-      
-      // Map alert types to appropriate toast types
-      const getAlertTypeInfo = (type: string): { title: string; toastType: 'warning' | 'success' | 'info' | 'error' } => {
-        const typeUpper = type.toUpperCase()
-        
-        if (typeUpper.includes('ENTRY')) {
-          return { title: '📍 Entry Alert', toastType: 'success' }
-        } else if (typeUpper.includes('EXIT') || typeUpper.includes('CLOSE')) {
-          return { title: '✅ Exit Alert', toastType: 'info' }
-        } else if (typeUpper.includes('SL')) {
-          return { title: '🛑 SL Alert', toastType: 'warning' }
-        } else if (typeUpper.includes('TP')) {
-          return { title: '🎯 Target Alert', toastType: 'success' }
-        } else {
-          return { title: '🚨 Trade Alert', toastType: 'warning' }
-        }
-      }
-
-      const { title, toastType } = getAlertTypeInfo(alert.alert_type)
 
       toast.addToast({
-        type: toastType,
-        title,
+        type: event === 'executed' ? 'success' : 'info',
+        title: `Order ${event.charAt(0).toUpperCase()}${event.slice(1)}`,
         message: `${alert.symbol}: ${alert.message} at ${timeStr}`,
         duration: 6000,
       })
@@ -357,29 +191,27 @@ const Logs: React.FC = () => {
         // Get today's date for monitoring file
         const today = new Date()
         const dateStr = today.toISOString().split('T')[0].replace(/-/g, '')
-        // Backend is on host machine localhost:4000, accessible from host browser
-        const monitoringFile = `http://localhost:4000/logs/monitoring_${dateStr}.csv?t=${Date.now()}`
-        
-        console.log('🔍 Fetching monitoring file:', monitoringFile)
-        
-        // Fetch monitoring data which contains real 3min candles
-        const response = await fetch(monitoringFile)
-        console.log('📡 Response status:', response.status, response.ok)
-        
-        if (!response.ok) {
-          console.log('❌ File not found or error:', response.status)
-          setStoreLogs([])
-          return
-        }
-
-        const text = await response.text()
-        console.log('📄 File size:', text.length, 'bytes')
-        
-        const parsed = Papa.parse<Record<string, string>>(text, { header: true, skipEmptyLines: true })
-        console.log('📋 Monitoring rows:', parsed.data.length)
+        const monitoringFiles = [
+          `monitoring_${dateStr}.csv`,
+          ...apiInstruments
+            .filter((instrument) => instrument.executionMode === 'TEST')
+            .map((instrument) => `monitoring_test_${instrument.id}_${dateStr}.csv`),
+        ]
+        const monitoringRows = (await Promise.all(monitoringFiles.map(async (filename) => {
+          const response = await fetch(
+            `http://localhost:4000/logs/${filename}?t=${Date.now()}`,
+          )
+          if (!response.ok) return []
+          const text = await response.text()
+          return Papa.parse<Record<string, string>>(
+            text,
+            { header: true, skipEmptyLines: true },
+          ).data
+        }))).flat()
+        console.log('📋 Monitoring rows:', monitoringRows.length)
 
         const candleDataByKey = new Map<string, LogEntry['candleOhlc']>()
-        parsed.data.forEach((row) => {
+        monitoringRows.forEach((row) => {
           if (row.category?.trim() !== 'DATA') return
           const candleMatch = row.message?.match(/3m candle\s+(\d{2}:\d{2}:\d{2})\s+O=([\d.]+)\s+H=([\d.]+)\s+L=([\d.]+)\s+C=([\d.]+)/i)
           const symbol = row.symbol?.trim()
@@ -402,16 +234,16 @@ const Logs: React.FC = () => {
               )
             })
         )
-        const logs: LogEntry[] = parsed.data.flatMap((row, index) => {
+        const logs: LogEntry[] = monitoringRows.flatMap((row, index) => {
           if (row.category?.trim() !== 'SETUP_STATUS' || !row.timestamp || !row.message) return []
 
           const parts = row.message.split('|').map((part) => part.trim())
           const recordedSetupName = parts[0] || 'EMA21 setup'
           const instrument = row.symbol?.trim() || parts[1] || ''
           const side = recordedSetupName.match(/^(CE|PE)\b/i)?.[1]?.toUpperCase()
-          const setupStrategy = recordedSetupName.match(/^(?:CE|PE)\s+(.+?)\s+setup$/i)?.[1] || 'EMA21'
-          const isHdLockedSymbol = hdLockedSymbols.has(instrument)
-          const strategy = isHdLockedSymbol ? 'HD' : setupStrategy
+          const setupStrategy = recordedSetupName.match(/^(?:CE|PE)\s+(.+?)\s+setup$/i)?.[1]
+          const isHdLockedSymbol = !setupStrategy && hdLockedSymbols.has(instrument)
+          const strategy = setupStrategy || (isHdLockedSymbol ? 'HD' : 'EMA21')
           const setupName = isHdLockedSymbol && side ? `${side} HD setup` : recordedSetupName
           const parsedTimestamp = new Date(row.timestamp)
           if (Number.isNaN(parsedTimestamp.getTime())) return []
@@ -692,6 +524,7 @@ const Logs: React.FC = () => {
           strike,
           strikeLabel: hasLock && !sameLockedStrike ? 'LOCKED' : 'ATM',
           strategy: instrument.strategy,
+          executionMode: instrument.executionMode,
           ceStrike: ceContract?.strike,
           peStrike: peContract?.strike,
           hasCE: hasLock ? Boolean(lock?.ceSymbol) : false,
@@ -904,9 +737,22 @@ const Logs: React.FC = () => {
             </span>
             <span className={`truncate text-sm font-black ${visual.name}`}>{instrument.baseSymbol}</span>
           </div>
-          <span className="shrink-0 text-[10px] font-semibold uppercase text-text-tertiary">
-            {instrument.strategy}
-          </span>
+          <div className="flex shrink-0 items-center gap-1.5">
+            <span className="text-[10px] font-semibold uppercase text-text-tertiary">
+              {instrument.strategy}
+            </span>
+            <span
+              title={`Execution mode: ${instrument.executionMode}`}
+              className={clsx(
+                'rounded px-1.5 py-0.5 text-[9px] font-black leading-none',
+                instrument.executionMode === 'TEST'
+                  ? 'bg-amber-300 text-black'
+                  : 'bg-emerald-400 text-black'
+              )}
+            >
+              {instrument.executionMode}
+            </span>
+          </div>
         </div>
         <div className="mt-2 flex items-center gap-2">
           <span className="text-[10px] font-semibold uppercase text-text-tertiary">
@@ -1287,31 +1133,6 @@ const Logs: React.FC = () => {
         </Card>
       </div>
 
-      <section className="space-y-4 border-t border-bg-tertiary pt-6">
-        <div className="flex items-center gap-3">
-          <h2 className="text-lg font-semibold text-text-primary">Test Signals & Events</h2>
-          <ExecutionModeBadge mode="TEST" />
-        </div>
-        {testActivity.alerts.length === 0 ? (
-          <Card>
-            <p className="px-4 py-3 text-sm text-text-secondary">No Test signals or events yet.</p>
-          </Card>
-        ) : (
-          <div className="divide-y divide-amber-500/20 overflow-hidden rounded-md border border-amber-500/40">
-            {testActivity.alerts.slice(0, 100).map((alert) => (
-              <div key={alert.id} className="grid grid-cols-1 gap-2 bg-amber-500/5 px-4 py-3 md:grid-cols-[150px_110px_1fr] md:items-start">
-                <time className="font-mono text-xs text-text-tertiary">{formatTime(alert.timestamp)}</time>
-                <span className="inline-flex w-fit rounded bg-amber-300 px-2 py-0.5 text-[10px] font-black text-black">{alert.category}</span>
-                <p className="min-w-0 break-words text-sm text-text-primary">
-                  <span className="mr-2 font-semibold text-amber-300">{alert.instrument_name} · {alert.strategy}</span>
-                  {alert.message}
-                </p>
-              </div>
-            ))}
-          </div>
-        )}
-      </section>
-
       {/* ACTIVE LOGS SECTION - CE/PE Columns with 3-minute Data - Reference Layout */}
       <div className="space-y-4">
         {/* Header with Export Button */}
@@ -1627,6 +1448,30 @@ const Logs: React.FC = () => {
           )}
         </Card>
       </div>
+      <section className="space-y-4 border-t border-bg-tertiary pt-6">
+        <div className="flex items-center gap-3">
+          <h2 className="text-lg font-semibold text-text-primary">Forward-Test Signals & Events</h2>
+          <ExecutionModeBadge mode="TEST" />
+        </div>
+        {testActivity.alerts.length === 0 ? (
+          <Card>
+            <p className="px-4 py-3 text-sm text-text-secondary">No Test signals or events yet.</p>
+          </Card>
+        ) : (
+          <div className="divide-y divide-amber-500/20 overflow-hidden rounded-md border border-amber-500/40">
+            {testActivity.alerts.slice(0, 100).map((alert) => (
+              <div key={alert.id} className="grid grid-cols-1 gap-2 bg-amber-500/5 px-4 py-3 md:grid-cols-[150px_110px_1fr] md:items-start">
+                <time className="font-mono text-xs text-text-tertiary">{formatTime(alert.timestamp)}</time>
+                <span className="inline-flex w-fit rounded bg-amber-300 px-2 py-0.5 text-[10px] font-black text-black">{alert.category}</span>
+                <p className="min-w-0 break-words text-sm text-text-primary">
+                  <span className="mr-2 font-semibold text-amber-300">{alert.instrument_name} · {alert.strategy}</span>
+                  {alert.message}
+                </p>
+              </div>
+            ))}
+          </div>
+        )}
+      </section>
     </div>
   )
 }

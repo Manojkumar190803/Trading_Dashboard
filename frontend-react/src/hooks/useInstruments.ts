@@ -14,10 +14,6 @@ interface InstrumentPayload {
   premiumMinPrice?: number
   premiumMaxPrice?: number
   maxInitialRiskPoints?: number
-  partialBookingEnabled: boolean
-  partialBookingRR: number
-  partialBookingLots: number
-  partialBookingIntervalRR: number
   maxLosingTradesPerDay: number
   executionMode: 'LIVE' | 'TEST'
   status?: string
@@ -100,10 +96,6 @@ export const useInstruments = (includeArchived = false) => {
           premiumMinPrice: formData.premiumMinPrice,
           premiumMaxPrice: formData.premiumMaxPrice,
           maxInitialRiskPoints: formData.maxInitialRiskPoints,
-          partialBookingEnabled: formData.partialBookingEnabled,
-          partialBookingRR: formData.partialBookingRR,
-          partialBookingLots: formData.partialBookingLots,
-          partialBookingIntervalRR: formData.partialBookingIntervalRR,
           maxLosingTradesPerDay: formData.maxLosingTradesPerDay,
           executionMode: formData.executionMode,
         }),
@@ -114,11 +106,13 @@ export const useInstruments = (includeArchived = false) => {
         const archivedResponse = await fetch('/api/instruments/debug/all')
         const archivedData = await archivedResponse.json()
         const archivedInstruments = archivedData.instruments || []
-        const isArchived = (instrument: { id: number; name: string; status: string }) => instrument.status !== 'ACTIVE'
-        const archived = archivedInstruments.find((instrument: { id: number; name: string; status: string }) =>
+        const isArchived = (instrument: { id: number; name: string; strategy: string; status: string }) => instrument.status !== 'ACTIVE'
+        const archived = archivedInstruments.find((instrument: { id: number; name: string; strategy: string; status: string }) =>
           instrument.name.trim() === formData.name.trim() && isArchived(instrument)
-        ) || archivedInstruments.find((instrument: { id: number; name: string; status: string }) =>
+          && instrument.strategy.trim().toUpperCase() === formData.strategy.trim().toUpperCase()
+        ) || archivedInstruments.find((instrument: { id: number; name: string; strategy: string; status: string }) =>
           instrument.name.trim().toLowerCase() === formData.name.trim().toLowerCase()
+          && instrument.strategy.trim().toUpperCase() === formData.strategy.trim().toUpperCase()
           && isArchived(instrument)
         )
 
@@ -139,10 +133,6 @@ export const useInstruments = (includeArchived = false) => {
               premiumMinPrice: formData.premiumMinPrice,
               premiumMaxPrice: formData.premiumMaxPrice,
               maxInitialRiskPoints: formData.maxInitialRiskPoints,
-              partialBookingEnabled: formData.partialBookingEnabled,
-              partialBookingRR: formData.partialBookingRR,
-              partialBookingLots: formData.partialBookingLots,
-              partialBookingIntervalRR: formData.partialBookingIntervalRR,
               maxLosingTradesPerDay: formData.maxLosingTradesPerDay,
               executionMode: formData.executionMode,
               status: 'ACTIVE',
@@ -183,10 +173,6 @@ export const useInstruments = (includeArchived = false) => {
           premiumMinPrice: formData.premiumMinPrice,
           premiumMaxPrice: formData.premiumMaxPrice,
           maxInitialRiskPoints: formData.maxInitialRiskPoints,
-          partialBookingEnabled: formData.partialBookingEnabled,
-          partialBookingRR: formData.partialBookingRR,
-          partialBookingLots: formData.partialBookingLots,
-          partialBookingIntervalRR: formData.partialBookingIntervalRR,
           maxLosingTradesPerDay: formData.maxLosingTradesPerDay,
           executionMode: formData.executionMode,
         }),

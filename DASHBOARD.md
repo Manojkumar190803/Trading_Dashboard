@@ -105,8 +105,8 @@ does not cancel orders or close positions.
 This page creates, edits, activates/deactivates, and archives strategy
 instruments. It provides symbol search/validation, strategy selection, and
 configuration for monitoring times, lot adjustment, maximum initial risk,
-partial booking, daily losing-trade limits, and a per-instrument `LIVE` or
-`TEST` execution mode. Existing and new instruments default to `LIVE`.
+daily losing-trade limits, and a per-instrument `LIVE` or `TEST` execution
+mode. Existing and new instruments default to `LIVE`.
 
 Instrument records are saved through Flask and stored in PostgreSQL. The
 strategy daemon polls the API and starts runners for `ACTIVE` instruments.
@@ -134,6 +134,13 @@ alerts are persisted separately in `logs/test_trading_<id>.json`; Test mode
 does not submit order mutations to OpenAlgo or write into the shared Live
 monitoring and alert records. Changing an instrument's mode does not change the
 global OpenAlgo account mode.
+
+Partial booking is configured once in **Configure Global Trade Management** on
+the Instruments page. Its enable flag, initial RR, lots per booking, and RR
+interval apply to all existing and new instruments and strategies, including
+HD; instrument-level legacy values do not override the shared policy. Defaults
+are enabled, 2R, one lot, and 0.5R intervals. HD continues its trailing-stop
+rules after each partial booking.
 
 ### Logs (`/logs`)
 
@@ -174,6 +181,7 @@ Verify broker and strategy mode before live trading.
 | Account, funds, positions, and orders | `dashboard_exporter` writes `logs/dashboard_data.json` from OpenAlgo | Home, Positions, Orderbook, some Analytics endpoints |
 | Account snapshot stream | Express watches the JSON file and sends `/dashboard-stream` events | Home page |
 | Instrument configuration/status | Flask API backed by PostgreSQL | Instruments page and strategy daemon |
+| Global trailing and partial-booking policy | `trailingStopsConfig` in `logs/instruments_config.json` | Strategy daemon and all managed strategy runners |
 | Strategy monitoring | `logs/monitoring_YYYYMMDD.csv` | Logs page |
 | Strategy alerts | `logs/trade_alerts_<symbol>_YYYYMMDD.csv` | Logs page |
 | Test virtual trading activity | `logs/test_trading_<id>.json`, aggregated by `/api/test-trading` | Dashboard, Positions, Orderbook, Analytics, and Logs Test sections |

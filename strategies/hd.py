@@ -121,7 +121,7 @@ class HDSignalProvider(SignalProvider):
         if side_state.alert_ready:
             return "ALERT CANDLE READY"
         if side_state.setup_pending:
-            return "WAITING FOR NEXT CANDLE AFTER RSI < 20"
+            return "RSI dipped below 20; looking for a strong candle or hammer"
         return "⏸  Waiting for RSI < 20"
 
     def diagnose_no_signal(

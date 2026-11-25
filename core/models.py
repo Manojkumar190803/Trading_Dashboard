@@ -56,7 +56,8 @@ class StrategyConfig:
 
     # ── Risk (all on option premium points) ──────────────────────────
     max_option_risk_points: float = 20.0
-    premium_min_price: float = 120.0
+    premium_range_enabled: bool = True
+    premium_min_price: float = 150.0
     premium_max_price: float = 180.0
     min_vwap_room_rr: float = 1.5
     pending_entry_expiry_candles: int = 3
@@ -108,6 +109,7 @@ class Position:
     progress_status: str = "Monitoring position"
     next_target_rr: Optional[float] = None
     pending_exit: Optional[PendingExit] = None
+    protective_stop_retry_at: Optional[datetime] = None
 
 
 @dataclass
@@ -151,6 +153,7 @@ class BaseSideState:
 class DayState:
     trading_day: Optional[date] = None
     atm_locked: bool = False
+    atm_locked_at: Optional[datetime] = None
     atm_strike: Optional[int] = None
     ce_symbol: Optional[str] = None
     pe_symbol: Optional[str] = None

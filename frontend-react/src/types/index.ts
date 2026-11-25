@@ -182,6 +182,10 @@ export interface TrailingStopsConfig {
   breakEvenRR: number // Breakeven milestone in Risk Ratio (default 1.25)
   trailStepRR: number // Trailing step size in Risk Ratio (default 0.5)
   maxInitialRiskPoints: number // Maximum initial risk in points (default 20)
+  partialBookingEnabled: boolean
+  partialBookingRR: number
+  partialBookingLots: number
+  partialBookingIntervalRR: number
   createdAt: string
   updatedAt: string
 }

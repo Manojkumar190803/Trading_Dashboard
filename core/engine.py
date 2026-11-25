@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import csv
 import json
+import math
 import os
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
@@ -24,10 +25,14 @@ from core.models import (
     StrategyAlert,
     StrategyConfig,
 )
+from core.option_contracts import select_option_contract, select_option_contract_pair
 from core.signal_logger import SignalLogger
 from strategies.base import SignalProvider
 
 logger = logging.getLogger("core.engine")
+
+HD_TARGET_PREMIUM = 150.0
+HD_MAX_STRIKE_SEARCH_STEPS = 50
 
 
 def _shared_sl_count_path(trading_day: date) -> Path:
@@ -351,7 +356,7 @@ class BaseStrategyEngine:
     # ── helpers ──────────────────────────────────────────────────────
 
     def _record_alert(self, ts: datetime, category: str, message: str) -> None:
-        if category in {"SIGNAL", "PENDING_ENTRY"} and any(
+        if category in {"ATM_LOCK", "SIGNAL", "PENDING_ENTRY", "SETUP"} and any(
             alert.timestamp.date() == ts.date()
             and alert.category == category
             and alert.message == message
@@ -362,7 +367,7 @@ class BaseStrategyEngine:
         if len(self.alerts) > 500:
             self.alerts = self.alerts[-500:]
         if self.persist_alerts and category in (
-            "SIGNAL", "PENDING_ENTRY", "ENTRY", "EXIT", "TARGET", "SL", "CANCEL",
+            "ATM_LOCK", "SIGNAL", "PENDING_ENTRY", "SETUP", "ENTRY", "EXIT", "TARGET", "SL", "CANCEL",
             "ORDER", "PROTECTIVE_SL", "TSL", "RISK", "REJECT", "FAILED", "ERROR", "UNCERTAIN_ENTRY",
         ):
             record_test_alert = getattr(self.broker, "record_alert", None)
@@ -716,12 +721,14 @@ class BaseStrategyEngine:
             modified = False
             logger.warning("%s protective SL modify failed for %s: %s", side, order_id, exc)
         if not modified:
+            position.protective_stop_retry_at = ts + timedelta(seconds=15)
             self._record_alert(
                 ts, "RISK",
-                f"{side} protective SL update failed for {position.option_symbol} "
-                f"order_id={order_id}; existing SL was not replaced",
+                f"{side} protective SL update unconfirmed for {position.option_symbol} "
+                f"order_id={order_id}; check broker order immediately",
             )
             return
+        position.protective_stop_retry_at = None
         self._record_alert(
             ts, "PROTECTIVE_SL",
             f"{side} protective SL modified for {position.option_symbol} "
@@ -1105,62 +1112,353 @@ class BaseStrategyEngine:
         ts: datetime,
         spot_price: float,
         expiry_day_override: Optional[date] = None,
+        force_refresh: bool = False,
     ) -> None:
-        if self.state.atm_locked:
+        if self.state.atm_locked and not force_refresh:
             return
         strike = get_atm_strike(spot_price, self.cfg.strike_step)
 
-        expiry_day: Optional[date] = expiry_day_override
-        if expiry_day is None:
-            expiry_day = self.broker.resolve_nearest_expiry(
-                self.cfg.option_index_symbol,
-                ts.date(),
-                strike,
-                self.cfg.strike_step,
-                preferred_weekday=self.cfg.weekly_expiry_weekday,
-                expiry_policy=self.cfg.expiry_policy,
-            )
-        if expiry_day is None:
-            if self.cfg.expiry_policy == "monthly":
-                expiry_day = choose_monthly_expiry_for_entry(ts.date(), self.cfg.weekly_expiry_weekday)
-            else:
-                expiry_day = choose_weekly_expiry_for_entry(ts.date(), self.cfg.weekly_expiry_weekday)
-        expiry_code = format_expiry_code(expiry_day)
-
         if getattr(self.signal_provider, "strategy_key", None) == "hd":
-            try:
-                chain = self.broker.fetch_option_chain(
-                    self.cfg.option_index_symbol,
-                    self.cfg.exchange_spot,
-                    expiry_code,
+            contracts_by_side: dict[
+                str, dict[date, list[tuple[str, float, int]]]
+            ] = {
+                "CE": {},
+                "PE": {},
+            }
+            latest_premiums: dict[
+                str, tuple[Optional[str], Optional[float]]
+            ] = {"CE": (None, None), "PE": (None, None)}
+            for side in ("CE", "PE"):
+                atm_strike = strike
+                atm_contract: Optional[dict[str, object]] = None
+                atm_expiry: Optional[date] = None
+                try:
+                    atm_rows = self.broker.search_symbols(
+                        f"{self.cfg.option_index_symbol} {atm_strike} {side}",
+                        self.cfg.exchange_options,
+                    )
+                    atm_expiry, atm_contract = select_option_contract(
+                        atm_rows,
+                        self.cfg.option_index_symbol,
+                        atm_strike,
+                        side,
+                        ts.date(),
+                        self.cfg.expiry_policy,
+                    )
+                except Exception as exc:
+                    self._record_alert(
+                        ts,
+                        "RISK",
+                        f"HD {side} option-contract search failed: {exc}",
+                    )
+                    return
+
+                atm_symbol = (
+                    atm_contract.get("symbol")
+                    if atm_contract is not None
+                    else None
                 )
-            except Exception as exc:
-                self._record_alert(ts, "RISK", f"HD option-chain fetch failed: {exc}")
-                return
-            selected = self._select_hd_contracts(chain, strike)
-            if selected is None:
+                try:
+                    atm_premium = (
+                        float(self.broker.get_ltp(atm_symbol))
+                        if isinstance(atm_symbol, str)
+                        else 0.0
+                    )
+                except (TypeError, ValueError):
+                    atm_premium = 0.0
+                latest_premiums[side] = (
+                    atm_symbol if isinstance(atm_symbol, str) else None,
+                    atm_premium if atm_premium > 0 else None,
+                )
+                if atm_expiry is None or not isinstance(atm_symbol, str):
+                    self._record_alert(
+                        ts,
+                        "RISK",
+                        f"HD {side} ATM contract unavailable; cannot locate the ₹150 premium target",
+                    )
+                    continue
+                if atm_premium <= 0:
+                    self._record_alert(
+                        ts,
+                        "RISK",
+                        f"HD {side} ATM premium unavailable; cannot locate the ₹150 premium target",
+                    )
+                    continue
+
+                if side == "CE":
+                    direction = 1 if atm_premium >= HD_TARGET_PREMIUM else -1
+                else:
+                    direction = -1 if atm_premium >= HD_TARGET_PREMIUM else 1
+
+                for step in range(HD_MAX_STRIKE_SEARCH_STEPS + 1):
+                    candidate_strike = atm_strike + direction * step * self.cfg.strike_step
+                    if step == 0:
+                        expiry, contract = atm_expiry, atm_contract
+                        premium = atm_premium
+                    else:
+                        try:
+                            rows = self.broker.search_symbols(
+                                f"{self.cfg.option_index_symbol} "
+                                f"{candidate_strike} {side}",
+                                self.cfg.exchange_options,
+                            )
+                            expiry, contract = select_option_contract(
+                                rows,
+                                self.cfg.option_index_symbol,
+                                candidate_strike,
+                                side,
+                                ts.date(),
+                                self.cfg.expiry_policy,
+                            )
+                        except Exception as exc:
+                            self._record_alert(
+                                ts,
+                                "RISK",
+                                f"HD {side} option-contract search failed: {exc}",
+                            )
+                            return
+                        symbol = contract.get("symbol") if contract else None
+                        try:
+                            premium = (
+                                float(self.broker.get_ltp(symbol))
+                                if isinstance(symbol, str)
+                                else 0.0
+                            )
+                        except (TypeError, ValueError):
+                            premium = 0.0
+                        if isinstance(symbol, str):
+                            latest_premiums[side] = (
+                                symbol,
+                                premium if premium > 0 else None,
+                            )
+
+                    if (
+                        expiry is not None
+                        and contract is not None
+                        and isinstance(contract.get("symbol"), str)
+                        and premium >= HD_TARGET_PREMIUM
+                    ):
+                        contracts_by_side[side].setdefault(expiry, []).append(
+                            (str(contract["symbol"]), premium, candidate_strike)
+                        )
+
+                    if premium > 0:
+                        crossed_target = (
+                            premium < HD_TARGET_PREMIUM
+                            if direction == (1 if side == "CE" else -1)
+                            else premium >= HD_TARGET_PREMIUM
+                        )
+                        if crossed_target:
+                            break
+
+            common_expiries = set(contracts_by_side["CE"]).intersection(
+                contracts_by_side["PE"]
+            )
+            candidate_expiries = common_expiries or (
+                set(contracts_by_side["CE"]) | set(contracts_by_side["PE"])
+            )
+            if not candidate_expiries:
+                def premium_detail(side: str) -> str:
+                    symbol, premium = latest_premiums[side]
+                    if symbol is None:
+                        return f"{side} contract unavailable"
+                    if premium is None:
+                        return f"{side} {symbol} LTP unavailable"
+                    return (
+                        f"{side} {symbol} LTP ₹{premium:.2f} "
+                        f"({'eligible' if premium >= HD_TARGET_PREMIUM else 'below ₹150'})"
+                    )
+
                 self._record_alert(
                     ts,
                     "RISK",
-                    "HD contracts not locked: no one-step ITM contracts in "
-                    f"premium range {self.cfg.premium_min_price:.2f}-"
-                    f"{self.cfg.premium_max_price:.2f}",
+                    "HD contracts not locked: no contract found at or above "
+                    f"₹{HD_TARGET_PREMIUM:.2f} within "
+                    f"{HD_MAX_STRIKE_SEARCH_STEPS} strike steps; "
+                    f"{premium_detail('CE')}; {premium_detail('PE')}",
                 )
                 return
-            ce_symbol, pe_symbol = selected
+
+            if ts.date() in candidate_expiries:
+                expiry_day = ts.date()
+            elif self.cfg.expiry_policy == "monthly":
+                nearest_month = min(candidate_expiries).replace(day=1)
+                month_expiries = {
+                    expiry
+                    for expiry in candidate_expiries
+                    if expiry.year == nearest_month.year
+                    and expiry.month == nearest_month.month
+                }
+                expiry_day = (
+                    max(month_expiries) if month_expiries else min(candidate_expiries)
+                )
+            else:
+                expiry_day = min(candidate_expiries)
+
+            ce_candidates = contracts_by_side["CE"].get(expiry_day, [])
+            pe_candidates = contracts_by_side["PE"].get(expiry_day, [])
+            ce_candidate = min(ce_candidates, key=lambda item: item[1]) if ce_candidates else None
+            pe_candidate = min(pe_candidates, key=lambda item: item[1]) if pe_candidates else None
+            ce_symbol = ce_candidate[0] if ce_candidate else None
+            pe_symbol = pe_candidate[0] if pe_candidate else None
+
+            if ce_candidate is not None and ce_candidate[2] == strike:
+                ce_strike = strike - self.cfg.strike_step
+                try:
+                    rows = self.broker.search_symbols(
+                        f"{self.cfg.option_index_symbol} {ce_strike} CE",
+                        self.cfg.exchange_options,
+                    )
+                    shifted_expiry, shifted_contract = select_option_contract(
+                        rows,
+                        self.cfg.option_index_symbol,
+                        ce_strike,
+                        "CE",
+                        ts.date(),
+                        self.cfg.expiry_policy,
+                    )
+                    shifted_symbol = shifted_contract.get("symbol") if shifted_contract else None
+                    shifted_premium = (
+                        float(self.broker.get_ltp(shifted_symbol))
+                        if isinstance(shifted_symbol, str)
+                        else 0.0
+                    )
+                    if (
+                        shifted_expiry == expiry_day
+                        and isinstance(shifted_symbol, str)
+                        and shifted_premium >= HD_TARGET_PREMIUM
+                    ):
+                        ce_symbol = shifted_symbol
+                        ce_candidate = (shifted_symbol, shifted_premium, ce_strike)
+                    else:
+                        ce_symbol = None
+                        ce_candidate = None
+                except Exception as exc:
+                    self._record_alert(
+                        ts,
+                        "RISK",
+                        f"HD CE ITM fallback search failed: {exc}",
+                    )
+                    return
+
+            if pe_candidate is not None and pe_candidate[2] == strike:
+                pe_strike = strike + self.cfg.strike_step
+                try:
+                    rows = self.broker.search_symbols(
+                        f"{self.cfg.option_index_symbol} {pe_strike} PE",
+                        self.cfg.exchange_options,
+                    )
+                    shifted_expiry, shifted_contract = select_option_contract(
+                        rows,
+                        self.cfg.option_index_symbol,
+                        pe_strike,
+                        "PE",
+                        ts.date(),
+                        self.cfg.expiry_policy,
+                    )
+                    shifted_symbol = shifted_contract.get("symbol") if shifted_contract else None
+                    shifted_premium = (
+                        float(self.broker.get_ltp(shifted_symbol))
+                        if isinstance(shifted_symbol, str)
+                        else 0.0
+                    )
+                    if (
+                        shifted_expiry == expiry_day
+                        and isinstance(shifted_symbol, str)
+                        and shifted_premium >= HD_TARGET_PREMIUM
+                    ):
+                        pe_symbol = shifted_symbol
+                        pe_candidate = (shifted_symbol, shifted_premium, pe_strike)
+                    else:
+                        pe_symbol = None
+                        pe_candidate = None
+                except Exception as exc:
+                    self._record_alert(
+                        ts,
+                        "RISK",
+                        f"HD PE ITM fallback search failed: {exc}",
+                    )
+                    return
+
+            premiums = {
+                "CE": (ce_symbol, ce_candidate[1] if ce_candidate else None),
+                "PE": (pe_symbol, pe_candidate[1] if pe_candidate else None),
+            }
+
+            def premium_detail(side: str) -> str:
+                symbol, premium = premiums[side]
+                if symbol is None:
+                    return f"{side} contract unavailable at selected expiry"
+                return f"{side} {symbol} LTP ₹{premium:.2f}"
+
             if ce_symbol is None:
-                self._record_alert(ts, "RISK", "HD CE unavailable: one-step ITM contract missing or outside premium range")
+                self._record_alert(ts, "RISK", f"HD CE unavailable: {premium_detail('CE')}")
             if pe_symbol is None:
-                self._record_alert(ts, "RISK", "HD PE unavailable: one-step ITM contract missing or outside premium range")
+                self._record_alert(ts, "RISK", f"HD PE unavailable: {premium_detail('PE')}")
         else:
-            ce_symbol = build_option_symbol(self.cfg.option_index_symbol, expiry_code, strike, "CE")
-            pe_symbol = build_option_symbol(self.cfg.option_index_symbol, expiry_code, strike, "PE")
+            expiry_day = expiry_day_override
+            if expiry_day is None:
+                expiry_day = self.broker.resolve_nearest_expiry(
+                    self.cfg.option_index_symbol,
+                    ts.date(),
+                    strike,
+                    self.cfg.strike_step,
+                    preferred_weekday=self.cfg.weekly_expiry_weekday,
+                    expiry_policy=self.cfg.expiry_policy,
+                )
+            if expiry_day is None:
+                if self.cfg.expiry_policy == "monthly":
+                    expiry_day = choose_monthly_expiry_for_entry(
+                        ts.date(),
+                        self.cfg.weekly_expiry_weekday,
+                    )
+                else:
+                    expiry_day = choose_weekly_expiry_for_entry(
+                        ts.date(),
+                        self.cfg.weekly_expiry_weekday,
+                    )
+        expiry_code = format_expiry_code(expiry_day)
+        if getattr(self.signal_provider, "strategy_key", None) != "hd":
+            ce_symbol = build_option_symbol(
+                self.cfg.option_index_symbol,
+                expiry_code,
+                strike,
+                "CE",
+            )
+            pe_symbol = build_option_symbol(
+                self.cfg.option_index_symbol,
+                expiry_code,
+                strike,
+                "PE",
+            )
+        assigned_symbols: dict[str, Optional[str]] = {}
+        for side, selected_symbol in (("CE", ce_symbol), ("PE", pe_symbol)):
+            side_state = self._side_state(side)
+            active_symbol = None
+            if side_state.position is not None:
+                active_symbol = side_state.position.option_symbol
+            elif side_state.pending_entry is not None:
+                active_symbol = side_state.pending_entry.option_symbol
+            assigned_symbol = active_symbol or selected_symbol
+            assigned_symbols[side] = assigned_symbol
+            if active_symbol is None and side_state.option_symbol != assigned_symbol:
+                replacement = self.signal_provider.create_side_state()
+                replacement.option_symbol = assigned_symbol
+                if side == "CE":
+                    self.state.ce = replacement
+                else:
+                    self.state.pe = replacement
+
+        ce_symbol = assigned_symbols["CE"]
+        pe_symbol = assigned_symbols["PE"]
         self.state.ce_symbol = ce_symbol
         self.state.pe_symbol = pe_symbol
         self.state.atm_strike = strike
         self.state.ce.option_symbol = ce_symbol
         self.state.pe.option_symbol = pe_symbol
         self.state.atm_locked = bool(ce_symbol or pe_symbol)
+        if self.state.atm_locked:
+            self.state.atm_locked_at = ts
         print()
         print("┌" + "─" * 60 + "┐")
         print(f"│ {'STRATEGY — STRIKES LOCKED':^58s} │")
@@ -1179,49 +1477,35 @@ class BaseStrategyEngine:
 
     def _select_hd_contracts(
         self,
-        response: Optional[dict[str, object]],
-        atm_strike: int,
-    ) -> Optional[tuple[Optional[str], Optional[str]]]:
-        if self.cfg.premium_min_price >= self.cfg.premium_max_price or response is None:
-            return None
-        payload = response.get("data") if isinstance(response.get("data"), dict) else response
-        chain_rows = payload.get("chain") if isinstance(payload, dict) else None
-        if not isinstance(chain_rows, list):
-            return None
-
-        midpoint = (self.cfg.premium_min_price + self.cfg.premium_max_price) / 2
-        selected: dict[str, tuple[float, str]] = {}
-        for row in chain_rows:
-            if not isinstance(row, dict):
+        call_contract: Optional[dict[str, object]],
+        put_contract: Optional[dict[str, object]],
+    ) -> tuple[
+        Optional[str],
+        Optional[str],
+        dict[str, tuple[Optional[str], Optional[float]]],
+    ]:
+        selected: dict[str, str] = {}
+        premiums: dict[str, tuple[Optional[str], Optional[float]]] = {}
+        for side, contract in (("CE", call_contract), ("PE", put_contract)):
+            if contract is None:
+                premiums[side] = (None, None)
+                continue
+            symbol = contract.get("symbol")
+            if not isinstance(symbol, str) or not symbol:
+                premiums[side] = (None, None)
                 continue
             try:
-                strike = float(row.get("strike"))
+                premium = float(self.broker.get_ltp(symbol))
             except (TypeError, ValueError):
+                premiums[side] = (symbol, None)
                 continue
-            for side in ("CE", "PE"):
-                target_strike = atm_strike + (-self.cfg.strike_step if side == "CE" else self.cfg.strike_step)
-                if strike != target_strike:
-                    continue
-                option = row.get(side.lower()) or row.get(side)
-                if not isinstance(option, dict):
-                    continue
-                symbol = option.get("symbol")
-                try:
-                    premium = float(option.get("ltp"))
-                except (TypeError, ValueError):
-                    continue
-                if not symbol or not self.cfg.premium_min_price <= premium <= self.cfg.premium_max_price:
-                    continue
-                rank = abs(premium - midpoint)
-                current = selected.get(side)
-                if current is None or rank < current[0]:
-                    selected[side] = (rank, str(symbol))
+            premiums[side] = (symbol, premium)
+            if premium >= HD_TARGET_PREMIUM:
+                selected[side] = symbol
 
-        ce_symbol = selected.get("CE", ((), None))[1]
-        pe_symbol = selected.get("PE", ((), None))[1]
-        if ce_symbol is None and pe_symbol is None:
-            return None
-        return ce_symbol, pe_symbol
+        ce_symbol = selected.get("CE")
+        pe_symbol = selected.get("PE")
+        return ce_symbol, pe_symbol, premiums
 
     # ── entry placement ────────────────────────────────────────────
 
@@ -1631,9 +1915,22 @@ class BaseStrategyEngine:
                         f"is {broker_quantity}, expected long quantity is {pending.quantity}",
                     )
                     return
-                option_ltp = float(
-                    status.get("average_price") or status.get("price") or pending.option_trigger_level
-                )
+                if self._is_ema21_strategy():
+                    try:
+                        option_ltp = float(status.get("average_price") or 0)
+                    except (TypeError, ValueError, OverflowError):
+                        option_ltp = 0.0
+                    if not math.isfinite(option_ltp) or option_ltp <= 0:
+                        self._record_alert(
+                            ts, "RISK",
+                            f"{side} entry fill price unavailable for {pending.option_symbol}; "
+                            "check broker order immediately",
+                        )
+                        return
+                else:
+                    option_ltp = float(
+                        status.get("average_price") or status.get("price") or pending.option_trigger_level
+                    )
                 actual_risk = option_ltp - pending.option_stop_level
                 if actual_risk > self.cfg.max_option_risk_points:
                     self._record_alert(
@@ -1835,7 +2132,6 @@ class BaseStrategyEngine:
         if (
             pos is None
             or not self.cfg.partial_booking_enabled
-            or self._is_hd_strategy()
         ):
             return
 
@@ -1893,16 +2189,8 @@ class BaseStrategyEngine:
             self._record_alert(
                 self.last_processed_candle_time or pos.entry_time,
                 "TARGET",
-                f"{pos.option_type} {self.cfg.t1_rr:.1f} RR hit — SL moved to entry (breakeven)",
+                f"{pos.option_type} {self.cfg.t1_rr:.1f} RR hit — local SL moved to entry (breakeven)",
             )
-
-        if self._is_hd_strategy():
-            self._advance_hd_trailing(
-                side_state,
-                rr,
-                self.last_processed_candle_time or pos.entry_time,
-            )
-            return
 
         self._manage_partial_booking(
             side_state,
@@ -1912,6 +2200,14 @@ class BaseStrategyEngine:
         )
         pos = side_state.position
         if pos is None or pos.pending_exit is not None:
+            return
+
+        if self._is_hd_strategy():
+            self._advance_hd_trailing(
+                side_state,
+                rr,
+                self.last_processed_candle_time or pos.entry_time,
+            )
             return
 
         # Step-trailing: at 1.5R protect 0.5R, then advance by 0.5R.
@@ -1935,13 +2231,13 @@ class BaseStrategyEngine:
                     else:
                         trailing_status = "trailing position"
                     pos.progress_status = (
-                        f"{current_step:.1f}R reached - SL shifted to {new_sl:.2f}; "
+                        f"{current_step:.1f}R reached - local SL shifted to {new_sl:.2f}; "
                         f"{trailing_status}"
                     )
                     self._record_alert(
                         self.last_processed_candle_time or pos.entry_time,
                         "TSL",
-                        f"{pos.option_type} {current_step:.1f} RR — TSL raised to {new_sl:.2f}",
+                        f"{pos.option_type} {current_step:.1f} RR — local TSL raised to {new_sl:.2f}",
                     )
 
     def _advance_hd_trailing(
@@ -1966,12 +2262,12 @@ class BaseStrategyEngine:
                 self._record_alert(
                     ts,
                     "TSL",
-                    f"{pos.option_type} {milestone:.2f} RR milestone hit — TSL raised to {new_stop:.2f}",
+                    f"{pos.option_type} {milestone:.2f} RR milestone hit — local TSL raised to {new_stop:.2f}",
                 )
             pos.highest_rr_step = milestone
             pos.next_target_rr = milestone + step
             pos.progress_status = (
-                f"{milestone:.2f}R reached - SL shifted to {pos.option_stop_level:.2f}; "
+                f"{milestone:.2f}R reached - local SL shifted to {pos.option_stop_level:.2f}; "
                 f"looking for {pos.next_target_rr:.2f}R"
             )
             milestone += step
@@ -2131,6 +2427,9 @@ class BaseStrategyEngine:
             )
             return
 
+        if pos.protective_stop_retry_at is not None and ts >= pos.protective_stop_retry_at:
+            self._refresh_protective_stop(pos.option_type, pos, ts)
+
         # Compute current RR from tick LTP.
         rr_entry = pos.entry_price if self._uses_broker_confirmed_fill() else pos.option_entry_trigger
         rr = (ltp - rr_entry) / ir
@@ -2150,16 +2449,16 @@ class BaseStrategyEngine:
                 self._record_alert(
                     ts,
                     "TSL",
-                    f"{pos.option_type} {self.cfg.t1_rr:.1f} RR (tick) — SL to entry",
+                    f"{pos.option_type} {self.cfg.t1_rr:.1f} RR (tick) — local SL to entry",
                 )
-
-        if self._is_hd_strategy():
-            self._advance_hd_trailing(side_state, rr, ts)
-            return
 
         self._manage_partial_booking(side_state, rr, ts, "tick")
         pos = side_state.position
         if pos is None or pos.pending_exit is not None:
+            return
+
+        if self._is_hd_strategy():
+            self._advance_hd_trailing(side_state, rr, ts)
             return
 
         # Step-trailing: at 1.5R protect 0.5R, then advance by 0.5R.
@@ -2183,10 +2482,10 @@ class BaseStrategyEngine:
                     else:
                         trailing_status = "trailing position"
                     pos.progress_status = (
-                        f"{current_step:.1f}R reached - SL shifted to {new_sl:.2f}; "
+                        f"{current_step:.1f}R reached - local SL shifted to {new_sl:.2f}; "
                         f"{trailing_status}"
                     )
-                    self._record_alert(ts, "TSL", f"{pos.option_type} {current_step:.1f} RR (tick) — TSL={new_sl:.2f}")
+                    self._record_alert(ts, "TSL", f"{pos.option_type} {current_step:.1f} RR (tick) — local TSL={new_sl:.2f}")
 
         # Check trailing stop on this tick.
         if pos.breakeven_armed:
@@ -2365,6 +2664,19 @@ class BaseStrategyEngine:
         setup_was_active = getattr(side_state, "setup_active", False)
         if not state_updated:
             self.signal_provider.update_state(side_state, row, prev_row)
+        if (
+            self._is_hd_strategy()
+            and side_state.position is None
+            and side_state.pending_entry is None
+            and getattr(side_state, "setup_pending", False)
+            and getattr(side_state, "setup_candle_time", None) == ts
+        ):
+            self._record_alert(
+                ts,
+                "SETUP",
+                f"{side} RSI dipped below 20; looking for a strong candle or hammer "
+                f"on {side_state.option_symbol or '-'} at {ts.strftime('%H:%M')}",
+            )
         if side_state.pending_entry is not None:
             cancellation_reason = self.signal_provider.pending_entry_cancellation_reason(
                 side, side_state, row, prev_row

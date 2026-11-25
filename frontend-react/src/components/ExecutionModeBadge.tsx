@@ -8,14 +8,14 @@ interface ExecutionModeBadgeProps {
 const ExecutionModeBadge: React.FC<ExecutionModeBadgeProps> = ({ mode, className }) => (
   <span
     className={clsx(
-      'inline-flex min-w-16 justify-center rounded px-2.5 py-1 text-[11px] font-black ring-2',
+      'inline-flex min-w-24 justify-center rounded px-2.5 py-1 text-[11px] font-black ring-2',
       mode === 'TEST'
         ? 'bg-amber-300 text-black ring-amber-100'
         : 'bg-emerald-400 text-black ring-emerald-200',
       className,
     )}
   >
-    {mode}
+    {mode === 'TEST' ? 'FORWARD TEST' : mode}
   </span>
 )
 

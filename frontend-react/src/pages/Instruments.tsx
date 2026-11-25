@@ -44,10 +44,6 @@ interface FormData {
   lotSizeAdjustment: number
   strategy: string
   maxInitialRiskPoints: number
-  partialBookingEnabled: boolean
-  partialBookingRR: number
-  partialBookingLots: number
-  partialBookingIntervalRR: number
   maxLosingTradesPerDay: number
   executionMode: 'LIVE' | 'TEST'
 }
@@ -72,6 +68,7 @@ const Instruments: React.FC = () => {
   const [symbolValidation, setSymbolValidation] = useState<{ symbol: string; valid: boolean; message: string } | null>(null)
   const [isValidatingSymbol, setIsValidatingSymbol] = useState(false)
   const [isSubmitting, setIsSubmitting] = useState(false)
+  const [validationMessage, setValidationMessage] = useState<string | null>(null)
   const [formData, setFormData] = useState<FormData>({
     name: '',
     brokerSymbol: '',
@@ -81,10 +78,6 @@ const Instruments: React.FC = () => {
     lotSizeAdjustment: 1,
     strategy: '21EMA',
     maxInitialRiskPoints: 20,
-    partialBookingEnabled: true,
-    partialBookingRR: 2,
-    partialBookingLots: 1,
-    partialBookingIntervalRR: 0.5,
     maxLosingTradesPerDay: 3,
     executionMode: 'LIVE',
   })
@@ -199,7 +192,7 @@ const Instruments: React.FC = () => {
       formData.entryCutoffTime < formData.monitoringStartTime
       || formData.entryCutoffTime > formData.monitoringEndTime
     ) {
-      alert('Entry cutoff must be between the monitoring start and end times')
+      setValidationMessage('Entry cutoff must be between the monitoring start and end times')
       return
     }
     if (!Number.isInteger(formData.lotSizeAdjustment) || formData.lotSizeAdjustment < 1) {
@@ -208,18 +201,6 @@ const Instruments: React.FC = () => {
     }
     if (formData.maxInitialRiskPoints <= 0) {
       alert('Maximum initial risk must be greater than zero')
-      return
-    }
-    if (formData.partialBookingRR <= 0) {
-      alert('Partial booking RR must be greater than zero')
-      return
-    }
-    if (formData.partialBookingIntervalRR <= 0) {
-      alert('Partial booking RR interval must be greater than zero')
-      return
-    }
-    if (!Number.isInteger(formData.partialBookingLots) || formData.partialBookingLots < 1) {
-      alert('Partial booking lots must be a positive whole number')
       return
     }
     if (!Number.isInteger(formData.maxLosingTradesPerDay) || formData.maxLosingTradesPerDay < 1) {
@@ -243,10 +224,6 @@ const Instruments: React.FC = () => {
       strategy: formData.strategy,
       productType: 'INTRADAY',
       maxInitialRiskPoints: formData.maxInitialRiskPoints,
-      partialBookingEnabled: formData.partialBookingEnabled,
-      partialBookingRR: formData.partialBookingRR,
-      partialBookingLots: formData.partialBookingLots,
-      partialBookingIntervalRR: formData.partialBookingIntervalRR,
       maxLosingTradesPerDay: formData.maxLosingTradesPerDay,
       executionMode: formData.executionMode,
     }
@@ -283,10 +260,6 @@ const Instruments: React.FC = () => {
       lotSizeAdjustment: inst.lotSizeAdjustment,
       strategy: inst.strategy,
       maxInitialRiskPoints: inst.maxInitialRiskPoints ?? 20,
-      partialBookingEnabled: inst.partialBookingEnabled ?? true,
-      partialBookingRR: inst.partialBookingRR ?? 2,
-      partialBookingLots: inst.partialBookingLots ?? 1,
-      partialBookingIntervalRR: inst.partialBookingIntervalRR ?? 0.5,
       maxLosingTradesPerDay: inst.maxLosingTradesPerDay ?? 3,
       executionMode: inst.executionMode ?? 'LIVE',
     })
@@ -314,10 +287,6 @@ const Instruments: React.FC = () => {
       lotSizeAdjustment: 1,
       strategy: '21EMA',
       maxInitialRiskPoints: 20,
-      partialBookingEnabled: true,
-      partialBookingRR: 2,
-      partialBookingLots: 1,
-      partialBookingIntervalRR: 0.5,
       maxLosingTradesPerDay: 3,
       executionMode: 'LIVE',
     })
@@ -541,10 +510,13 @@ const Instruments: React.FC = () => {
                           : 'bg-amber-950 text-amber-300 ring-amber-700 hover:bg-amber-900'
                     )}
                   >
-                    {mode}
+                    {mode === 'TEST' ? 'FORWARD TEST' : mode}
                   </button>
                 ))}
               </div>
+              <p className="mt-2 text-xs text-text-tertiary">
+                Forward Test uses live OpenAlgo market data and simulated orders only; it does not place real broker orders.
+              </p>
             </div>
             <div>
               <label className="block text-sm font-medium text-text-secondary mb-2">Max Losing Trades per Day *</label>
@@ -566,64 +538,9 @@ const Instruments: React.FC = () => {
 
             <section className="col-span-1 md:col-span-3 rounded-lg border border-bg-tertiary bg-bg-primary/50 p-4">
               <h3 className="text-sm font-semibold text-text-primary">Partial Booking</h3>
-              {formData.strategy === 'HD' ? (
-                <p className="mt-2 text-sm text-text-secondary">
-                  Partial booking is not available for HD; its position exits follow HD trailing rules.
-                </p>
-              ) : (
-                <>
-                  <label className="mt-3 flex items-center gap-2 text-sm text-text-secondary">
-                    <input
-                      type="checkbox"
-                      checked={formData.partialBookingEnabled}
-                      onChange={(e) => setFormData({ ...formData, partialBookingEnabled: e.target.checked })}
-                      className="h-4 w-4 accent-cyan-400"
-                    />
-                    Enable partial booking
-                  </label>
-                  <div className="mt-3 grid grid-cols-1 md:grid-cols-3 gap-4">
-                    <div>
-                      <label className="block text-sm font-medium text-text-secondary mb-2">Initial booking at (R)</label>
-                      <input
-                        type="number"
-                        min="0.1"
-                        step="0.1"
-                        value={formData.partialBookingRR}
-                        disabled={!formData.partialBookingEnabled}
-                        onChange={(e) => setFormData({ ...formData, partialBookingRR: Number(e.target.value) || 2 })}
-                        className="w-full px-3 py-2 bg-bg-primary border border-bg-tertiary rounded-lg text-text-primary disabled:opacity-50"
-                      />
-                    </div>
-                    <div>
-                      <label className="block text-sm font-medium text-text-secondary mb-2">RR interval after each booking</label>
-                      <input
-                        type="number"
-                        min="0.1"
-                        step="0.1"
-                        value={formData.partialBookingIntervalRR}
-                        disabled={!formData.partialBookingEnabled}
-                        onChange={(e) => setFormData({ ...formData, partialBookingIntervalRR: Number(e.target.value) || 0.5 })}
-                        className="w-full px-3 py-2 bg-bg-primary border border-bg-tertiary rounded-lg text-text-primary disabled:opacity-50"
-                      />
-                    </div>
-                    <div>
-                      <label className="block text-sm font-medium text-text-secondary mb-2">Lots per booking</label>
-                      <input
-                        type="number"
-                        min="1"
-                        step="1"
-                        value={formData.partialBookingLots}
-                        disabled={!formData.partialBookingEnabled}
-                        onChange={(e) => setFormData({ ...formData, partialBookingLots: Number(e.target.value) || 1 })}
-                        className="w-full px-3 py-2 bg-bg-primary border border-bg-tertiary rounded-lg text-text-primary disabled:opacity-50"
-                      />
-                    </div>
-                    <p className="self-end text-sm text-text-secondary md:col-span-3">
-                      Books {formData.partialBookingLots} lot(s) at {formData.partialBookingRR}R, then every {formData.partialBookingIntervalRR}R; always leaves 1 lot to trail.
-                    </p>
-                  </div>
-                </>
-              )}
+              <p className="mt-2 text-sm text-text-secondary">
+                Partial booking is configured globally and applies to all strategies and instruments, including HD.
+              </p>
             </section>
 
             <div className="col-span-1 md:col-span-3 flex gap-3">
@@ -767,7 +684,7 @@ const Instruments: React.FC = () => {
               GLOBAL CONFIG
             </div>
             <h2 className="text-lg font-semibold text-text-primary group-hover:text-accent-cyan transition-colors">
-              Configure Global Trailing Stops
+              Configure Global Trade Management
             </h2>
           </div>
           <ChevronDown
@@ -784,12 +701,11 @@ const Instruments: React.FC = () => {
             {/* Info Box */}
             <div className="bg-bg-primary border border-accent-cyan/30 rounded-lg p-4">
               <p className="text-sm text-text-secondary">
-                These settings apply globally to all strategies and instruments. Breakeven at <span className="font-semibold text-accent-cyan">{localTrailingConfig.breakEvenRR.toFixed(2)}</span> RR, 
-                trailing in <span className="font-semibold text-accent-cyan">{localTrailingConfig.trailStepRR.toFixed(2)}</span> RR steps.
+                These settings apply globally to all existing and new instruments, including HD. Partial booking is {localTrailingConfig.partialBookingEnabled ? 'enabled' : 'disabled'}: book {localTrailingConfig.partialBookingLots} lot(s) at {localTrailingConfig.partialBookingRR.toFixed(2)}R, then every {localTrailingConfig.partialBookingIntervalRR.toFixed(2)}R while retaining one lot to trail.
               </p>
             </div>
 
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+            <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-6">
               {/* Breakeven RR Milestone */}
               <div>
                 <label className="block text-sm font-medium text-text-secondary mb-2">Breakeven Milestone (RR)</label>
@@ -858,6 +774,54 @@ const Instruments: React.FC = () => {
                   Global default for maximum initial risk. Can be overridden per instrument.
                 </p>
               </div>
+
+              <div>
+                <label className="flex items-center gap-2 text-sm font-medium text-text-secondary">
+                  <input
+                    type="checkbox"
+                    checked={localTrailingConfig.partialBookingEnabled}
+                    onChange={(e) => setLocalTrailingConfig({ ...localTrailingConfig, partialBookingEnabled: e.target.checked })}
+                    className="h-4 w-4 accent-cyan-400"
+                  />
+                  Enable partial booking globally
+                </label>
+              </div>
+              <div>
+                <label className="block text-sm font-medium text-text-secondary mb-2">Initial booking at (R)</label>
+                <input
+                  type="number"
+                  min="0.1"
+                  step="0.1"
+                  value={localTrailingConfig.partialBookingRR}
+                  disabled={!localTrailingConfig.partialBookingEnabled}
+                  onChange={(e) => setLocalTrailingConfig({ ...localTrailingConfig, partialBookingRR: parseFloat(e.target.value) || 2 })}
+                  className="w-full px-3 py-2 bg-bg-primary border border-bg-tertiary rounded-lg text-text-primary disabled:opacity-50"
+                />
+              </div>
+              <div>
+                <label className="block text-sm font-medium text-text-secondary mb-2">Lots per booking</label>
+                <input
+                  type="number"
+                  min="1"
+                  step="1"
+                  value={localTrailingConfig.partialBookingLots}
+                  disabled={!localTrailingConfig.partialBookingEnabled}
+                  onChange={(e) => setLocalTrailingConfig({ ...localTrailingConfig, partialBookingLots: Math.max(1, Math.floor(Number(e.target.value) || 1)) })}
+                  className="w-full px-3 py-2 bg-bg-primary border border-bg-tertiary rounded-lg text-text-primary disabled:opacity-50"
+                />
+              </div>
+              <div>
+                <label className="block text-sm font-medium text-text-secondary mb-2">RR interval after each booking</label>
+                <input
+                  type="number"
+                  min="0.1"
+                  step="0.1"
+                  value={localTrailingConfig.partialBookingIntervalRR}
+                  disabled={!localTrailingConfig.partialBookingEnabled}
+                  onChange={(e) => setLocalTrailingConfig({ ...localTrailingConfig, partialBookingIntervalRR: parseFloat(e.target.value) || 0.5 })}
+                  className="w-full px-3 py-2 bg-bg-primary border border-bg-tertiary rounded-lg text-text-primary disabled:opacity-50"
+                />
+              </div>
             </div>
 
             {/* Action Buttons */}
@@ -887,6 +851,10 @@ const Instruments: React.FC = () => {
                     breakEvenRR: 1.25,
                     trailStepRR: 0.5,
                     maxInitialRiskPoints: 20,
+                    partialBookingEnabled: true,
+                    partialBookingRR: 2,
+                    partialBookingLots: 1,
+                    partialBookingIntervalRR: 0.5,
                     createdAt: new Date().toISOString(),
                     updatedAt: new Date().toISOString(),
                   })
@@ -1009,6 +977,39 @@ const Instruments: React.FC = () => {
             <p className="text-2xl font-bold text-accent-red">
               {instruments.filter((i) => !i.status).length}
             </p>
+          </div>
+        </div>
+      )}
+
+      {validationMessage && (
+        <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/60 p-4">
+          <div
+            role="alertdialog"
+            aria-modal="true"
+            aria-labelledby="instrument-validation-title"
+            aria-describedby="instrument-validation-message"
+            className="w-full max-w-md rounded-lg border border-bg-tertiary bg-bg-secondary p-5 shadow-2xl"
+          >
+            <div className="flex items-start gap-3">
+              <AlertCircle size={20} className="mt-0.5 shrink-0 text-accent-yellow" />
+              <div>
+                <h2 id="instrument-validation-title" className="text-base font-semibold text-text-primary">
+                  Trading Dashboard
+                </h2>
+                <p id="instrument-validation-message" className="mt-2 text-sm text-text-secondary">
+                  {validationMessage}
+                </p>
+              </div>
+            </div>
+            <div className="mt-5 flex justify-end">
+              <button
+                autoFocus
+                onClick={() => setValidationMessage(null)}
+                className="rounded px-4 py-2 text-sm font-semibold text-bg-primary bg-accent-cyan transition-colors hover:bg-accent-cyan/90 focus:outline-none focus:ring-2 focus:ring-accent-cyan focus:ring-offset-2 focus:ring-offset-bg-secondary"
+              >
+                OK
+              </button>
+            </div>
           </div>
         </div>
       )}

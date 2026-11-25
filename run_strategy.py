@@ -327,7 +327,8 @@ def _apply_dashboard_ema21_overrides(cfg: StrategyConfig) -> None:
 def _apply_hd_policy(cfg: StrategyConfig) -> None:
     from datetime import time
 
-    cfg.premium_min_price = _env_float("HD_PREMIUM_MIN_PRICE", 120.0)
+    cfg.premium_range_enabled = _env_bool("HD_PREMIUM_RANGE_ENABLED", True)
+    cfg.premium_min_price = _env_float("HD_PREMIUM_MIN_PRICE", 150.0)
     cfg.premium_max_price = _env_float("HD_PREMIUM_MAX_PRICE", 180.0)
     cfg.max_option_risk_points = _env_float(
         "HD_MAX_OPTION_RISK_POINTS", 20.0
@@ -344,8 +345,6 @@ def _apply_hd_policy(cfg: StrategyConfig) -> None:
         raise ValueError(
             "HD entry cutoff must be between the monitoring start and end times"
         )
-    if cfg.premium_min_price >= cfg.premium_max_price:
-        raise ValueError("HD premium minimum must be less than premium maximum")
     if cfg.max_option_risk_points <= 0:
         raise ValueError("HD maximum initial risk must be greater than zero")
     if cfg.full_size_lots <= 0:

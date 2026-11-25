@@ -212,6 +212,7 @@ def _strategy_environment(
     strategy_key = str(instrument.get('strategy', '21EMA')).strip().upper()
     if strategy_key in {'21EMA', 'EMA21'}:
         strategy_key = 'EMA21'
+    trailing = trailing_config or {}
 
     if strategy_key == 'EMA21':
         strategy_tag = environment.get('STRATEGY_NAME', 'Strategy')
@@ -228,18 +229,22 @@ def _strategy_environment(
         'INSTRUMENT_NAME': str(instrument.get('name', instrument.get('brokerSymbol', 'Unknown'))),
         'MAX_LOSING_TRADES_PER_DAY': str(instrument.get('maxLosingTradesPerDay', 3)),
         'DAILY_LOSS_STATE_FILE': str(LOGS_DIR / f"daily_loss_state_{instrument.get('id', instrument.get('brokerSymbol', 'default'))}.json"),
-        'PARTIAL_BOOKING_ENABLED': str(instrument.get('partialBookingEnabled', True)).lower(),
-        'PARTIAL_BOOKING_RR': str(instrument.get('partialBookingRR', 2.0)),
-        'PARTIAL_BOOKING_LOTS': str(instrument.get('partialBookingLots', 1)),
-        'PARTIAL_BOOKING_INTERVAL_RR': str(instrument.get('partialBookingIntervalRR', 0.5)),
+        'PARTIAL_BOOKING_ENABLED': str(trailing.get('partialBookingEnabled', True)).lower(),
+        'PARTIAL_BOOKING_RR': str(trailing.get('partialBookingRR', 2.0)),
+        'PARTIAL_BOOKING_LOTS': str(trailing.get('partialBookingLots', 1)),
+        'PARTIAL_BOOKING_INTERVAL_RR': str(trailing.get('partialBookingIntervalRR', 0.5)),
     })
     if strategy_key == 'EMA21':
-        lot_size_adjustment = instrument.get('lotSizeAdjustment')
+        lot_size_value = instrument.get('lotSizeAdjustment')
+        try:
+            lot_size_adjustment = float(1 if lot_size_value is None else lot_size_value)
+        except (TypeError, ValueError):
+            raise ValueError('EMA21 lotSizeAdjustment must be a positive integer') from None
+        if lot_size_adjustment < 1 or not lot_size_adjustment.is_integer():
+            raise ValueError('EMA21 lotSizeAdjustment must be a positive integer')
         max_initial_risk = instrument.get('maxInitialRiskPoints')
         environment.update({
-            'DASHBOARD_EMA21_FULL_SIZE_LOTS': str(
-                1 if lot_size_adjustment is None else lot_size_adjustment
-            ),
+            'DASHBOARD_EMA21_FULL_SIZE_LOTS': str(int(lot_size_adjustment)),
             'DASHBOARD_EMA21_MONITORING_START_TIME': str(
                 instrument.get('monitoringStartTime') or '09:15'
             ),
@@ -258,7 +263,6 @@ def _strategy_environment(
     if strategy_key != 'HD':
         return environment
 
-    trailing = trailing_config or {}
     lot_size_value = instrument.get('lotSizeAdjustment')
     lot_size_adjustment = float(1 if lot_size_value is None else lot_size_value)
     if lot_size_adjustment < 1 or not lot_size_adjustment.is_integer():
@@ -266,11 +270,13 @@ def _strategy_environment(
 
     premium_min = instrument.get('premiumMinPrice')
     premium_max = instrument.get('premiumMaxPrice')
+    premium_range_enabled = premium_min is not None
     max_initial_risk = instrument.get('maxInitialRiskPoints')
     if max_initial_risk is None:
         max_initial_risk = 20
     values = {
-        'HD_PREMIUM_MIN_PRICE': 120 if premium_min is None else premium_min,
+        'HD_PREMIUM_RANGE_ENABLED': premium_range_enabled,
+        'HD_PREMIUM_MIN_PRICE': 150 if premium_min is None else premium_min,
         'HD_PREMIUM_MAX_PRICE': 180 if premium_max is None else premium_max,
         'HD_MAX_OPTION_RISK_POINTS': max_initial_risk,
         'HD_FULL_SIZE_LOTS': int(lot_size_adjustment),
@@ -317,10 +323,10 @@ def _runtime_signature(instrument: dict[str, Any], trailing: dict[str, Any]) -> 
         instrument.get('lotSizeAdjustment'),
         instrument.get('entryCutoffTime'),
         instrument.get('monitoringEndTime'),
-        instrument.get('partialBookingEnabled', True),
-        instrument.get('partialBookingRR', 2.0),
-        instrument.get('partialBookingLots', 1),
-        instrument.get('partialBookingIntervalRR', 0.5),
+        trailing.get('partialBookingEnabled', True),
+        trailing.get('partialBookingRR', 2.0),
+        trailing.get('partialBookingLots', 1),
+        trailing.get('partialBookingIntervalRR', 0.5),
         instrument.get('maxLosingTradesPerDay', 3),
         str(instrument.get('executionMode', 'LIVE')).upper(),
         trailing.get('breakEvenRR'),

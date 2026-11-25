@@ -578,7 +578,7 @@ def test_restore_open_position_parses_comma_separated_entry_alert(tmp_path, monk
             return [{
                 "symbol": "NIFTY08SEP2623850CE",
                 "quantity": 130,
-                "average_price": 180.65,
+                "average_price": 120.0,
             }]
 
         def get_open_orders(self):
@@ -599,6 +599,40 @@ def test_restore_open_position_parses_comma_separated_entry_alert(tmp_path, monk
     assert position.entry_price == 180.65
     assert position.option_entry_trigger == 180.35
     assert position.option_stop_level == 170.30
+
+
+def test_restore_pending_entry_waits_for_confirmed_fill_price(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+
+    class PositionBroker(ConsoleBroker):
+        def get_position_book(self):
+            return [{"symbol": "NIFTY01SEP2624250PE", "quantity": 65, "average_price": 40.0}]
+
+        def get_open_orders(self):
+            return []
+
+        def get_order_status(self, order_id):
+            return {"order_status": "complete", "average_price": 0}
+
+    broker = PositionBroker()
+    engine = BaseStrategyEngine(StrategyConfig(), RiskConfig(), broker, EMA21SignalProvider())
+    engine.state.pe.option_symbol = "NIFTY01SEP2624250PE"
+    engine.state.pe.pending_entry = PendingEntry(
+        signal=Signal.BUY_PE,
+        created_at=datetime(2026, 9, 1, 10, 0),
+        option_symbol="NIFTY01SEP2624250PE",
+        quantity=65,
+        option_trigger_level=116.0,
+        option_stop_level=106.0,
+        trigger_candle_high=116.0,
+        trigger_candle_low=110.0,
+        order_id="ENTRY-1",
+    )
+
+    runner._restore_open_positions(engine, broker, datetime(2026, 9, 1).date())
+
+    assert engine.state.pe.position is None
+    assert engine.state.pe.pending_entry is not None
 
 
 def test_restore_open_entry_order_after_restart(tmp_path, monkeypatch):
@@ -948,11 +982,13 @@ def test_restore_hd_atm_lock_accepts_a_single_selected_side(monkeypatch, tmp_pat
         pe=SimpleNamespace(option_symbol=None),
         atm_locked=False,
     )
+    restored_alerts = []
     engine = SimpleNamespace(
         state=state,
         cfg=SimpleNamespace(option_index_symbol="NIFTY", atm_lock_time=time(9, 20)),
         _is_hd_strategy=lambda: True,
         on_day_transition_if_needed=lambda _timestamp: None,
+        _record_alert=lambda *args: restored_alerts.append(args),
     )
 
     assert runner._restore_atm_lock(engine, date(2026, 10, 16)) is True
@@ -961,6 +997,10 @@ def test_restore_hd_atm_lock_accepts_a_single_selected_side(monkeypatch, tmp_pat
     assert state.pe_symbol == "NIFTY19OCT2623200PE"
     assert state.ce.option_symbol is None
     assert state.pe.option_symbol == "NIFTY19OCT2623200PE"
+    assert restored_alerts[0][1:] == (
+        "ATM_LOCK",
+        "Restored ATM lock for 2026-10-16: CE=- PE=NIFTY19OCT2623200PE",
+    )
 
 
 def test_live_tick_poll_keeps_pending_entry_ticks_out_of_active_monitoring(monkeypatch):
@@ -986,7 +1026,9 @@ def test_live_tick_poll_keeps_pending_entry_ticks_out_of_active_monitoring(monke
 
 
 @pytest.mark.parametrize("multi", [False, True])
-def test_live_tick_poll_activates_monitoring_after_entry_fill(monkeypatch, multi):
+def test_live_tick_poll_activates_monitoring_after_entry_fill(monkeypatch, tmp_path, multi):
+    monkeypatch.chdir(tmp_path)
+
     class FilledEntryBroker(ConsoleBroker):
         requires_position_reconciliation = True
 
@@ -997,7 +1039,7 @@ def test_live_tick_poll_activates_monitoring_after_entry_fill(monkeypatch, multi
             return [{
                 "symbol": "NIFTY01SEP2624250PE",
                 "quantity": 130,
-                "average_price": 116.25,
+                "average_price": 40.0,
             }]
 
         def get_open_orders(self):
@@ -1035,6 +1077,7 @@ def test_live_tick_poll_activates_monitoring_after_entry_fill(monkeypatch, multi
     live_runner._poll_active_ticks()
 
     assert engine.state.pe.position is not None
+    assert engine.state.pe.position.entry_price == 116.25
     assert engine.state.pe.position.current_price == 116.5
     assert engine.state.pe.pending_entry is None
     assert any("tick monitoring activated" in alert.message for alert in engine.alerts)

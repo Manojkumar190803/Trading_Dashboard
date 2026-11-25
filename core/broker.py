@@ -108,6 +108,14 @@ class BrokerInterface:
         """Return an option chain when the broker supports contract discovery."""
         return None
 
+    def search_symbols(
+        self,
+        query: str,
+        exchange: str,
+    ) -> list[dict[str, object]]:
+        """Return symbol-master matches when the broker supports symbol search."""
+        raise NotImplementedError("Broker does not support symbol search")
+
 
 class ConsoleBroker(BrokerInterface):
     """Prints orders to stdout; useful for dry-run verification."""
@@ -398,6 +406,19 @@ class OpenAlgoBroker(BrokerInterface):
                 http_response.raise_for_status()
                 response = http_response.json()
             except requests.RequestException as exc:
+                status_code = getattr(
+                    getattr(exc, "response", None),
+                    "status_code",
+                    None,
+                )
+                if status_code == 404:
+                    raise RuntimeError(
+                        "OpenAlgo returned HTTP 404 for /api/v1/optionchain. "
+                        "This server does not expose the option-chain API required "
+                        "to resolve historical option symbols. Update the OpenAlgo "
+                        "server or set OPENALGO_HOST to an instance that supports "
+                        "the option-chain endpoint."
+                    ) from exc
                 raise RuntimeError(
                     f"option chain HTTP request failed for {underlying}: {exc}"
                 ) from exc
@@ -410,6 +431,62 @@ class OpenAlgoBroker(BrokerInterface):
             message = response.get("message") if isinstance(response, dict) else response
             raise RuntimeError(f"option chain request failed for {underlying}: {message}")
         return response
+
+    def search_symbols(
+        self,
+        query: str,
+        exchange: str,
+    ) -> list[dict[str, object]]:
+        """Search the OpenAlgo symbol master and return matching instruments."""
+        search = getattr(self.client, "search", None)
+        if callable(search):
+            response = search(query=query, exchange=exchange)
+        else:
+            base_url = getattr(self.client, "base_url", None)
+            api_key = getattr(self.client, "api_key", None)
+            if not isinstance(base_url, str) or not base_url.strip() or not api_key:
+                raise RuntimeError(
+                    "OpenAlgo client does not expose search or the REST API credentials"
+                )
+            try:
+                http_response = requests.post(
+                    f"{base_url.rstrip('/')}/search",
+                    json={
+                        "apikey": api_key,
+                        "query": query,
+                        "exchange": exchange,
+                    },
+                    timeout=15,
+                )
+                http_response.raise_for_status()
+                response = http_response.json()
+            except requests.RequestException as exc:
+                status_code = getattr(
+                    getattr(exc, "response", None),
+                    "status_code",
+                    None,
+                )
+                if status_code == 404:
+                    raise RuntimeError(
+                        "OpenAlgo returned HTTP 404 for /api/v1/search. "
+                        "This server does not expose the symbol-search API required "
+                        "to resolve option contracts."
+                    ) from exc
+                raise RuntimeError(
+                    f"OpenAlgo symbol search failed for {query}: {exc}"
+                ) from exc
+            except ValueError as exc:
+                raise RuntimeError(
+                    f"OpenAlgo symbol-search response was not valid JSON for {query}"
+                ) from exc
+
+        if not isinstance(response, dict) or response.get("status") != "success":
+            message = response.get("message") if isinstance(response, dict) else response
+            raise RuntimeError(f"OpenAlgo symbol search failed for {query}: {message}")
+        data = response.get("data")
+        if not isinstance(data, list):
+            raise RuntimeError(f"OpenAlgo symbol search returned no data list for {query}")
+        return [row for row in data if isinstance(row, dict)]
 
     def get_position_book(self) -> list[dict[str, object]]:
         if self._positionbook_auth_failed:
@@ -497,6 +574,25 @@ class OpenAlgoBroker(BrokerInterface):
                 order_id, symbol, side.value, quantity, trigger_price, limit_price,
             )
             return True
+        if side == OrderSide.SELL:
+            orders = self.get_open_orders()
+            matching_order = next(
+                (order for order in orders or []
+                 if str(order.get("orderid") or order.get("order_id") or "") == str(order_id)
+                 and str(order.get("symbol") or "") == symbol
+                 and str(order.get("action") or "").upper() == side.value),
+                None,
+            )
+            try:
+                current_trigger = float(matching_order.get("trigger_price", 0)) if matching_order else 0
+            except (TypeError, ValueError, OverflowError):
+                current_trigger = 0
+            if not (0 < current_trigger <= float(trigger_price)):
+                logger.warning(
+                    "protective SL modify blocked for %s (%s): broker trigger unavailable or higher than %.2f",
+                    symbol, order_id, trigger_price,
+                )
+                return False
         try:
             response = self.client.modifyorder(
                 order_id=order_id,
@@ -513,7 +609,33 @@ class OpenAlgoBroker(BrokerInterface):
         except Exception as exc:
             logger.error("modifyorder SL error for %s (%s): %s", symbol, order_id, exc)
             return False
-        return isinstance(response, dict) and response.get("status") == "success"
+        if not isinstance(response, dict) or response.get("status") != "success":
+            logger.warning("modifyorder SL rejected for %s (%s): %s", symbol, order_id, response)
+            return False
+
+        orders = self.get_open_orders()
+        if orders is not None:
+            for order in orders:
+                if str(order.get("orderid") or order.get("order_id") or "") != str(order_id):
+                    continue
+                try:
+                    if (
+                        str(order.get("symbol") or "") == symbol
+                        and str(order.get("action") or "").upper() == side.value
+                        and float(order.get("quantity", 0)) == quantity
+                        and abs(float(order.get("trigger_price", 0)) - trigger_price) < 0.001
+                        and abs(float(order.get("price", 0)) - limit_price) < 0.001
+                    ):
+                        return True
+                except (TypeError, ValueError, OverflowError):
+                    pass
+                break
+        logger.warning(
+            "modifyorder SL acknowledged but not confirmed by orderbook for %s (%s); "
+            "requested qty=%s trigger=%.2f limit=%.2f",
+            symbol, order_id, quantity, trigger_price, limit_price,
+        )
+        return False
 
     def place_stop_limit_order(
         self,
@@ -1173,6 +1295,12 @@ class TestTradingBroker(OpenAlgoBroker):
         self._alerts: list[dict[str, object]] = []
         self._load_state()
 
+    @staticmethod
+    def _alert_dedupe_key(timestamp: str, category: str, message: str) -> tuple[str, str, str]:
+        if category == "ATM_LOCK":
+            timestamp = timestamp[:10]
+        return timestamp, category, message
+
     def _load_state(self) -> None:
         try:
             payload = json.loads(self.state_path.read_text(encoding="utf-8"))
@@ -1187,7 +1315,21 @@ class TestTradingBroker(OpenAlgoBroker):
             if isinstance(row, dict) and row.get("symbol")
         }
         self._trades = [row for row in payload.get("trades", []) if isinstance(row, dict)]
-        self._alerts = [row for row in payload.get("alerts", []) if isinstance(row, dict)]
+        stored_alerts = [row for row in payload.get("alerts", []) if isinstance(row, dict)]
+        seen_alerts = set()
+        self._alerts = []
+        for alert in stored_alerts:
+            key = self._alert_dedupe_key(
+                str(alert.get("timestamp") or ""),
+                str(alert.get("category") or ""),
+                str(alert.get("message") or ""),
+            )
+            if key in seen_alerts:
+                continue
+            seen_alerts.add(key)
+            self._alerts.append(alert)
+        if len(self._alerts) < len(stored_alerts):
+            self._persist_state()
 
     def _state_payload(self) -> dict[str, object]:
         positions = list(self._positions.values())
@@ -1223,9 +1365,20 @@ class TestTradingBroker(OpenAlgoBroker):
 
     def record_alert(self, timestamp: datetime, category: str, message: str) -> None:
         with self._state_lock:
+            timestamp_value = timestamp.isoformat()
+            alert_key = self._alert_dedupe_key(timestamp_value, category, message)
+            if any(
+                self._alert_dedupe_key(
+                    str(alert.get("timestamp") or ""),
+                    str(alert.get("category") or ""),
+                    str(alert.get("message") or ""),
+                ) == alert_key
+                for alert in self._alerts
+            ):
+                return
             self._alerts.append({
                 "id": f"{self.instrument_id}-{uuid.uuid4().hex[:12]}",
-                "timestamp": timestamp.isoformat(),
+                "timestamp": timestamp_value,
                 "execution_mode": "TEST",
                 "instrument_id": self.instrument_id,
                 "instrument_name": self.instrument_name,

@@ -163,7 +163,9 @@ def test_status_diagnostics_and_reset_cover_each_setup_state():
     assert provider.diagnose_no_signal("CE", state, row, None) == "WAITING_FOR_RSI_CROSS_BELOW_20"
 
     state.setup_pending = True
-    assert provider.format_setup_status(state) == "WAITING FOR NEXT CANDLE AFTER RSI < 20"
+    assert provider.format_setup_status(state) == (
+        "RSI dipped below 20; looking for a strong candle or hammer"
+    )
     assert provider.diagnose_no_signal("CE", state, row, None) == "WAITING_FOR_ALERT_CANDLE"
 
     state.alert_ready = True

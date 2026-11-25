@@ -189,6 +189,10 @@ export const useAppStore = create<AppStore>(
       breakEvenRR: 1.25,
       trailStepRR: 0.5,
       maxInitialRiskPoints: 20,
+      partialBookingEnabled: true,
+      partialBookingRR: 2,
+      partialBookingLots: 1,
+      partialBookingIntervalRR: 0.5,
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
     },
@@ -206,6 +210,10 @@ export const useAppStore = create<AppStore>(
           breakEvenRR: 1.25,
           trailStepRR: 0.5,
           maxInitialRiskPoints: 20,
+          partialBookingEnabled: true,
+          partialBookingRR: 2,
+          partialBookingLots: 1,
+          partialBookingIntervalRR: 0.5,
           createdAt: new Date().toISOString(),
           updatedAt: new Date().toISOString(),
         },
@@ -257,6 +265,17 @@ export const useAppStore = create<AppStore>(
         theme: state.theme,
         trailingStopsConfig: state.trailingStopsConfig,
       }),
+      merge: (persistedState, currentState) => {
+        const persisted = persistedState as Partial<AppStore>
+        return {
+          ...currentState,
+          ...persisted,
+          trailingStopsConfig: {
+            ...currentState.trailingStopsConfig,
+            ...persisted.trailingStopsConfig,
+          },
+        }
+      },
     }
   ) as any
 )
